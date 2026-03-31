@@ -29,128 +29,127 @@ The LIBS Foundation Model is a self-supervised transformer for Laser Induced Bre
 
 ## Model Architecture
 
-### Embedding (input → residual stream)
+### Transformer Encoder (high-level)
 
 ```
-Input Spectrum [batch, 2048] — raw intensity scalars, normalized to [0,1]
+Input Spectrum (2048 bins, normalized 0-1)
     │
     ▼
-┌──────────────────────────────────────────────────────┐
-│  Intensity Projection (learned 2-layer MLP)          │
-│  Each scalar independently:                          │
-│    Linear(1 → 128) → GELU → Linear(128 → 256)       │
-│  Same weights shared across all 2048 bins            │
-│  Output: [batch, 2048, 256]                          │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│  Intensity Embedding (learned MLP)      │
+│  Each intensity scalar → d_model vector │
+│  + Mask token replacement               │
+│  (see Masking Strategies below)         │
+└─────────────────────────────────────────┘
     │
     ▼
-┌──────────────────────────────────────────────────────┐
-│  Mask Token Replacement (pretraining only)           │
-│  80% of masked bins: projected vector REPLACED with  │
-│    a single learned mask token (one 256-dim vector,  │
-│    same for all positions — differentiated only by   │
-│    positional encoding added below)                  │
-│  10%: keeps projected random intensity               │
-│  10%: keeps projected original value                 │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│  + [CLS] Token (learned)                │
+│  + Sinusoidal Positional Encoding       │
+│  Sequence length: 2049 (2048 + 1)       │
+└─────────────────────────────────────────┘
     │
     ▼
-┌──────────────────────────────────────────────────────┐
-│  Prepend [CLS] Token                                 │
-│  Learned 256-dim vector at position 0                │
-│  Sequence: [CLS, bin_0, ..., bin_2047] → [2049, 256] │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│  Transformer Encoder Blocks (× N)       │
+│  - Multi-Head Self-Attention            │
+│  - Feed-Forward Network                 │
+│  - Pre-LayerNorm + Residual Connections │
+└─────────────────────────────────────────┘
     │
-    ▼
-┌──────────────────────────────────────────────────────┐
-│  + Sinusoidal Positional Encoding (fixed)            │
-│  Added element-wise — the only thing differentiating │
-│  masked positions from each other                    │
-└──────────────────────────────────────────────────────┘
-    │
-    ▼
-  LayerNorm → this is x₀, the initial residual stream
+    ├────────────────────┐
+    ▼                    ▼
+[CLS] Embedding     Sequence Output
+    │                    │
+    ▼                    ▼
+Classification/     MIP Prediction
+Regression Head     Head (pre-training)
 ```
 
-### Residual Stream
+### Embedding Details
 
-The core of the transformer is a single stream of vectors that flows straight from
+The embedding pipeline transforms raw intensities into the initial residual stream:
+
+1. **Intensity projection** — a learned 2-layer MLP (`Linear(1→128) → GELU → Linear(128→256)`)
+   projects each scalar intensity independently to a d_model-dimensional vector. The same
+   weights are shared across all 2048 bins.
+
+2. **Mask token replacement** (pretraining only) — masked positions have their projected
+   vectors replaced with a single learned mask token (one 256-dim vector, shared across all
+   masked positions). See [How BERT-style Masking Works](#how-bert-style-masking-works-for-continuous-spectra)
+   for the 80/10/10 replacement strategy.
+
+3. **[CLS] token** — a learned 256-dim vector prepended at position 0. It carries no spectral
+   information initially; through attention across all layers it accumulates a global summary
+   of the entire spectrum. Used for downstream classification/regression.
+
+4. **Positional encoding** — fixed sinusoidal encoding added element-wise. This is the only
+   thing differentiating masked positions from each other (they all share the same mask token).
+
+5. **LayerNorm** — produces x₀, the initial state of the residual stream.
+
+### Residual Stream Perspective (alternative view of the transformer)
+
+The transformer can be understood as a single stream of vectors flowing straight from
 embedding to output. Nothing overwrites it — each sub-layer reads from the stream,
-computes a delta, and **adds** it back. The stream accumulates information.
-
-You can tap the stream at any point (after any layer) and run it through the
-de-embedding head (MIP or classification) to get a valid, if less refined, output.
-Early layers produce coarser predictions; later layers refine them. The final output
-is the sum of the initial embedding and all deltas written by every attention and FFN
-block.
+computes a delta, and **adds** it back.
 
 ```
-x₀  (after embedding + pos enc + layernorm)
+x₀  (embedding output — the initial stream)
  │
- │         ┌─────────────────────────────────────────────────────────┐
- ├────────►│  Self-Attention (layer 1)                               │
- │         │  Every token attends to all 2049 tokens (no masking     │
- │         │  in the attention map — masked bins participate fully). │
- │◄────────│  Masked positions gather context from neighbors.        │
- │  += δ   └─────────────────────────────────────────────────────────┘
+ │         ┌───────────────────────────┐
+ ├────────►│  Self-Attention (layer 1) │
+ │◄────────│                           │
+ │  += δ   └───────────────────────────┘
  │
-x₁ = x₀ + δ_attn1
+ │         ┌───────────────────────────┐
+ ├────────►│  FFN (layer 1)            │
+ │◄────────│                           │
+ │  += δ   └───────────────────────────┘
  │
- │         ┌─────────────────────────────────────────────────────────┐
- ├────────►│  FFN (layer 1)                                          │
- │         │  Linear(256→1024) → GELU → Linear(1024→256)             │
- │◄────────│  Per-position "thinking" — no cross-talk between tokens │
- │  += δ   └─────────────────────────────────────────────────────────┘
+ │         ┌───────────────────────────┐
+ ├────────►│  Self-Attention (layer 2) │
+ │◄────────│                           │
+ │  += δ   └───────────────────────────┘
  │
-x₂ = x₁ + δ_ffn1
- │
- │         ┌──────────────────────────────┐
- ├────────►│  Self-Attention (layer 2)    │
- │◄────────│                              │
- │  += δ   └──────────────────────────────┘
- │
- │         ┌──────────────────────────────┐
- ├────────►│  FFN (layer 2)              │
- │◄────────│                              │
- │  += δ   └──────────────────────────────┘
+ │         ┌───────────────────────────┐
+ ├────────►│  FFN (layer 2)            │
+ │◄────────│                           │
+ │  += δ   └───────────────────────────┘
  │
  ┆          ... layers 3–5 ...
  │
- │         ┌──────────────────────────────┐
- ├────────►│  Self-Attention (layer 6)    │
- │◄────────│                              │
- │  += δ   └──────────────────────────────┘
+ │         ┌───────────────────────────┐
+ ├────────►│  Self-Attention (layer 6) │
+ │◄────────│                           │
+ │  += δ   └───────────────────────────┘
  │
- │         ┌──────────────────────────────┐
- ├────────►│  FFN (layer 6)              │
- │◄────────│                              │
- │  += δ   └──────────────────────────────┘
- │
-x₁₂ = x₀ + δ_attn1 + δ_ffn1 + δ_attn2 + ... + δ_ffn6
+ │         ┌───────────────────────────┐
+ ├────────►│  FFN (layer 6)            │
+ │◄────────│                           │
+ │  += δ   └───────────────────────────┘
  │
  ▼
-Final LayerNorm
+x_final = x₀ + δ_attn1 + δ_ffn1 + ... + δ_ffn6
  │
- ├──── position 0 ──► [CLS] embedding [256] ──► Classification / Regression head
- │                     (global spectrum summary,     (downstream tasks)
- │                      built entirely through
- │                      attention over 6 layers)
- │
- └──── positions 1–2048 ──► MIP head ──► predicted intensity per bin
-                             (pretraining: loss on masked positions only)
+ ▼
+Final LayerNorm → output heads
 ```
 
-**Key points:**
+**How to read this:**
 
-- The stream is the straight vertical line. It is never overwritten, only added to.
-- At a masked position, x₀ contains no intensity info (just mask token + position).
-  Every delta from attention writes in context gathered from unmasked neighbors.
-  By x₁₂ the representation is built entirely from accumulated context.
-- At an unmasked position, x₀ already contains the real intensity. The deltas enrich
-  it with global spectral context, but the original info persists in the stream.
-- You could run any intermediate x_i through the MIP head and get a prediction —
-  it would just be less refined than using x₁₂. The model gradually builds up its
-  representation; no single layer is solely responsible for the output.
+- The straight vertical line **is** the residual stream — it is never overwritten, only added to.
+- Self-attention reads all 2049 positions, computes interactions between them, and writes a
+  delta back. This is where tokens exchange information (masked positions gather context
+  from unmasked neighbors).
+- FFN processes each position independently — per-token "thinking" with no cross-talk.
+- The stream can be tapped at **any intermediate point** and fed through the output head
+  (MIP or classification) to get a valid prediction. Early taps give coarser results;
+  later layers refine them. The final output is the sum of all deltas.
+- At a masked position, x₀ has no intensity info — just mask token + positional encoding.
+  The entire representation is built from context accumulated through attention deltas.
+- At an unmasked position, x₀ already has the real intensity. Deltas enrich it with
+  global spectral context.
 
 ### Model Configurations
 
