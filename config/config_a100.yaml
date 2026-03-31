@@ -1,0 +1,100 @@
+# =============================================================================
+# LIBS Foundation Model Configuration - A100 Large Scale Training
+# =============================================================================
+# Target: NVIDIA A100 (40GB/80GB)
+# Model: ~500M parameters
+# Dataset: 500k training samples
+# =============================================================================
+
+# Data settings
+data:
+  n_bins: 2048                    # Spectrum resolution (wavelength bins)
+  n_classes: 5                    # Number of material classes
+  synthetic:
+    train_samples: 500000         # Large training set
+    val_samples: 50000            # 10% validation
+    test_samples: 50000           # Held-out test set
+    labeled_samples: 50000        # For fine-tuning
+    noise_sigma: 0.02             # Gaussian noise level
+    peak_width_range: [5, 15]     # Peak width range (bins)
+    intensity_variation: 0.3      # Peak intensity variation (+/- 30%)
+
+# =============================================================================
+# Model Architecture - Large Scale (~500M params)
+# =============================================================================
+model:
+  d_model: 1024                   # Hidden dimension (4x larger than base)
+  n_heads: 16                     # Attention heads
+  n_layers: 24                    # Transformer layers (4x deeper)
+  d_ff: 4096                      # Feed-forward dimension
+  dropout: 0.1                    # Dropout rate
+  max_seq_len: 2049               # 2048 bins + 1 CLS token
+
+# =============================================================================
+# Pre-training Settings - Advanced Masking
+# =============================================================================
+pretrain:
+  # Masking configuration
+  mask_ratio: 0.15                # 15% of bins masked
+  mask_token_prob: 0.8            # 80% replaced with mask token
+  random_token_prob: 0.1          # 10% replaced with random value
+  
+  # Contiguous block masking with variable sizes
+  contiguous_masking: true
+  block_sizes: [25, 50, 100, 150] # Variable block sizes (bins)
+  
+  # Peak-biased masking (ensures masks cover peaks, not just noise)
+  peak_bias_enabled: true
+  peak_bias_ratio: 0.5            # 50% of masked bins must be on peaks
+  peak_threshold: 0.2             # Intensity threshold for peak detection
+  
+  # Training hyperparameters
+  batch_size: 32                  # Per-GPU batch size (adjust based on VRAM)
+  epochs: 100
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 10
+  min_lr: 1.0e-6
+  
+  # Gradient accumulation for effective larger batch
+  # Effective batch = batch_size * accumulate_grad_batches
+  accumulate_grad_batches: 4      # Effective batch size: 32 * 4 = 128
+
+# =============================================================================
+# Fine-tuning Settings
+# =============================================================================
+finetune:
+  batch_size: 32
+  epochs: 50
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder: false           # Full fine-tuning
+
+# =============================================================================
+# Logging and Checkpointing
+# =============================================================================
+logging:
+  logger: "wandb"                 # Use wandb for large runs
+  log_every_n_steps: 100
+  val_check_interval: 0.25        # Validate 4x per epoch
+
+  wandb:
+    project: "libs-foundation-model"
+    entity: null                  # Your wandb username/team
+    tags: ["libs", "self-supervised", "a100", "large"]
+
+# =============================================================================
+# Device Settings
+# =============================================================================
+device:
+  accelerator: "gpu"
+  precision: "bf16-mixed"         # BF16 for A100 (better range than FP16)
+  
+# =============================================================================
+# Estimated Resources
+# =============================================================================
+# Model size: ~500M parameters
+# VRAM usage: ~30-35GB (with batch_size=32, bf16)
+# Training time: ~24-48 hours for 100 epochs
+# Storage: ~5GB for checkpoints
+# =============================================================================

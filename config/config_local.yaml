@@ -1,0 +1,72 @@
+# LIBS Foundation Model Configuration - LOCAL TESTING (16GB GPU)
+# Use this for testing on RTX 4060 Ti / similar GPUs
+# For full training on A100, use config.yaml
+
+# Data settings (reduced for faster iteration)
+data:
+  n_bins: 2048
+  n_classes: 5
+  synthetic:
+    train_samples: 5000           # Reduced for local testing
+    val_samples: 500
+    test_samples: 500
+    labeled_samples: 2000
+    noise_sigma: 0.02
+    peak_width_range: [5, 15]
+    intensity_variation: 0.3
+
+# Model architecture (same as full)
+model:
+  d_model: 256
+  n_heads: 8
+  n_layers: 6
+  d_ff: 1024
+  dropout: 0.1
+  max_seq_len: 2049
+
+# Pre-training settings (reduced for 16GB GPU)
+pretrain:
+  # Masking configuration
+  mask_ratio: 0.15
+  mask_token_prob: 0.8
+  random_token_prob: 0.1
+  
+  # Contiguous block masking with variable sizes
+  contiguous_masking: true
+  block_sizes: [25, 50, 100]      # Variable block sizes
+  
+  # Peak-biased masking
+  peak_bias_enabled: true
+  peak_bias_ratio: 0.5            # 50% of masks must cover peaks
+  peak_threshold: 0.2
+  
+  # Training (reduced for 16GB GPU)
+  batch_size: 16
+  epochs: 10                      # Quick test
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 2
+  min_lr: 1.0e-6
+
+# Fine-tuning settings
+finetune:
+  batch_size: 16                  # Reduced for 16GB GPU
+  epochs: 10
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder: false
+
+# Logging
+logging:
+  logger: "tensorboard"
+  log_every_n_steps: 10
+  val_check_interval: 1.0
+  wandb:
+    project: "libs-foundation-model"
+    entity: null
+    tags: ["libs", "self-supervised", "local-test"]
+
+# Device settings (optimized for 16GB GPU)
+device:
+  accelerator: "auto"
+  precision: "bf16-mixed"         # 4060 Ti supports bf16; more stable than fp16

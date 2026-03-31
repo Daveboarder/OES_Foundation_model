@@ -1,0 +1,71 @@
+# LIBS Foundation Model Configuration
+
+# Data settings
+data:
+  n_bins: 2048                    # Number of wavelength bins
+  n_classes: 5                    # Number of material classes
+  synthetic:
+    train_samples: 50000          # Training samples for pre-training
+    val_samples: 5000             # Validation samples
+    test_samples: 5000            # Test samples
+    labeled_samples: 10000        # Labeled samples for fine-tuning
+    noise_sigma: 0.02             # Gaussian noise standard deviation
+    peak_width_range: [5, 15]     # Peak width range (bins)
+    intensity_variation: 0.3     # Peak intensity variation (+/- 30%)
+
+# Model architecture
+model:
+  d_model: 256                    # Model dimension
+  n_heads: 8                      # Number of attention heads
+  n_layers: 6                     # Number of transformer layers
+  d_ff: 1024                      # Feed-forward dimension
+  dropout: 0.1                    # Dropout rate
+  max_seq_len: 2049               # 2048 bins + 1 CLS token
+
+# Pre-training settings
+pretrain:
+  # Masking configuration
+  mask_ratio: 0.15                # Fraction of bins to mask
+  mask_token_prob: 0.8            # Probability of replacing with mask token
+  random_token_prob: 0.1          # Probability of replacing with random value
+  
+  # Contiguous block masking
+  contiguous_masking: true        # Mask contiguous regions instead of random bins
+  block_sizes: [25, 50, 100]      # Variable block sizes (randomly sampled)
+  
+  # Peak-biased masking
+  peak_bias_enabled: true         # Ensure masks cover peaks, not just noise
+  peak_bias_ratio: 0.5            # 50% of masked bins must overlap with peaks
+  peak_threshold: 0.2             # Intensity threshold for peak detection
+  
+  # Training
+  batch_size: 64                  # For A100 (use config_local.yaml for 16GB GPU)
+  epochs: 100
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 10
+  min_lr: 1.0e-6
+
+# Fine-tuning settings
+finetune:
+  batch_size: 32
+  epochs: 50
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder: false           # Whether to freeze encoder weights
+
+# Logging and checkpointing
+logging:
+  logger: "tensorboard"           # "wandb" or "tensorboard"
+  log_every_n_steps: 50
+  val_check_interval: 1.0         # Validate every epoch
+
+  wandb:
+    project: "libs-foundation-model"
+    entity: null                  # Your wandb username/team (null = default)
+    tags: ["libs", "self-supervised"]
+
+# Device settings
+device:
+  accelerator: "auto"             # auto, gpu, cpu
+  precision: "bf16-mixed"         # bf16-mixed for A100, 16 for older GPUs, 32 for full

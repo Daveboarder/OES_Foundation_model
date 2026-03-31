@@ -1,0 +1,54 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ML artifacts
+logs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+wandb/
+
+# Data
+data/generated/
+*.npy
+*.h5
+*.hdf5
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Experiment runs
+runs/
+
+# External repos
+LIBSSS/
+
+# Misc
+*.log
+.env

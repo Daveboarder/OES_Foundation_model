@@ -1,0 +1,3 @@
+# Ensure Unix line endings for scripts run on Linux cluster
+*.slurm text eol=lf
+*.sh text eol=lf
