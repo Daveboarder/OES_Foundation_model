@@ -29,17 +29,13 @@ The key idea is that self-supervised pre-training learns useful spectral represe
 
 ### 1. Setup Environment
 
-**Windows (PowerShell):**
-```powershell
-.\setup_env.ps1
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
+
+```bash
+uv sync
 ```
 
-**Linux/macOS:**
-```bash
-chmod +x setup_env.sh
-./setup_env.sh
-source .venv/bin/activate
-```
+This creates a `.venv` and installs all dependencies from `uv.lock`.
 
 ### 2. Explore Synthetic Data
 
@@ -311,8 +307,6 @@ self_supervised_LIBS/
 ├── train_finetune.py            # Fine-tuning entry point
 ├── evaluate_model.py            # Post-training evaluation
 ├── list_runs.py                 # List and inspect runs
-├── setup_env.ps1                # Windows setup script
-├── setup_env.sh                 # Linux setup script
 └── pyproject.toml               # Project configuration
 ```
 
@@ -404,7 +398,7 @@ wandb login
 
 ```bash
 # 1. Setup
-.\setup_env.ps1  # or ./setup_env.sh
+uv sync
 
 # 2. Explore data
 uv run python data/explorations/visualize_synthetic_data.py
