@@ -28,6 +28,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from data.synthetic_generator import SyntheticLIBSGenerator
 from data.dataset import LabeledLIBSDataset
+from data.libs_pipeline import (
+    build_dataset_from_config,
+    cluster_compositions,
+    extract_finetune_labels,
+    get_or_make_splits,
+)
 from models.libs_transformer import LIBSTransformer
 from training.finetune import LIBSFinetuneModule, FinetuneDataModule
 from utils.run_manager import RunManager
@@ -53,9 +59,9 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def generate_labeled_data(config: dict, seed: int = 42):
-    print("Generating labeled synthetic data...")
-
+def _generate_legacy_labeled(config: dict, seed: int):
+    """Original toy generator with 5 classes and 5-dim concentrations."""
+    print("Generating legacy labeled synthetic data...")
     generator = SyntheticLIBSGenerator(
         n_bins=config['data']['n_bins'],
         noise_sigma=config['data']['synthetic']['noise_sigma'],
@@ -63,21 +69,92 @@ def generate_labeled_data(config: dict, seed: int = 42):
         intensity_variation=config['data']['synthetic']['intensity_variation'],
         seed=seed,
     )
+    total = config['data']['synthetic']['labeled_samples']
+    spectra, labels, concentrations = generator.generate_dataset(n_samples=total, return_labels=True)
+    t = int(0.7 * total); v = int(0.85 * total)
+    return {
+        'train': (spectra[:t], labels[:t], concentrations[:t]),
+        'val':   (spectra[t:v], labels[t:v], concentrations[t:v]),
+        'test':  (spectra[v:], labels[v:], concentrations[v:]),
+        'element_names': None,
+    }
 
-    total_samples = config['data']['synthetic']['labeled_samples']
-    spectra, labels, concentrations = generator.generate_dataset(
-        n_samples=total_samples, return_labels=True,
+
+def _generate_libs_pipeline_labeled(config: dict, libs_config_path: str, seed: int):
+    """Realistic physics-based labeled data.
+
+    Loads (or generates from cache) the full synthetic dataset, extracts
+    per-element concentrations from sample_table, and partitions everything
+    into train/val/test using the splits JSON keyed by the cache fingerprint.
+
+    Returns the same dict shape as the legacy path but with concentrations of
+    shape [N, n_elements] (60 elements by default) and labels coming from
+    KMeans clustering on the concentration vectors.
+    """
+    print(f"Generating LIBS-pipeline labeled data from {libs_config_path}...")
+    libs_cfg = yaml.safe_load(open(libs_config_path))
+    libs_cfg.setdefault('generation', {})
+    # Respect the libs_data.yaml seed unless caller overrides.
+    libs_cfg['generation'].setdefault('seed', seed)
+    downstream = libs_cfg.get('downstream', {})
+
+    ds = build_dataset_from_config(libs_cfg)
+    if len(ds) == 0:
+        raise RuntimeError("LIBS pipeline produced no labeled data — check sample matrix / DB.")
+
+    spectra = ds.spectra.astype(np.float32)
+    elements = downstream.get('elements_to_predict')  # None = all 60
+    concentrations, element_names, sample_type_ids = extract_finetune_labels(
+        ds.sample_table, elements=elements,
     )
 
-    # 70/15/15 split
-    train_idx = int(0.7 * total_samples)
-    val_idx = int(0.85 * total_samples)
+    # Override n_bins from the actual wavelength array
+    actual_n_bins = spectra.shape[1]
+    if config['data']['n_bins'] != actual_n_bins:
+        print(f"Overriding n_bins: {config['data']['n_bins']} -> {actual_n_bins}")
+        config['data']['n_bins'] = actual_n_bins
+        config['model']['max_seq_len'] = actual_n_bins + 1
+
+    # Override n_classes (= cluster count), n_elements (= concentration vector dim),
+    # and n_concentration_bins (per-element bin count for the binned task).
+    n_clusters = downstream.get('n_clusters', 10)
+    config['data']['n_classes'] = n_clusters
+    config['data']['n_elements'] = len(element_names)
+    config['data']['n_concentration_bins'] = downstream.get('n_concentration_bins', 1000)
+
+    cluster_labels = cluster_compositions(concentrations, n_clusters=n_clusters, seed=seed)
+
+    # Shared deterministic split — cached alongside the spectra. Pretrain and
+    # finetune will read the same JSON so test set is consistent across phases.
+    split_cfg = downstream.get('splits', {})
+    splits, splits_path = get_or_make_splits(
+        n=len(spectra),
+        cache_dir=ds.cache_dir,
+        cache_key=ds.cache_key,
+        val_fraction=split_cfg.get('val_fraction', 0.15),
+        test_fraction=split_cfg.get('test_fraction', 0.15),
+        seed=split_cfg.get('seed', seed),
+    )
+    print(f"Splits: train={len(splits['train'])}, val={len(splits['val'])}, "
+          f"test={len(splits['test'])}  (saved to {splits_path})")
+    print(f"Elements: {len(element_names)}  Clusters: {n_clusters}  "
+          f"Sample types: {len(np.unique(sample_type_ids))}")
+
+    def pick(idx):
+        return spectra[idx], cluster_labels[idx], concentrations[idx]
 
     return {
-        'train': (spectra[:train_idx], labels[:train_idx], concentrations[:train_idx]),
-        'val': (spectra[train_idx:val_idx], labels[train_idx:val_idx], concentrations[train_idx:val_idx]),
-        'test': (spectra[val_idx:], labels[val_idx:], concentrations[val_idx:]),
+        'train': pick(splits['train']),
+        'val':   pick(splits['val']),
+        'test':  pick(splits['test']),
+        'element_names': element_names,
     }
+
+
+def generate_labeled_data(config: dict, seed: int = 42, libs_config_path: str | None = None):
+    if libs_config_path:
+        return _generate_libs_pipeline_labeled(config, libs_config_path, seed)
+    return _generate_legacy_labeled(config, seed)
 
 
 def load_pretrained_model(config: dict, checkpoint_path: str) -> LIBSTransformer:
@@ -148,12 +225,16 @@ def main(args):
 
     pl.seed_everything(args.seed)
 
-    data = generate_labeled_data(config, seed=args.seed)
+    data = generate_labeled_data(config, seed=args.seed, libs_config_path=args.libs_data_config)
     train_spectra, train_labels, train_conc = data['train']
     val_spectra, val_labels, val_conc = data['val']
     test_spectra, test_labels, test_conc = data['test']
+    element_names = data.get('element_names')
 
     print(f"Train: {len(train_spectra)}, Val: {len(val_spectra)}, Test: {len(test_spectra)}")
+    if element_names is not None:
+        print(f"Predicting {len(element_names)} elements: {element_names[:10]}"
+              f"{'...' if len(element_names) > 10 else ''}")
 
     if pretrained_checkpoint:
         encoder = load_pretrained_model(config, str(pretrained_checkpoint))
@@ -161,10 +242,17 @@ def main(args):
         print("No pre-trained checkpoint provided, creating fresh model...")
         encoder = create_fresh_model(config)
 
+    # n_elements: prefer config.data.n_elements (set by the libs pipeline path);
+    # fall back to n_classes for the legacy 5-class generator.
+    n_elements = config['data'].get('n_elements', config['data']['n_classes'])
+    n_concentration_bins = config['data'].get('n_concentration_bins', 1000)
+
     finetune_module = LIBSFinetuneModule(
         encoder=encoder,
         task=args.task,
         n_classes=config['data']['n_classes'],
+        n_elements=n_elements,
+        n_concentration_bins=n_concentration_bins,
         freeze_encoder=args.freeze_encoder,
         learning_rate=config['finetune']['learning_rate'],
         weight_decay=config['finetune']['weight_decay'],
@@ -173,13 +261,14 @@ def main(args):
         pool=args.pool,
     )
 
+    needs_concentrations = args.task in ('regression', 'quantification', 'quantification_binned', 'both')
     data_module = FinetuneDataModule(
         train_spectra=train_spectra,
         train_labels=train_labels,
         val_spectra=val_spectra,
         val_labels=val_labels,
-        train_concentrations=train_conc if args.task in ['regression', 'both'] else None,
-        val_concentrations=val_conc if args.task in ['regression', 'both'] else None,
+        train_concentrations=train_conc if needs_concentrations else None,
+        val_concentrations=val_conc if needs_concentrations else None,
         batch_size=config['finetune']['batch_size'],
         num_workers=args.num_workers,
     )
@@ -210,11 +299,13 @@ def main(args):
             version='',
         )
 
-    # Monitor metric
+    # Monitor metric — task-specific so the best checkpoint reflects the right goal
     if args.task == 'classification':
         monitor, mon_mode = 'val/accuracy', 'max'
-    elif args.task == 'regression':
+    elif args.task in ('regression', 'quantification'):
         monitor, mon_mode = 'val/reg_mae', 'min'
+    elif args.task == 'quantification_binned':
+        monitor, mon_mode = 'val/bin_accuracy', 'max'
     else:
         monitor, mon_mode = 'val/loss', 'min'
 
@@ -246,6 +337,10 @@ def main(args):
     run_mgr.save_run_info({
         "task": args.task,
         "pool": args.pool,
+        "n_elements": n_elements,
+        "n_concentration_bins": n_concentration_bins,
+        "element_names": element_names,
+        "libs_data_config": args.libs_data_config,
         "model_params": encoder.num_parameters,
         "train_samples": len(train_spectra),
         "val_samples": len(val_spectra),
@@ -280,7 +375,7 @@ def main(args):
     print("\nEvaluating on test set...")
     test_dataset = LabeledLIBSDataset(
         spectra=test_spectra, labels=test_labels,
-        concentrations=test_conc if args.task in ['regression', 'both'] else None,
+        concentrations=test_conc if needs_concentrations else None,
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset, batch_size=config['finetune']['batch_size'],
@@ -291,6 +386,8 @@ def main(args):
         checkpoint_callback.best_model_path,
         encoder=encoder, task=args.task,
         n_classes=config['data']['n_classes'],
+        n_elements=n_elements,
+        n_concentration_bins=n_concentration_bins,
     )
     test_results = trainer.test(best_model, dataloaders=test_loader)
 
@@ -302,6 +399,10 @@ def main(args):
     run_mgr.save_run_info({
         "task": args.task,
         "pool": args.pool,
+        "n_elements": n_elements,
+        "n_concentration_bins": n_concentration_bins,
+        "element_names": element_names,
+        "libs_data_config": args.libs_data_config,
         "model_params": encoder.num_parameters,
         "train_samples": len(train_spectra),
         "val_samples": len(val_spectra),
@@ -332,8 +433,18 @@ if __name__ == "__main__":
     parser.add_argument('--runs_dir', type=str, default='runs')
     parser.add_argument('--pretrain_run_dir', type=str, default=None,
                         help='Path to pretrain run directory')
-    parser.add_argument('--task', type=str, choices=['classification', 'regression', 'both'],
-                        default='both')
+    parser.add_argument('--task', type=str,
+                        choices=['classification', 'quantification',
+                                 'quantification_binned', 'regression', 'both'],
+                        default='both',
+                        help='Downstream task: classification (cluster ID), '
+                             'quantification (MSE regression on concentrations), '
+                             'quantification_binned (per-element bin CE, upstream-style), '
+                             'regression/both (legacy, kept for backward compat)')
+    parser.add_argument('--libs_data_config', type=str, default=None,
+                        help='Path to physics-based LIBS data pipeline config '
+                             '(e.g. config/libs_data.yaml). If set, replaces the '
+                             'legacy 5-class SyntheticLIBSGenerator.')
     parser.add_argument('--pool', type=str, choices=['cls', 'mean', 'cls_mean'],
                         default='cls',
                         help='How to pool encoder outputs for the heads: '

@@ -3,10 +3,13 @@ Task-specific heads for LIBS Foundation Model.
 
 Includes heads for:
 - Classification (material identification)
-- Regression (concentration prediction)
+- Regression (concentration prediction)        — "standard" quantification
+- Binned quantification (per-element bin CE)   — inherited from
+  Daveboarder/Element_Identification (train_nn_autotransformer.py).
 - Masked intensity prediction
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 from typing import Optional
@@ -108,6 +111,81 @@ class RegressionHead(nn.Module):
         """
         x = self.regressor(cls_embedding)
         return self.activation(x)
+
+
+def concentration_to_bin(concentration, n_bins: int = 1000):
+    """Map concentration in [0, 1] to an integer bin index in [0, n_bins-1].
+
+    Mirrors upstream Daveboarder/Element_Identification convention:
+        c=0.0 -> 0,   c=0.75 -> 749,   c=1.0 -> n_bins-1
+    Works on numpy arrays or torch tensors.
+    """
+    if isinstance(concentration, torch.Tensor):
+        idx = torch.round(concentration * (n_bins - 1)).long()
+        return idx.clamp_(0, n_bins - 1)
+    arr = np.asarray(concentration, dtype=np.float64)
+    return np.clip(np.round(arr * (n_bins - 1)).astype(np.int64), 0, n_bins - 1)
+
+
+def bin_to_concentration(bin_idx, n_bins: int = 1000):
+    """Inverse of concentration_to_bin. Returns float in [0, 1]."""
+    if isinstance(bin_idx, torch.Tensor):
+        return bin_idx.to(torch.float32) / (n_bins - 1)
+    return np.asarray(bin_idx, dtype=np.float64) / (n_bins - 1)
+
+
+class BinnedQuantificationHead(nn.Module):
+    """Per-element bin-classification head for concentration prediction.
+
+    Architecture: one small 2-layer MLP branch per element, each producing
+    `n_bins` logits. Loss is cross-entropy applied independently per element
+    over the bin index target. At inference, argmax → bin_to_concentration.
+
+    Rationale (from upstream): concentrations span several orders of magnitude
+    (Fe ~0.95 vs trace ~1e-5), so a discrete classification objective gives a
+    more uniform gradient signal than MSE.
+
+    Args:
+        d_model: encoder representation dim
+        n_elements: number of element concentrations to predict
+        n_bins: number of discrete concentration bins (default 1000 = upstream)
+        hidden: per-branch hidden width
+        dropout: branch dropout
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_elements: int,
+        n_bins: int = 1000,
+        hidden: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n_elements = n_elements
+        self.n_bins = n_bins
+        self.branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, n_bins),
+            )
+            for _ in range(n_elements)
+        ])
+
+    def forward(self, representation: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            representation: [B, d_model] pooled encoder output
+        Returns:
+            logits: [B, n_elements, n_bins]
+        """
+        # Stack along element axis; each branch independently consumes the
+        # pooled representation. (Could be fused into one big linear, but
+        # per-element branches match upstream and isolate gradients.)
+        per_element = [branch(representation) for branch in self.branches]
+        return torch.stack(per_element, dim=1)
 
 
 class MaskedPredictionHead(nn.Module):

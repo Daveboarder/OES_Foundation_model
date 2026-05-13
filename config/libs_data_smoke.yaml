@@ -1,0 +1,28 @@
+# Smoke-test data config: 3 sample types × 2 shots each.
+paths:
+  db:                "external_data/Source/LIBS_data_vacuum.db"
+  sample_matrix:     "external_data/Source/Samples_Fe_matrix.xlsx"
+  wavelength_json:   "external_data/Data/VASKUT K8.json"
+  cache_dir:         "external_data/cache"
+
+ranges:
+  te: [6500.0, 11000.0]
+  ne: [1.0e+17, 5.0e+17]
+
+generation:
+  n_samples_per_type: 6      # small but enough to satisfy n_clusters + 3-way split
+  max_sample_types: 3
+  number_density:    1.0e-4
+  optical_path:      1.4e-4
+  n_workers:         1
+  seed:              42
+  verbose:           true
+
+downstream:
+  elements_to_predict: null  # all 60 columns
+  n_clusters: 3              # 3 sample types → 3 clusters
+  n_concentration_bins: 50   # tiny for smoke test (full is 1000)
+  splits:
+    val_fraction: 0.2
+    test_fraction: 0.2
+    seed: 42

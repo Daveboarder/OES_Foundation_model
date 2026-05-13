@@ -1,0 +1,55 @@
+# Smoke-test config: tiny model + 6 synth shots from the new pipeline.
+# Used only to verify the pipeline-through-Lightning wiring.
+
+data:
+  n_bins: 2048   # placeholder — overridden by pipeline to actual wavelength length
+  n_classes: 5
+  synthetic:
+    train_samples: 0       # unused with libs_data pipeline
+    val_samples: 0         # unused
+    test_samples: 0
+    labeled_samples: 0
+    noise_sigma: 0.02
+    peak_width_range: [5, 15]
+    intensity_variation: 0.3
+    val_fraction: 0.34     # 2/6 → val
+
+model:
+  d_model: 32
+  n_heads: 2
+  n_layers: 1
+  d_ff: 64
+  dropout: 0.0
+  max_seq_len: 2049
+
+pretrain:
+  mask_ratio: 0.15
+  mask_token_prob: 0.8
+  random_token_prob: 0.1
+  contiguous_masking: true
+  block_sizes: [50]
+  peak_bias_enabled: false
+  peak_bias_ratio: 0.5
+  peak_threshold: 0.2
+  batch_size: 2
+  epochs: 2
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+
+finetune:
+  batch_size: 4
+  epochs: 2
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder: false
+
+logging:
+  logger: "tensorboard"
+  log_every_n_steps: 1
+  val_check_interval: 1.0
+
+device:
+  accelerator: "cpu"
+  precision: "32"

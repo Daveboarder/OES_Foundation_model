@@ -1,0 +1,50 @@
+# =============================================================================
+# LIBS Synthetic Data Pipeline — physical parameters + resource paths
+# =============================================================================
+# Used by `data/libs_pipeline.build_dataset_from_config(cfg)`.
+# All paths are relative to the project root.
+# =============================================================================
+
+paths:
+  db:                "external_data/Source/LIBS_data_vacuum.db"
+  sample_matrix:     "external_data/Source/Samples_Fe_matrix.xlsx"
+  wavelength_json:   "external_data/Data/VASKUT K8.json"
+  cache_dir:         "external_data/cache"
+
+# Physical ranges sampled per simulated shot.
+# Te (plasma temperature) is uniform; Ne (electron density) is log-uniform.
+ranges:
+  te: [6500.0, 11000.0]     # Kelvin
+  ne: [1.0e+17, 5.0e+17]    # cm^-3
+
+# Generation knobs.
+generation:
+  n_samples_per_type: 50     # Shots per row of the Excel matrix (2256 rows → set ~5-20 for pretraining)
+  max_sample_types: null    # Cap total types; null = use all (~2256). Set to small int for smoke tests.
+  number_density:    1.0e-4 # N (cm^-3); upstream default
+  optical_path:      1.4e-4 # l (cm);    upstream default
+  n_workers:         1      # >1 enables multiprocessing pool (Windows: spawn-safe but slower)
+  seed:              42
+  verbose:           true
+
+# Downstream / fine-tune settings (only used by train_finetune.py).
+downstream:
+  # Per-element concentrations to predict. null = use every element column
+  # present in the sample matrix (~60 for Samples_Fe_matrix.xlsx).
+  # Set to an explicit list (e.g. ["Fe", "C", "Mn", "Si"]) to restrict.
+  elements_to_predict: null
+
+  # K-means cluster count on concentration vectors → classification labels.
+  # The raw sample_type_id space (2256 types) is too granular for classification.
+  n_clusters: 10
+
+  # Number of bins for the quantification_binned task (per element).
+  # Upstream Daveboarder/Element_Identification uses 1000.
+  n_concentration_bins: 1000
+
+  # Train/val/test split is materialised once and cached alongside the
+  # spectra HDF5 so pretrain and finetune share the same partition.
+  splits:
+    val_fraction: 0.15
+    test_fraction: 0.15
+    seed: 42

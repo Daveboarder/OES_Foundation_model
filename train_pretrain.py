@@ -27,6 +27,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.synthetic_generator import SyntheticLIBSGenerator
+from data.libs_pipeline import build_dataset_from_config
 from models.libs_transformer import LIBSTransformer
 from training.pretrain import LIBSPretrainModule, PretrainDataModule
 from utils.run_manager import RunManager
@@ -55,9 +56,9 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def generate_data(config: dict, seed: int = 42):
-    print("Generating synthetic data...")
-
+def _generate_legacy_synthetic(config: dict, seed: int):
+    """Original 5-class Gaussian-peak synthetic data (kept for sanity comparison)."""
+    print("Generating legacy synthetic data...")
     generator = SyntheticLIBSGenerator(
         n_bins=config['data']['n_bins'],
         noise_sigma=config['data']['synthetic']['noise_sigma'],
@@ -65,10 +66,9 @@ def generate_data(config: dict, seed: int = 42):
         intensity_variation=config['data']['synthetic']['intensity_variation'],
         seed=seed,
     )
-
-    train_samples = config['data']['synthetic']['train_samples']
-    train_spectra, _, _ = generator.generate_dataset(n_samples=train_samples, return_labels=True)
-
+    train_spectra, _, _ = generator.generate_dataset(
+        n_samples=config['data']['synthetic']['train_samples'], return_labels=True,
+    )
     generator_val = SyntheticLIBSGenerator(
         n_bins=config['data']['n_bins'],
         noise_sigma=config['data']['synthetic']['noise_sigma'],
@@ -76,10 +76,46 @@ def generate_data(config: dict, seed: int = 42):
         intensity_variation=config['data']['synthetic']['intensity_variation'],
         seed=seed + 1000,
     )
+    val_spectra, _, _ = generator_val.generate_dataset(
+        n_samples=config['data']['synthetic']['val_samples'], return_labels=True,
+    )
+    return train_spectra, val_spectra
 
-    val_samples = config['data']['synthetic']['val_samples']
-    val_spectra, _, _ = generator_val.generate_dataset(n_samples=val_samples, return_labels=True)
 
+def _generate_libs_pipeline(config: dict, libs_config_path: str, seed: int):
+    """Realistic physics-based synthesis (Daveboarder/Element_Identification heritage).
+
+    The full dataset is materialised once (cached to HDF5), then split into
+    train/val by `data.synthetic.val_fraction` (default 0.1). n_bins is
+    overridden in-place to match the actual wavelength array length."""
+    print(f"Generating LIBS-pipeline data from {libs_config_path}...")
+    libs_cfg = yaml.safe_load(open(libs_config_path))
+    libs_cfg.setdefault('generation', {})['seed'] = seed
+
+    ds = build_dataset_from_config(libs_cfg)
+    spectra = ds.spectra.astype(np.float32)
+    if spectra.size == 0:
+        raise RuntimeError("LIBS pipeline produced no spectra — check sample types / DB.")
+
+    # Override model n_bins to match the real wavelength axis (e.g. 69712)
+    actual_n_bins = spectra.shape[1]
+    if config['data']['n_bins'] != actual_n_bins:
+        print(f"Overriding n_bins: {config['data']['n_bins']} -> {actual_n_bins}")
+        config['data']['n_bins'] = actual_n_bins
+        config['model']['max_seq_len'] = actual_n_bins + 1
+
+    val_frac = config['data']['synthetic'].get('val_fraction', 0.1)
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(spectra))
+    n_val = max(1, int(len(spectra) * val_frac))
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    return spectra[train_idx], spectra[val_idx]
+
+
+def generate_data(config: dict, seed: int = 42, libs_config_path: str | None = None):
+    if libs_config_path:
+        return _generate_libs_pipeline(config, libs_config_path, seed)
+    train_spectra, val_spectra = _generate_legacy_synthetic(config, seed)
     print(f"Generated {len(train_spectra)} training samples")
     print(f"Generated {len(val_spectra)} validation samples")
     return train_spectra, val_spectra
@@ -111,7 +147,10 @@ def main(args):
 
     pl.seed_everything(args.seed)
 
-    train_spectra, val_spectra = generate_data(config, seed=args.seed)
+    train_spectra, val_spectra = generate_data(
+        config, seed=args.seed, libs_config_path=args.libs_data_config,
+    )
+    print(f"Train: {len(train_spectra)} samples | Val: {len(val_spectra)} samples | n_bins: {train_spectra.shape[1]}")
 
     if args.save_data:
         data_dir = run_mgr.run_dir / "data"
@@ -285,7 +324,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pre-train LIBS Foundation Model")
 
     parser.add_argument('--config', type=str, default='config/config.yaml',
-                        help='Path to config file')
+                        help='Path to model/training config file')
+    parser.add_argument('--libs_data_config', type=str, default=None,
+                        help='Path to physics-based LIBS data pipeline config '
+                             '(e.g. config/libs_data.yaml). If set, replaces the '
+                             'legacy SyntheticLIBSGenerator with the realistic pipeline.')
     parser.add_argument('--runs_dir', type=str, default='runs',
                         help='Base directory for all runs (default: runs/)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')

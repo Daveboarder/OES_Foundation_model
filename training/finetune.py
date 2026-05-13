@@ -10,32 +10,66 @@ import pytorch_lightning as pl
 from typing import Any, Dict, Optional, Literal
 import math
 
-from models.heads import ClassificationHead, RegressionHead
+from models.heads import (
+    BinnedQuantificationHead,
+    ClassificationHead,
+    RegressionHead,
+    bin_to_concentration,
+    concentration_to_bin,
+)
+
+
+# Tasks legend:
+#   'classification'         — single class label, cross-entropy
+#   'quantification'         — concentration vector, MSE (standard regression)
+#   'quantification_binned'  — per-element bin CE (upstream-style, 1000-way per element)
+#   'regression' / 'both'    — legacy aliases kept for backward compatibility:
+#                              'regression' == 'quantification' (sigmoid head),
+#                              'both' = classification + regression jointly.
+TaskName = Literal[
+    'classification',
+    'quantification',
+    'quantification_binned',
+    'regression',
+    'both',
+]
 
 
 class LIBSFinetuneModule(pl.LightningModule):
     """
-    PyTorch Lightning module for fine-tuning LIBS Transformer.
-    
-    Supports classification, regression, or both tasks.
-    
+    PyTorch Lightning module for fine-tuning the LIBS Transformer.
+
+    Supports four downstream tasks (see TaskName). The encoder is shared; each
+    task has its own head. Task choice fully determines what targets are read
+    from the batch:
+        - classification:        batch['label']           (int64, [B])
+        - quantification:        batch['concentrations']  (float32, [B, n_elements])
+        - quantification_binned: batch['concentrations']  (float32, [B, n_elements])
+        - both:                  batch['label'] + batch['concentrations']
+
     Args:
         encoder: Pre-trained LIBSTransformer encoder
-        task: Task type ('classification', 'regression', or 'both')
-        n_classes: Number of classes
+        task: One of TaskName
+        n_classes: Number of classes (classification only)
+        n_elements: Concentration vector dimension (quantification tasks).
+                    Defaults to n_classes for backward compat.
+        n_concentration_bins: Bin count for quantification_binned (upstream: 1000)
         freeze_encoder: Whether to freeze encoder weights
         learning_rate: Learning rate
         weight_decay: Weight decay
         warmup_epochs: Warmup epochs
         max_epochs: Maximum epochs
         class_weights: Optional class weights for imbalanced classification
+        pool: Pooling strategy for the encoder representation
     """
-    
+
     def __init__(
         self,
         encoder: nn.Module,
-        task: Literal['classification', 'regression', 'both'] = 'both',
+        task: TaskName = 'classification',
         n_classes: int = 5,
+        n_elements: Optional[int] = None,
+        n_concentration_bins: int = 1000,
         freeze_encoder: bool = False,
         learning_rate: float = 5e-5,
         weight_decay: float = 0.01,
@@ -50,6 +84,8 @@ class LIBSFinetuneModule(pl.LightningModule):
         self.encoder = encoder
         self.task = task
         self.n_classes = n_classes
+        self.n_elements = n_elements if n_elements is not None else n_classes
+        self.n_concentration_bins = n_concentration_bins
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_epochs = warmup_epochs
@@ -57,25 +93,27 @@ class LIBSFinetuneModule(pl.LightningModule):
         self.pool = pool
 
         d_model = encoder.d_model
-        # cls_mean concats CLS and mean-pool, doubling the head input dim
         head_in_dim = 2 * d_model if pool == 'cls_mean' else d_model
 
-        # Freeze encoder if requested
         if freeze_encoder:
             self.freeze_encoder()
 
-        # Task heads
-        if task in ['classification', 'both']:
+        # Heads — only built for tasks that need them.
+        if task in ('classification', 'both'):
             self.classification_head = ClassificationHead(head_in_dim, n_classes)
-            if class_weights is not None:
-                self.register_buffer('class_weights', class_weights)
-            else:
-                self.class_weights = None
+        if task in ('quantification', 'regression', 'both'):
+            self.regression_head = RegressionHead(head_in_dim, self.n_elements)
+        if task == 'quantification_binned':
+            self.binned_head = BinnedQuantificationHead(
+                d_model=head_in_dim,
+                n_elements=self.n_elements,
+                n_bins=n_concentration_bins,
+            )
 
-        if task in ['regression', 'both']:
-            self.regression_head = RegressionHead(head_in_dim, n_classes)
-        
-        # Loss functions
+        if class_weights is not None:
+            self.register_buffer('class_weights', class_weights)
+        else:
+            self.class_weights = None
         self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
         self.mse_loss = nn.MSELoss()
     
@@ -113,7 +151,13 @@ class LIBSFinetuneModule(pl.LightningModule):
             x: Input spectrum [batch_size, n_bins]
 
         Returns:
-            Dictionary with predictions
+            Dict with at least 'cls_embedding' and 'representation', plus
+            task-specific outputs:
+              - classification:        'class_logits'       [B, n_classes]
+              - quantification:        'concentrations'     [B, n_elements]
+              - quantification_binned: 'bin_logits'         [B, n_elements, n_bins]
+                                       'concentrations_pred' [B, n_elements] (argmax-decoded)
+              - both:                  'class_logits' + 'concentrations'
         """
         encoder_output = self.encoder(x)
         representation = self._pool(encoder_output)
@@ -123,12 +167,16 @@ class LIBSFinetuneModule(pl.LightningModule):
             'representation': representation,
         }
 
-        if self.task in ['classification', 'both']:
+        if self.task in ('classification', 'both'):
             result['class_logits'] = self.classification_head(representation)
-
-        if self.task in ['regression', 'both']:
+        if self.task in ('quantification', 'regression', 'both'):
             result['concentrations'] = self.regression_head(representation)
-
+        if self.task == 'quantification_binned':
+            logits = self.binned_head(representation)        # [B, E, N_BINS]
+            result['bin_logits'] = logits
+            result['concentrations_pred'] = bin_to_concentration(
+                logits.argmax(dim=-1), n_bins=self.n_concentration_bins,
+            )
         return result
     
     def compute_classification_loss(
@@ -181,112 +229,118 @@ class LIBSFinetuneModule(pl.LightningModule):
         """Compute regression metrics."""
         # MSE
         mse = self.mse_loss(predictions, targets)
-        
+
         # MAE
         mae = torch.abs(predictions - targets).mean()
-        
+
         # R-squared (per output, then averaged)
         ss_res = ((targets - predictions) ** 2).sum(dim=0)
         ss_tot = ((targets - targets.mean(dim=0)) ** 2).sum(dim=0)
         r2 = (1 - ss_res / (ss_tot + 1e-8)).mean()
-        
+
         return {
             'mse': mse,
             'mae': mae,
             'r2': r2,
         }
+
+    def compute_binned_loss(
+        self,
+        bin_logits: torch.Tensor,
+        concentrations: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-element bin CE loss. Targets are encoded on the fly from float
+        concentrations so the dataset can stay task-agnostic.
+
+        Args:
+            bin_logits: [B, n_elements, n_bins]
+            concentrations: [B, n_elements] float in [0, 1]
+        """
+        bin_targets = concentration_to_bin(concentrations, n_bins=self.n_concentration_bins)
+        # Flatten element axis into the batch axis for CE.
+        return nn.functional.cross_entropy(
+            bin_logits.reshape(-1, self.n_concentration_bins),
+            bin_targets.reshape(-1),
+        )
+
+    def compute_binned_metrics(
+        self,
+        bin_logits: torch.Tensor,
+        concentrations: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Bin-classification metrics plus decoded-concentration MAE/R²."""
+        bin_targets = concentration_to_bin(concentrations, n_bins=self.n_concentration_bins)
+        preds = bin_logits.argmax(dim=-1)
+        bin_acc = (preds == bin_targets).float().mean()
+
+        # Decoded scalar predictions for direct comparison to MSE baseline.
+        decoded = bin_to_concentration(preds, n_bins=self.n_concentration_bins)
+        mae = torch.abs(decoded - concentrations).mean()
+        ss_res = ((concentrations - decoded) ** 2).sum(dim=0)
+        ss_tot = ((concentrations - concentrations.mean(dim=0)) ** 2).sum(dim=0)
+        r2 = (1 - ss_res / (ss_tot + 1e-8)).mean()
+        return {
+            'bin_accuracy': bin_acc,
+            'decoded_mae': mae,
+            'decoded_r2': r2,
+        }
     
-    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """Training step."""
+    def _step(self, batch: Dict[str, torch.Tensor], stage: str) -> Dict[str, torch.Tensor]:
+        """Shared train/val/test logic, dispatched by self.task.
+
+        Args:
+            batch: dict containing 'spectrum' plus task-specific targets
+            stage: 'train', 'val', or 'test' (prefix for logged metrics)
+        """
         outputs = self(batch['spectrum'])
-        
         total_loss = torch.tensor(0.0, device=self.device)
-        
-        # Classification loss
-        if self.task in ['classification', 'both']:
-            cls_loss = self.compute_classification_loss(
-                outputs['class_logits'],
-                batch['label'],
-            )
+        on_step = (stage == 'train')
+        log_kw = dict(on_step=on_step, on_epoch=True, prog_bar=False, sync_dist=(stage != 'train'))
+        results: Dict[str, torch.Tensor] = {}
+
+        # ── Classification ───────────────────────────────────────────────
+        if self.task in ('classification', 'both'):
+            cls_loss = self.compute_classification_loss(outputs['class_logits'], batch['label'])
             total_loss = total_loss + cls_loss
-            self.log('train/cls_loss', cls_loss, on_step=True, on_epoch=True)
-            
-            # Metrics
-            metrics = self.compute_classification_metrics(
-                outputs['class_logits'],
-                batch['label'],
-            )
-            self.log('train/accuracy', metrics['accuracy'], on_step=True, on_epoch=True)
-        
-        # Regression loss
-        if self.task in ['regression', 'both'] and 'concentrations' in batch:
-            reg_loss = self.compute_regression_loss(
-                outputs['concentrations'],
-                batch['concentrations'],
-            )
-            total_loss = total_loss + reg_loss
-            self.log('train/reg_loss', reg_loss, on_step=True, on_epoch=True)
-            
-            # Metrics
-            metrics = self.compute_regression_metrics(
-                outputs['concentrations'],
-                batch['concentrations'],
-            )
-            self.log('train/reg_mae', metrics['mae'], on_step=True, on_epoch=True)
-        
-        self.log('train/loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
-        
-        return total_loss
-    
-    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
-        """Validation step."""
-        outputs = self(batch['spectrum'])
-        
-        total_loss = torch.tensor(0.0, device=self.device)
-        results = {}
-        
-        # Classification
-        if self.task in ['classification', 'both']:
-            cls_loss = self.compute_classification_loss(
-                outputs['class_logits'],
-                batch['label'],
-            )
-            total_loss = total_loss + cls_loss
-            self.log('val/cls_loss', cls_loss, on_epoch=True, sync_dist=True)
-            
-            metrics = self.compute_classification_metrics(
-                outputs['class_logits'],
-                batch['label'],
-            )
-            self.log('val/accuracy', metrics['accuracy'], on_epoch=True, prog_bar=True, sync_dist=True)
-            self.log('val/balanced_accuracy', metrics['balanced_accuracy'], on_epoch=True, sync_dist=True)
-            
+            self.log(f'{stage}/cls_loss', cls_loss, **log_kw)
+            m = self.compute_classification_metrics(outputs['class_logits'], batch['label'])
+            self.log(f'{stage}/accuracy', m['accuracy'], **{**log_kw, 'prog_bar': stage != 'train'})
+            self.log(f'{stage}/balanced_accuracy', m['balanced_accuracy'], **log_kw)
             results['predictions'] = outputs['class_logits'].argmax(dim=-1)
             results['labels'] = batch['label']
-        
-        # Regression
-        if self.task in ['regression', 'both'] and 'concentrations' in batch:
-            reg_loss = self.compute_regression_loss(
-                outputs['concentrations'],
-                batch['concentrations'],
-            )
+
+        # ── Standard quantification (regression) ─────────────────────────
+        if self.task in ('quantification', 'regression', 'both') and 'concentrations' in batch:
+            reg_loss = self.compute_regression_loss(outputs['concentrations'], batch['concentrations'])
             total_loss = total_loss + reg_loss
-            self.log('val/reg_loss', reg_loss, on_epoch=True, sync_dist=True)
-            
-            metrics = self.compute_regression_metrics(
-                outputs['concentrations'],
-                batch['concentrations'],
-            )
-            self.log('val/reg_mae', metrics['mae'], on_epoch=True, prog_bar=True, sync_dist=True)
-            self.log('val/reg_r2', metrics['r2'], on_epoch=True, sync_dist=True)
-            
+            self.log(f'{stage}/reg_loss', reg_loss, **log_kw)
+            m = self.compute_regression_metrics(outputs['concentrations'], batch['concentrations'])
+            self.log(f'{stage}/reg_mae', m['mae'], **{**log_kw, 'prog_bar': stage != 'train'})
+            self.log(f'{stage}/reg_r2', m['r2'], **log_kw)
             results['conc_predictions'] = outputs['concentrations']
             results['conc_targets'] = batch['concentrations']
-        
-        self.log('val/loss', total_loss, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        # ── Binned quantification ────────────────────────────────────────
+        if self.task == 'quantification_binned' and 'concentrations' in batch:
+            bin_loss = self.compute_binned_loss(outputs['bin_logits'], batch['concentrations'])
+            total_loss = total_loss + bin_loss
+            self.log(f'{stage}/bin_loss', bin_loss, **log_kw)
+            m = self.compute_binned_metrics(outputs['bin_logits'], batch['concentrations'])
+            self.log(f'{stage}/bin_accuracy', m['bin_accuracy'], **{**log_kw, 'prog_bar': stage != 'train'})
+            self.log(f'{stage}/decoded_mae', m['decoded_mae'], **log_kw)
+            self.log(f'{stage}/decoded_r2', m['decoded_r2'], **log_kw)
+            results['conc_predictions'] = outputs['concentrations_pred']
+            results['conc_targets'] = batch['concentrations']
+
+        self.log(f'{stage}/loss', total_loss, **{**log_kw, 'prog_bar': True})
         results['loss'] = total_loss
-        
         return results
+
+    def training_step(self, batch, batch_idx):
+        return self._step(batch, 'train')['loss']
+
+    def validation_step(self, batch, batch_idx):
+        return self._step(batch, 'val')
     
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
         """Test step (same as validation)."""
@@ -298,10 +352,12 @@ class LIBSFinetuneModule(pl.LightningModule):
         encoder_params = list(self.encoder.parameters())
         head_params = []
         
-        if self.task in ['classification', 'both']:
-            head_params.extend(list(self.classification_head.parameters()))
-        if self.task in ['regression', 'both']:
-            head_params.extend(list(self.regression_head.parameters()))
+        if self.task in ('classification', 'both'):
+            head_params.extend(self.classification_head.parameters())
+        if self.task in ('quantification', 'regression', 'both'):
+            head_params.extend(self.regression_head.parameters())
+        if self.task == 'quantification_binned':
+            head_params.extend(self.binned_head.parameters())
         
         # Use lower learning rate for encoder
         param_groups = [

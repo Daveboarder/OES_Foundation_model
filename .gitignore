@@ -49,6 +49,13 @@ runs/
 # External repos
 LIBSSS/
 
+# Pipeline cache + sanity outputs (regenerable)
+external_data/cache/
+sanity_checks/
+
+# Claude Code state
+.claude/
+
 # Dev / Claude artifacts
 CLAUDE.md
 CHANGELOG.md
