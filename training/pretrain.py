@@ -279,21 +279,25 @@ class PretrainDataModule(pl.LightningDataModule):
             print(f"  Avg peak bins: {stats['avg_peak_bins']:.1f}")
     
     def train_dataloader(self):
+        from data.dataset import libs_worker_init_fn
         return torch.utils.data.DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
+            worker_init_fn=libs_worker_init_fn if self.num_workers > 0 else None,
         )
-    
+
     def val_dataloader(self):
+        from data.dataset import libs_worker_init_fn
         return torch.utils.data.DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
+            worker_init_fn=libs_worker_init_fn if self.num_workers > 0 else None,
         )
 
 

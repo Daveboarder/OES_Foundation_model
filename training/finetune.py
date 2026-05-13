@@ -42,10 +42,11 @@ class LIBSFinetuneModule(pl.LightningModule):
         warmup_epochs: int = 5,
         max_epochs: int = 50,
         class_weights: Optional[torch.Tensor] = None,
+        pool: Literal['cls', 'mean', 'cls_mean'] = 'cls',
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['encoder', 'class_weights'])
-        
+
         self.encoder = encoder
         self.task = task
         self.n_classes = n_classes
@@ -53,23 +54,26 @@ class LIBSFinetuneModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
-        
+        self.pool = pool
+
         d_model = encoder.d_model
-        
+        # cls_mean concats CLS and mean-pool, doubling the head input dim
+        head_in_dim = 2 * d_model if pool == 'cls_mean' else d_model
+
         # Freeze encoder if requested
         if freeze_encoder:
             self.freeze_encoder()
-        
+
         # Task heads
         if task in ['classification', 'both']:
-            self.classification_head = ClassificationHead(d_model, n_classes)
+            self.classification_head = ClassificationHead(head_in_dim, n_classes)
             if class_weights is not None:
                 self.register_buffer('class_weights', class_weights)
             else:
                 self.class_weights = None
-        
+
         if task in ['regression', 'both']:
-            self.regression_head = RegressionHead(d_model, n_classes)
+            self.regression_head = RegressionHead(head_in_dim, n_classes)
         
         # Loss functions
         self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
@@ -85,28 +89,46 @@ class LIBSFinetuneModule(pl.LightningModule):
         for param in self.encoder.parameters():
             param.requires_grad = True
     
+    def _pool(self, encoder_output: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Build the downstream representation from encoder outputs.
+
+        - 'cls': CLS token only [B, d_model]
+        - 'mean': mean over sequence positions (excluding CLS) [B, d_model]
+        - 'cls_mean': concat of CLS and mean-pool [B, 2*d_model]
+        """
+        cls = encoder_output['cls_embedding']
+        if self.pool == 'cls':
+            return cls
+        seq = encoder_output['sequence_embeddings']  # [B, n_bins, d_model]
+        mean = seq.mean(dim=1)
+        if self.pool == 'mean':
+            return mean
+        return torch.cat([cls, mean], dim=-1)
+
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
-        
+
         Args:
             x: Input spectrum [batch_size, n_bins]
-            
+
         Returns:
             Dictionary with predictions
         """
-        # Get encoder outputs
         encoder_output = self.encoder(x)
-        cls_embedding = encoder_output['cls_embedding']
-        
-        result = {'cls_embedding': cls_embedding}
-        
+        representation = self._pool(encoder_output)
+
+        result = {
+            'cls_embedding': encoder_output['cls_embedding'],
+            'representation': representation,
+        }
+
         if self.task in ['classification', 'both']:
-            result['class_logits'] = self.classification_head(cls_embedding)
-        
+            result['class_logits'] = self.classification_head(representation)
+
         if self.task in ['regression', 'both']:
-            result['concentrations'] = self.regression_head(cls_embedding)
-        
+            result['concentrations'] = self.regression_head(representation)
+
         return result
     
     def compute_classification_loss(

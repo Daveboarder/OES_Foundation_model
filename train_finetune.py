@@ -170,6 +170,7 @@ def main(args):
         weight_decay=config['finetune']['weight_decay'],
         warmup_epochs=5,
         max_epochs=config['finetune']['epochs'],
+        pool=args.pool,
     )
 
     data_module = FinetuneDataModule(
@@ -244,6 +245,7 @@ def main(args):
     # Run info
     run_mgr.save_run_info({
         "task": args.task,
+        "pool": args.pool,
         "model_params": encoder.num_parameters,
         "train_samples": len(train_spectra),
         "val_samples": len(val_spectra),
@@ -299,6 +301,7 @@ def main(args):
 
     run_mgr.save_run_info({
         "task": args.task,
+        "pool": args.pool,
         "model_params": encoder.num_parameters,
         "train_samples": len(train_spectra),
         "val_samples": len(val_spectra),
@@ -331,6 +334,11 @@ if __name__ == "__main__":
                         help='Path to pretrain run directory')
     parser.add_argument('--task', type=str, choices=['classification', 'regression', 'both'],
                         default='both')
+    parser.add_argument('--pool', type=str, choices=['cls', 'mean', 'cls_mean'],
+                        default='cls',
+                        help='How to pool encoder outputs for the heads: '
+                             'cls (CLS token only), mean (mean over bins), '
+                             'cls_mean (concat of both, head input is 2*d_model)')
     parser.add_argument('--freeze_encoder', action='store_true')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--experiment_name', type=str, default=None)

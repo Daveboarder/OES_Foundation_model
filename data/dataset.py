@@ -127,7 +127,13 @@ class MaskedLIBSDataset(Dataset):
         
         self.transform = transform
         self.rng = np.random.default_rng(seed)
-    
+
+    def _reseed(self, seed: int) -> None:
+        """Re-seed the per-instance rng. Called by worker_init_fn so each
+        DataLoader worker derives a distinct, reproducible mask stream from
+        the master torch seed (which advances per epoch via the sampler)."""
+        self.rng = np.random.default_rng(seed)
+
     def __len__(self) -> int:
         return len(self.spectra)
     
@@ -575,6 +581,26 @@ def create_labeled_data_loaders(
     )
     
     return train_loader, val_loader
+
+
+def libs_worker_init_fn(worker_id: int) -> None:
+    """DataLoader worker initializer.
+
+    PyTorch sets `worker_info.seed` per worker from the main-process torch
+    rng (which advances per epoch via the RandomSampler). We use that seed
+    to deterministically reseed the dataset's numpy rng so:
+      - different workers see different mask streams in the same epoch
+      - the same worker sees a different mask stream each epoch
+      - the whole sequence is reproducible from the master torch seed
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return
+    dataset = info.dataset
+    # torch worker seed is uint64; numpy default_rng accepts up to 2**32-1 safely.
+    seed = info.seed % (2**32)
+    if hasattr(dataset, '_reseed'):
+        dataset._reseed(seed)
 
 
 if __name__ == "__main__":

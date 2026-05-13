@@ -103,10 +103,18 @@ def load_finetune_model(checkpoint_path: str, config: dict):
     d_model = config['model']['d_model']
     n_classes = config['data']['n_classes']
 
-    cls_head = ClassificationHead(d_model=d_model, n_classes=n_classes)
-    reg_head = RegressionHead(d_model=d_model, n_outputs=n_classes)
-
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    # Recover pool from Lightning hparams so heads are sized correctly.
+    # Older checkpoints predate the pool option → default to 'cls'.
+    pool = 'cls'
+    if isinstance(checkpoint, dict):
+        pool = checkpoint.get('hyper_parameters', {}).get('pool', 'cls')
+    head_in_dim = 2 * d_model if pool == 'cls_mean' else d_model
+    print(f"Finetune pool: {pool} (head input dim={head_in_dim})")
+
+    cls_head = ClassificationHead(d_model=head_in_dim, n_classes=n_classes)
+    reg_head = RegressionHead(d_model=head_in_dim, n_outputs=n_classes)
 
     if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
@@ -140,7 +148,7 @@ def load_finetune_model(checkpoint_path: str, config: dict):
     model.eval()
     cls_head.eval()
     reg_head.eval()
-    return model, cls_head, reg_head
+    return model, cls_head, reg_head, pool
 
 
 def generate_test_data(config: dict, n_samples: int = 1000, seed: int = 9999):
@@ -369,7 +377,7 @@ def evaluate_finetune(
     print("EVALUATING FINE-TUNED MODEL")
     print("="*60)
 
-    model, cls_head, reg_head = load_finetune_model(checkpoint_path, config)
+    model, cls_head, reg_head, pool = load_finetune_model(checkpoint_path, config)
     model = model.to(device)
     cls_head = cls_head.to(device)
     reg_head = reg_head.to(device)
@@ -390,9 +398,18 @@ def evaluate_finetune(
             output = model(batch)
             cls_emb = output['cls_embedding']
 
-            cls_logits = cls_head(cls_emb)
-            reg_preds = reg_head(cls_emb)
+            # Apply the same pooling used at fine-tune time
+            if pool == 'cls':
+                rep = cls_emb
+            elif pool == 'mean':
+                rep = output['sequence_embeddings'].mean(dim=1)
+            else:  # cls_mean
+                rep = torch.cat([cls_emb, output['sequence_embeddings'].mean(dim=1)], dim=-1)
 
+            cls_logits = cls_head(rep)
+            reg_preds = reg_head(rep)
+
+            # t-SNE on CLS embedding (kept consistent across pool choices)
             all_embeddings.append(cls_emb.cpu().numpy())
             all_cls_preds.append(cls_logits.cpu().numpy())
             all_reg_preds.append(reg_preds.cpu().numpy())
