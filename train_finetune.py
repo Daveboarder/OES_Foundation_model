@@ -34,6 +34,10 @@ from data.libs_pipeline import (
     extract_finetune_labels,
     get_or_make_splits,
 )
+from data.line_embedding_pipeline import (
+    prepare_line_token_assets,
+    prepare_line_tokens_assets,
+)
 from models.libs_transformer import LIBSTransformer
 from training.finetune import LIBSFinetuneModule, FinetuneDataModule
 from utils.run_manager import RunManager
@@ -57,6 +61,88 @@ class SaveRawEncoderCallback(Callback):
 def load_config(config_path: str) -> dict:
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def _checkpoint_state_dict(checkpoint) -> dict:
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+        if any(k.startswith('model.') for k in state_dict.keys()):
+            return {
+                k[len('model.'):]: v for k, v in state_dict.items()
+                if k.startswith('model.')
+            }
+        return state_dict
+    return checkpoint
+
+
+def _load_weights_shape_safe(model: LIBSTransformer, state_dict: dict) -> None:
+    """Load only tensors with matching shapes (skips mip_head etc. when unused in finetune)."""
+    model_sd = model.state_dict()
+    filtered = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key not in model_sd:
+            continue
+        if model_sd[key].shape != value.shape:
+            skipped.append(key)
+            continue
+        filtered[key] = value
+
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    if skipped:
+        print(f"  Skipped {len(skipped)} keys due to shape mismatch (expected for mip_head when finetuning):")
+        for k in skipped[:8]:
+            print(f"    - {k}: checkpoint {tuple(state_dict[k].shape)} vs model {tuple(model_sd[k].shape)}")
+        if len(skipped) > 8:
+            print(f"    ... and {len(skipped) - 8} more")
+    if missing:
+        n_emb = sum(1 for k in missing if k.startswith('embedding.'))
+        n_enc = sum(1 for k in missing if k.startswith('encoder_blocks.'))
+        print(f"  Missing keys: {len(missing)} (embedding={n_emb}, encoder={n_enc}, other={len(missing) - n_emb - n_enc})")
+        if n_emb > 0 and n_enc > 0:
+            raise RuntimeError(
+                "Checkpoint architecture does not match the finetune model — "
+                "embedding and encoder weights could not be loaded. "
+                "Use the same embedding_type and model config as pre-training "
+                "(see pretrain run config.yaml / run_info.yaml)."
+            )
+    if unexpected:
+        print(f"  Unexpected keys in checkpoint (ignored): {len(unexpected)}")
+
+
+def align_config_with_pretrain_run(config: dict, args, pretrain_run_dir: str) -> None:
+    """Match model/embedding settings to the pretrain run so checkpoints load correctly."""
+    run_dir = Path(pretrain_run_dir)
+    run_info_path = run_dir / "run_info.yaml"
+    pretrain_cfg_path = run_dir / "config.yaml"
+    if not run_info_path.is_file():
+        return
+
+    run_info = yaml.safe_load(open(run_info_path))
+    pretrain_emb = run_info.get("embedding_type")
+    finetune_emb = config.get("model", {}).get("embedding_type", "intensity")
+
+    if pretrain_emb and pretrain_emb != finetune_emb:
+        print(
+            f"\nAligning with pretrain run: embedding_type {finetune_emb!r} -> {pretrain_emb!r} "
+            f"(from {run_info_path})"
+        )
+
+    if pretrain_cfg_path.is_file():
+        pretrain_cfg = yaml.safe_load(open(pretrain_cfg_path))
+        if "model" in pretrain_cfg:
+            config["model"].update(pretrain_cfg["model"])
+
+    lec = run_info.get("line_embedding_config")
+    if lec:
+        if not args.line_embedding_config:
+            args.line_embedding_config = lec
+            print(f"  Inherited --line_embedding_config {lec}")
+        elif Path(lec).resolve() != Path(args.line_embedding_config).resolve():
+            print(
+                f"  WARNING: --line_embedding_config ({args.line_embedding_config}) "
+                f"differs from pretrain ({lec})"
+            )
 
 
 def _generate_legacy_labeled(config: dict, seed: int):
@@ -148,6 +234,8 @@ def _generate_libs_pipeline_labeled(config: dict, libs_config_path: str, seed: i
         'val':   pick(splits['val']),
         'test':  pick(splits['test']),
         'element_names': element_names,
+        'splits': splits,
+        'libs_dataset': ds,
     }
 
 
@@ -157,8 +245,14 @@ def generate_labeled_data(config: dict, seed: int = 42, libs_config_path: str | 
     return _generate_legacy_labeled(config, seed)
 
 
-def load_pretrained_model(config: dict, checkpoint_path: str) -> LIBSTransformer:
-    model = LIBSTransformer(
+def load_pretrained_model(
+    config: dict,
+    checkpoint_path: str,
+    line_dict_meta: dict | None = None,
+    line_token_meta: dict | None = None,
+) -> LIBSTransformer:
+    emb_type = config['model'].get('embedding_type', 'intensity')
+    kwargs = dict(
         n_bins=config['data']['n_bins'],
         d_model=config['model']['d_model'],
         n_heads=config['model']['n_heads'],
@@ -166,26 +260,34 @@ def load_pretrained_model(config: dict, checkpoint_path: str) -> LIBSTransformer
         d_ff=config['model']['d_ff'],
         dropout=config['model']['dropout'],
         n_classes=config['data']['n_classes'],
+        embedding_type=emb_type,
     )
+    if emb_type == 'line_token' and line_dict_meta:
+        kwargs['n_lines'] = line_dict_meta['n_lines']
+        kwargs['line_dict_meta'] = line_dict_meta
+        kwargs['n_elements_vocab'] = line_dict_meta.get('n_elements', 53)
+    if emb_type == 'line_token_linear' and line_token_meta:
+        kwargs['n_lines'] = line_token_meta['n_lines']
+        kwargs['line_token_meta'] = line_token_meta
+        kwargs['n_mip_target_channels'] = int(
+            config['model'].get('n_mip_target_channels', 2)
+        )
+    model = LIBSTransformer(**kwargs)
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-
-    # Handle Lightning checkpoint vs raw weights
-    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-        state_dict = checkpoint['state_dict']
-        if any(k.startswith('model.') for k in state_dict.keys()):
-            state_dict = {k[len('model.'):]: v for k, v in state_dict.items()
-                          if k.startswith('model.')}
-    else:
-        state_dict = checkpoint
-
-    model.load_state_dict(state_dict)
-    print(f"Loaded pre-trained model from {checkpoint_path}")
+    state_dict = _checkpoint_state_dict(checkpoint)
+    _load_weights_shape_safe(model, state_dict)
+    print(f"Loaded pre-trained weights from {checkpoint_path}")
     return model
 
 
-def create_fresh_model(config: dict) -> LIBSTransformer:
-    model = LIBSTransformer(
+def create_fresh_model(
+    config: dict,
+    line_dict_meta: dict | None = None,
+    line_token_meta: dict | None = None,
+) -> LIBSTransformer:
+    emb_type = config['model'].get('embedding_type', 'intensity')
+    kwargs = dict(
         n_bins=config['data']['n_bins'],
         d_model=config['model']['d_model'],
         n_heads=config['model']['n_heads'],
@@ -193,7 +295,19 @@ def create_fresh_model(config: dict) -> LIBSTransformer:
         d_ff=config['model']['d_ff'],
         dropout=config['model']['dropout'],
         n_classes=config['data']['n_classes'],
+        embedding_type=emb_type,
     )
+    if emb_type == 'line_token' and line_dict_meta:
+        kwargs['n_lines'] = line_dict_meta['n_lines']
+        kwargs['line_dict_meta'] = line_dict_meta
+        kwargs['n_elements_vocab'] = line_dict_meta.get('n_elements', 53)
+    if emb_type == 'line_token_linear' and line_token_meta:
+        kwargs['n_lines'] = line_token_meta['n_lines']
+        kwargs['line_token_meta'] = line_token_meta
+        kwargs['n_mip_target_channels'] = int(
+            config['model'].get('n_mip_target_channels', 2)
+        )
+    model = LIBSTransformer(**kwargs)
     print(f"Created fresh model with {model.num_parameters:,} parameters")
     return model
 
@@ -207,8 +321,9 @@ def main(args):
 
     if args.pretrain_run_dir:
         pretrain_mgr = RunManager.from_existing_run(args.pretrain_run_dir)
-        pretrained_checkpoint = pretrain_mgr.get_checkpoint_for_mode("pretrain")
         pretrain_run_dir = str(pretrain_mgr.run_dir)
+        align_config_with_pretrain_run(config, args, pretrain_run_dir)
+        pretrained_checkpoint = pretrain_mgr.get_checkpoint_for_mode("pretrain")
         if pretrained_checkpoint is None:
             raise ValueError(f"No checkpoint found in pretrain run: {args.pretrain_run_dir}")
         print(f"Using pretrained model from: {pretrain_run_dir}")
@@ -225,22 +340,76 @@ def main(args):
 
     pl.seed_everything(args.seed)
 
+    line_dict_meta = None
+    line_token_meta = None
+    line_features_path = None
+    line_tokens_path = None
+    train_indices = val_indices = test_indices = None
+
+    requested_emb = config['model'].get('embedding_type', 'intensity')
+    if args.line_embedding_config and requested_emb == 'intensity':
+        requested_emb = 'line_token_linear'
+        config['model']['embedding_type'] = requested_emb
+    use_line_token = requested_emb in ('line_token', 'line_token_linear')
+    if use_line_token:
+        if not args.line_embedding_config or not args.libs_data_config:
+            raise ValueError(
+                f"embedding_type={requested_emb!r} finetune requires "
+                "--line_embedding_config and --libs_data_config"
+            )
+
     data = generate_labeled_data(config, seed=args.seed, libs_config_path=args.libs_data_config)
     train_spectra, train_labels, train_conc = data['train']
     val_spectra, val_labels, val_conc = data['val']
     test_spectra, test_labels, test_conc = data['test']
     element_names = data.get('element_names')
 
-    print(f"Train: {len(train_spectra)}, Val: {len(val_spectra)}, Test: {len(test_spectra)}")
+    if use_line_token and 'libs_dataset' in data:
+        ds = data['libs_dataset']
+        if requested_emb == 'line_token':
+            line_dict_meta = prepare_line_token_assets(
+                ds.spectra.astype(np.float32),
+                ds.wavelength,
+                args.line_embedding_config,
+                spectra_cache_key=ds.cache_key,
+                verbose=True,
+            )
+            n_lines = line_dict_meta['n_lines']
+            line_features_path = line_dict_meta['line_features_path']
+        else:
+            line_token_meta = prepare_line_tokens_assets(
+                ds.spectra.astype(np.float32),
+                ds.wavelength,
+                args.line_embedding_config,
+                spectra_cache_key=ds.cache_key,
+                verbose=True,
+            )
+            n_lines = line_token_meta['n_lines']
+            line_tokens_path = line_token_meta['line_tokens_path']
+        config['data']['n_bins'] = n_lines
+        config['model']['max_seq_len'] = n_lines + 1
+        splits = data['splits']
+        train_indices = splits['train']
+        val_indices = splits['val']
+        test_indices = splits['test']
+        print(f"Line tokens: {n_lines} lines per spectrum")
+
+    print(f"Train: {len(train_labels)}, Val: {len(val_labels)}, Test: {len(test_labels)}")
     if element_names is not None:
         print(f"Predicting {len(element_names)} elements: {element_names[:10]}"
               f"{'...' if len(element_names) > 10 else ''}")
 
     if pretrained_checkpoint:
-        encoder = load_pretrained_model(config, str(pretrained_checkpoint))
+        encoder = load_pretrained_model(
+            config, str(pretrained_checkpoint),
+            line_dict_meta=line_dict_meta,
+            line_token_meta=line_token_meta,
+        )
     else:
         print("No pre-trained checkpoint provided, creating fresh model...")
-        encoder = create_fresh_model(config)
+        encoder = create_fresh_model(
+            config, line_dict_meta=line_dict_meta, line_token_meta=line_token_meta,
+        )
 
     # n_elements: prefer config.data.n_elements (set by the libs pipeline path);
     # fall back to n_classes for the legacy 5-class generator.
@@ -262,15 +431,20 @@ def main(args):
     )
 
     needs_concentrations = args.task in ('regression', 'quantification', 'quantification_binned', 'both')
+    spectra_unused = line_features_path is not None or line_tokens_path is not None
     data_module = FinetuneDataModule(
-        train_spectra=train_spectra,
+        train_spectra=train_spectra if not spectra_unused else None,
         train_labels=train_labels,
-        val_spectra=val_spectra,
+        val_spectra=val_spectra if not spectra_unused else None,
         val_labels=val_labels,
         train_concentrations=train_conc if needs_concentrations else None,
         val_concentrations=val_conc if needs_concentrations else None,
         batch_size=config['finetune']['batch_size'],
         num_workers=args.num_workers,
+        line_features_path=line_features_path,
+        line_tokens_path=line_tokens_path,
+        train_indices=train_indices,
+        val_indices=val_indices,
     )
 
     # Logger
@@ -337,14 +511,18 @@ def main(args):
     run_mgr.save_run_info({
         "task": args.task,
         "pool": args.pool,
+        "embedding_type": config['model'].get('embedding_type', 'intensity'),
         "n_elements": n_elements,
         "n_concentration_bins": n_concentration_bins,
         "element_names": element_names,
         "libs_data_config": args.libs_data_config,
+        "line_embedding_config": args.line_embedding_config,
+        "line_features_path": line_features_path,
+        "line_tokens_path": line_tokens_path,
         "model_params": encoder.num_parameters,
-        "train_samples": len(train_spectra),
-        "val_samples": len(val_spectra),
-        "test_samples": len(test_spectra),
+        "train_samples": len(train_labels),
+        "val_samples": len(val_labels),
+        "test_samples": len(test_labels),
         "freeze_encoder": args.freeze_encoder,
         "pretrain_run": pretrain_run_dir,
         "pretrain_checkpoint": str(pretrained_checkpoint) if pretrained_checkpoint else None,
@@ -373,10 +551,27 @@ def main(args):
 
     # Test
     print("\nEvaluating on test set...")
-    test_dataset = LabeledLIBSDataset(
-        spectra=test_spectra, labels=test_labels,
-        concentrations=test_conc if needs_concentrations else None,
-    )
+    if line_tokens_path:
+        from data.dataset import LineTokensLabeledDataset
+        test_dataset = LineTokensLabeledDataset(
+            line_tokens_path,
+            test_labels,
+            concentrations=test_conc if needs_concentrations else None,
+            indices=test_indices,
+        )
+    elif line_features_path:
+        from data.dataset import LineTokenLabeledDataset
+        test_dataset = LineTokenLabeledDataset(
+            line_features_path,
+            test_labels,
+            concentrations=test_conc if needs_concentrations else None,
+            indices=test_indices,
+        )
+    else:
+        test_dataset = LabeledLIBSDataset(
+            spectra=test_spectra, labels=test_labels,
+            concentrations=test_conc if needs_concentrations else None,
+        )
     test_loader = torch.utils.data.DataLoader(
         test_dataset, batch_size=config['finetune']['batch_size'],
         shuffle=False, num_workers=args.num_workers,
@@ -399,14 +594,18 @@ def main(args):
     run_mgr.save_run_info({
         "task": args.task,
         "pool": args.pool,
+        "embedding_type": config['model'].get('embedding_type', 'intensity'),
         "n_elements": n_elements,
         "n_concentration_bins": n_concentration_bins,
         "element_names": element_names,
         "libs_data_config": args.libs_data_config,
+        "line_embedding_config": args.line_embedding_config,
+        "line_features_path": line_features_path,
+        "line_tokens_path": line_tokens_path,
         "model_params": encoder.num_parameters,
-        "train_samples": len(train_spectra),
-        "val_samples": len(val_spectra),
-        "test_samples": len(test_spectra),
+        "train_samples": len(train_labels),
+        "val_samples": len(val_labels),
+        "test_samples": len(test_labels),
         "freeze_encoder": args.freeze_encoder,
         "pretrain_run": pretrain_run_dir,
         "seed": args.seed,
@@ -445,6 +644,8 @@ if __name__ == "__main__":
                         help='Path to physics-based LIBS data pipeline config '
                              '(e.g. config/libs_data.yaml). If set, replaces the '
                              'legacy 5-class SyntheticLIBSGenerator.')
+    parser.add_argument('--line_embedding_config', type=str, default=None,
+                        help='Path to config/line_embedding.yaml for line-as-token mode.')
     parser.add_argument('--pool', type=str, choices=['cls', 'mean', 'cls_mean'],
                         default='cls',
                         help='How to pool encoder outputs for the heads: '

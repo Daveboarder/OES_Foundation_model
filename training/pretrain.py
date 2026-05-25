@@ -9,6 +9,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from typing import Any, Dict, Optional
 import math
+import numpy as np
 
 
 class LIBSPretrainModule(pl.LightningModule):
@@ -48,8 +49,17 @@ class LIBSPretrainModule(pl.LightningModule):
         # Loss function
         self.mse_loss = nn.MSELoss()
     
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        batch: Dict[str, torch.Tensor],
+        mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """Forward pass through the model."""
+        if 'tokens' in batch:
+            return self.model({'tokens': batch['tokens'], 'fit_valid': batch.get('fit_valid')})
+        if 'line_features' in batch:
+            return self.model({'line_features': batch['line_features']})
+        x = batch.get('input', batch.get('spectrum'))
         return self.model(x, mask=mask)
     
     def compute_loss(
@@ -89,18 +99,26 @@ class LIBSPretrainModule(pl.LightningModule):
         Returns:
             Loss value
         """
-        # Only replace mask-token positions (type 1) with learnable mask embedding.
-        # Type 2 (random value) and type 3 (unchanged) keep their projected embeddings,
-        # preserving the BERT-style 80/10/10 strategy.
-        embedding_mask = (batch['mask_type'] == 1)
-        outputs = self.model(batch['input'], mask=embedding_mask)
-
-        # Compute loss on ALL masked positions (all 15%), not just mask-token ones
-        loss = self.compute_loss(
-            predictions=outputs['mip_predictions'],
-            targets=batch['target'],
-            mask=batch['mask'],
-        )
+        if 'tokens' in batch:
+            outputs = self.model({'tokens': batch['tokens'], 'fit_valid': batch.get('fit_valid')})
+            preds = outputs['mip_predictions']
+            targets = batch['target']
+            line_mask = batch['mask']
+            loss = self.model.compute_mip_loss(preds, targets, line_mask)
+        elif 'line_features' in batch:
+            outputs = self.model({'line_features': batch['line_features']})
+            preds = outputs['mip_predictions']
+            targets = batch['target']
+            line_mask = batch['mask']
+            loss = self.model.compute_mip_loss(preds, targets, line_mask)
+        else:
+            embedding_mask = (batch['mask_type'] == 1)
+            outputs = self.model(batch['input'], mask=embedding_mask)
+            loss = self.compute_loss(
+                predictions=outputs['mip_predictions'],
+                targets=batch['target'],
+                mask=batch['mask'],
+            )
         
         # Log metrics
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -119,21 +137,42 @@ class LIBSPretrainModule(pl.LightningModule):
         Returns:
             Dictionary with loss and predictions
         """
-        # Same BERT-style masking as training: only type-1 positions get mask embedding
-        embedding_mask = (batch['mask_type'] == 1)
-        outputs = self.model(batch['input'], mask=embedding_mask)
-
-        # Loss on ALL masked positions
-        loss = self.compute_loss(
-            predictions=outputs['mip_predictions'],
-            targets=batch['target'],
-            mask=batch['mask'],
-        )
+        if 'tokens' in batch:
+            outputs = self.model({'tokens': batch['tokens'], 'fit_valid': batch.get('fit_valid')})
+            preds = outputs['mip_predictions']
+            targets = batch['target']
+            line_mask = batch['mask']
+            loss = self.model.compute_mip_loss(preds, targets, line_mask)
+            with torch.no_grad():
+                m = line_mask.unsqueeze(-1).expand_as(preds)
+                masked_preds = preds[m]
+                masked_targets = targets[m]
+        elif 'line_features' in batch:
+            outputs = self.model({'line_features': batch['line_features']})
+            preds = outputs['mip_predictions']
+            targets = batch['target']
+            line_mask = batch['mask']
+            loss = self.model.compute_mip_loss(preds, targets, line_mask)
+            with torch.no_grad():
+                m = line_mask.unsqueeze(-1).expand_as(preds)
+                masked_preds = preds[m]
+                masked_targets = targets[m]
+        else:
+            embedding_mask = (batch['mask_type'] == 1)
+            outputs = self.model(batch['input'], mask=embedding_mask)
+            loss = self.compute_loss(
+                predictions=outputs['mip_predictions'],
+                targets=batch['target'],
+                mask=batch['mask'],
+            )
+            with torch.no_grad():
+                masked_preds = outputs['mip_predictions'][batch['mask']]
+                masked_targets = batch['target'][batch['mask']]
         
         # Compute additional metrics
         with torch.no_grad():
-            masked_preds = outputs['mip_predictions'][batch['mask']]
-            masked_targets = batch['target'][batch['mask']]
+            if 'line_features' not in batch and 'tokens' not in batch:
+                pass  # masked_preds set above
             
             if masked_preds.numel() > 0:
                 mae = torch.abs(masked_preds - masked_targets).mean()
@@ -215,8 +254,8 @@ class PretrainDataModule(pl.LightningDataModule):
     
     def __init__(
         self,
-        train_spectra,
-        val_spectra,
+        train_spectra=None,
+        val_spectra=None,
         batch_size: int = 64,
         mask_ratio: float = 0.15,
         contiguous_masking: bool = False,
@@ -225,8 +264,11 @@ class PretrainDataModule(pl.LightningDataModule):
         peak_bias_ratio: float = 0.5,
         peak_threshold: float = 0.2,
         num_workers: int = 0,
-        # Legacy
         contiguous_mask_size: int = 50,
+        line_features_path: Optional[str] = None,
+        line_tokens_path: Optional[str] = None,
+        train_indices: Optional[np.ndarray] = None,
+        val_indices: Optional[np.ndarray] = None,
     ):
         super().__init__()
         self.train_spectra = train_spectra
@@ -234,49 +276,79 @@ class PretrainDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.mask_ratio = mask_ratio
         self.contiguous_masking = contiguous_masking
-        
-        # Handle block sizes (new) vs contiguous_mask_size (legacy)
-        if block_sizes is not None:
-            self.block_sizes = block_sizes
-        else:
-            self.block_sizes = [contiguous_mask_size]
-        
+        self.block_sizes = block_sizes if block_sizes is not None else [contiguous_mask_size]
         self.peak_bias_enabled = peak_bias_enabled
         self.peak_bias_ratio = peak_bias_ratio
         self.peak_threshold = peak_threshold
         self.num_workers = num_workers
+        self.line_features_path = line_features_path
+        self.line_tokens_path = line_tokens_path
+        self.train_indices = train_indices
+        self.val_indices = val_indices
     
     def setup(self, stage: Optional[str] = None):
         """Setup datasets."""
-        from data.dataset import MaskedLIBSDataset
+        from data.dataset import (
+            MaskedLIBSDataset,
+            MaskedLineTokenDataset,
+            MaskedLineTokensDataset,
+        )
+        import numpy as np
         
         if stage == 'fit' or stage is None:
-            self.train_dataset = MaskedLIBSDataset(
-                spectra=self.train_spectra,
-                mask_ratio=self.mask_ratio,
-                contiguous_masking=self.contiguous_masking,
-                block_sizes=self.block_sizes,
-                peak_bias_enabled=self.peak_bias_enabled,
-                peak_bias_ratio=self.peak_bias_ratio,
-                peak_threshold=self.peak_threshold,
-            )
-            self.val_dataset = MaskedLIBSDataset(
-                spectra=self.val_spectra,
-                mask_ratio=self.mask_ratio,
-                contiguous_masking=self.contiguous_masking,
-                block_sizes=self.block_sizes,
-                peak_bias_enabled=self.peak_bias_enabled,
-                peak_bias_ratio=self.peak_bias_ratio,
-                peak_threshold=self.peak_threshold,
-            )
-            
-            # Log masking statistics
-            stats = self.train_dataset.get_masking_stats(n_samples=100)
-            print(f"\nMasking Statistics (from 100 samples):")
-            print(f"  Avg masked bins: {stats['avg_masked_bins']:.1f}")
-            print(f"  Avg masked ratio: {stats['avg_masked_ratio']:.2%}")
-            print(f"  Peak coverage: {stats['peak_coverage']:.2%}")
-            print(f"  Avg peak bins: {stats['avg_peak_bins']:.1f}")
+            if self.line_tokens_path:
+                self.train_dataset = MaskedLineTokensDataset(
+                    self.line_tokens_path,
+                    indices=self.train_indices,
+                    mask_ratio=self.mask_ratio,
+                )
+                self.val_dataset = MaskedLineTokensDataset(
+                    self.line_tokens_path,
+                    indices=self.val_indices,
+                    mask_ratio=self.mask_ratio,
+                    seed=43,
+                )
+                print(f"\nLine-tokens pretrain (pre-baked HDF5): "
+                      f"{len(self.train_dataset)} train / {len(self.val_dataset)} val spectra")
+            elif self.line_features_path:
+                self.train_dataset = MaskedLineTokenDataset(
+                    self.line_features_path,
+                    indices=self.train_indices,
+                    mask_ratio=self.mask_ratio,
+                )
+                self.val_dataset = MaskedLineTokenDataset(
+                    self.line_features_path,
+                    indices=self.val_indices,
+                    mask_ratio=self.mask_ratio,
+                    seed=43,
+                )
+                print(f"\nLine-token pretrain: {len(self.train_dataset)} train / "
+                      f"{len(self.val_dataset)} val spectra")
+            else:
+                self.train_dataset = MaskedLIBSDataset(
+                    spectra=self.train_spectra,
+                    mask_ratio=self.mask_ratio,
+                    contiguous_masking=self.contiguous_masking,
+                    block_sizes=self.block_sizes,
+                    peak_bias_enabled=self.peak_bias_enabled,
+                    peak_bias_ratio=self.peak_bias_ratio,
+                    peak_threshold=self.peak_threshold,
+                )
+                self.val_dataset = MaskedLIBSDataset(
+                    spectra=self.val_spectra,
+                    mask_ratio=self.mask_ratio,
+                    contiguous_masking=self.contiguous_masking,
+                    block_sizes=self.block_sizes,
+                    peak_bias_enabled=self.peak_bias_enabled,
+                    peak_bias_ratio=self.peak_bias_ratio,
+                    peak_threshold=self.peak_threshold,
+                )
+                stats = self.train_dataset.get_masking_stats(n_samples=100)
+                print(f"\nMasking Statistics (from 100 samples):")
+                print(f"  Avg masked bins: {stats['avg_masked_bins']:.1f}")
+                print(f"  Avg masked ratio: {stats['avg_masked_ratio']:.2%}")
+                print(f"  Peak coverage: {stats['peak_coverage']:.2%}")
+                print(f"  Avg peak bins: {stats['avg_peak_bins']:.1f}")
     
     def train_dataloader(self):
         from data.dataset import libs_worker_init_fn

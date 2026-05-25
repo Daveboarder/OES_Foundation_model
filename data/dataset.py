@@ -480,6 +480,240 @@ class LabeledLIBSDataset(Dataset):
         return result
 
 
+class LineFeaturesDataset(Dataset):
+    """Read precomputed [n_lines, 6] features from HDF5 by spectrum index."""
+
+    def __init__(self, features_path: str, indices: Optional[np.ndarray] = None):
+        import h5py
+        self.features_path = str(features_path)
+        with h5py.File(self.features_path, "r") as f:
+            self._n_spectra = int(f.attrs["n_spectra"])
+        self.indices = np.arange(self._n_spectra) if indices is None else np.asarray(indices, dtype=np.int64)
+        self._file = None
+
+    def _open(self):
+        if self._file is None:
+            import h5py
+            self._file = h5py.File(self.features_path, "r")
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        self._open()
+        spec_idx = int(self.indices[idx])
+        return torch.from_numpy(self._file["features"][spec_idx].astype(np.float32))
+
+
+class MaskedLineTokenDataset(LineFeaturesDataset):
+    """
+    Self-supervised line-token batches for MIP on Voigt fit channels.
+
+    Masks a fraction of lines with valid fits; zeros max_intensity & FWHM in input.
+    """
+
+    def __init__(
+        self,
+        features_path: str,
+        indices: Optional[np.ndarray] = None,
+        mask_ratio: float = 0.15,
+        seed: int = 42,
+    ):
+        super().__init__(features_path, indices=indices)
+        self.mask_ratio = mask_ratio
+        self.rng = np.random.default_rng(seed)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        from data.line_features import FEAT_FWHM, FEAT_MAX_INT, FEAT_VALID
+
+        feats = super().__getitem__(idx).clone()
+        valid = feats[:, FEAT_VALID] > 0.5
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            line_mask = torch.zeros(feats.size(0), dtype=torch.bool)
+        else:
+            n_mask = max(1, int(n_valid * self.mask_ratio))
+            valid_idx = torch.where(valid)[0].numpy()
+            chosen = self.rng.choice(valid_idx, size=min(n_mask, len(valid_idx)), replace=False)
+            line_mask = torch.zeros(feats.size(0), dtype=torch.bool)
+            line_mask[chosen] = True
+
+        input_feats = feats.clone()
+        input_feats[line_mask, FEAT_MAX_INT] = 0.0
+        input_feats[line_mask, FEAT_FWHM] = 0.0
+
+        target = feats[:, :2].clone()  # max_I, FWHM
+
+        return {
+            "line_features": input_feats,
+            "target": target,
+            "mask": line_mask,
+            "input": input_feats,  # alias for pretrain module
+        }
+
+
+class LineTokensDataset(Dataset):
+    """
+    Lazy reader over the pre-baked ``line_tokens_<hash>.h5`` cache built by
+    :func:`data.line_tokenization.build_line_tokens_cache`.
+
+    Yields ``{"tokens": [n_lines, n_features], "fit_valid": [n_lines]}`` per
+    spectrum index. The HDF5 file is opened lazily (per worker) so this
+    dataset is safe to use with ``DataLoader(num_workers > 0)``.
+    """
+
+    def __init__(self, tokens_path: str, indices: Optional[np.ndarray] = None):
+        import h5py
+        self.tokens_path = str(tokens_path)
+        with h5py.File(self.tokens_path, "r") as f:
+            self._n_spectra = int(f.attrs["n_spectra"])
+            self.n_lines = int(f.attrs["n_lines"])
+            self.n_features = int(f.attrs["n_features"])
+        self.indices = (
+            np.arange(self._n_spectra) if indices is None
+            else np.asarray(indices, dtype=np.int64)
+        )
+        self._file = None
+
+    def _open(self):
+        if self._file is None:
+            import h5py
+            self._file = h5py.File(self.tokens_path, "r")
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def _read(self, spec_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        self._open()
+        toks = self._file["tokens"][spec_idx].astype(np.float32)
+        valid = self._file["fit_valid"][spec_idx].astype(np.uint8)
+        return toks, valid
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        spec_idx = int(self.indices[idx])
+        toks, valid = self._read(spec_idx)
+        return {
+            "tokens": torch.from_numpy(toks),
+            "fit_valid": torch.from_numpy(valid),
+        }
+
+
+class MaskedLineTokensDataset(LineTokensDataset):
+    """
+    Self-supervised batches for the ``line_token_linear`` model.
+
+    A fraction of *valid* lines is masked. For each masked line:
+        - Targets are the original feature values at
+          ``target_feature_indices`` (default: max_intensity + FWHM).
+        - Input feature values at those same channels are zeroed.
+    The encoder receives ``fit_valid`` so attention can still ignore
+    failed Voigt fits (independent of masking).
+    """
+
+    def __init__(
+        self,
+        tokens_path: str,
+        indices: Optional[np.ndarray] = None,
+        mask_ratio: float = 0.15,
+        target_feature_indices: Optional[Tuple[int, ...]] = None,
+        seed: int = 42,
+    ):
+        super().__init__(tokens_path, indices=indices)
+        from data.line_tokenization import MIP_TARGET_INDICES
+        self.mask_ratio = float(mask_ratio)
+        self.target_feature_indices = tuple(
+            target_feature_indices if target_feature_indices is not None else MIP_TARGET_INDICES
+        )
+        self.rng = np.random.default_rng(seed)
+
+    def _reseed(self, seed: int) -> None:
+        self.rng = np.random.default_rng(seed)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        spec_idx = int(self.indices[idx])
+        toks, valid = self._read(spec_idx)
+        n_lines = toks.shape[0]
+        targets_np = toks[:, list(self.target_feature_indices)].copy()
+
+        valid_idx = np.flatnonzero(valid > 0)
+        line_mask = np.zeros(n_lines, dtype=bool)
+        if valid_idx.size > 0:
+            n_mask = max(1, int(round(valid_idx.size * self.mask_ratio)))
+            chosen = self.rng.choice(valid_idx, size=min(n_mask, valid_idx.size), replace=False)
+            line_mask[chosen] = True
+            for ci in self.target_feature_indices:
+                toks[chosen, ci] = 0.0
+
+        return {
+            "tokens": torch.from_numpy(toks),
+            "fit_valid": torch.from_numpy(valid),
+            "target": torch.from_numpy(targets_np),
+            "mask": torch.from_numpy(line_mask),
+            "input": torch.from_numpy(toks),  # alias for symmetry with intensity path
+        }
+
+
+class LineTokensLabeledDataset(LineTokensDataset):
+    """Labeled fine-tuning with pre-baked tokens + class / concentration targets."""
+
+    def __init__(
+        self,
+        tokens_path: str,
+        labels: np.ndarray,
+        concentrations: Optional[np.ndarray] = None,
+        indices: Optional[np.ndarray] = None,
+    ):
+        super().__init__(tokens_path, indices=indices)
+        self.labels = np.asarray(labels).astype(np.int64)
+        self.concentrations = (
+            None if concentrations is None
+            else np.asarray(concentrations, dtype=np.float32)
+        )
+        if len(self.labels) != len(self.indices):
+            raise ValueError(
+                f"labels ({len(self.labels)}) must match indices ({len(self.indices)})"
+            )
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        spec_idx = int(self.indices[idx])
+        toks, valid = self._read(spec_idx)
+        out = {
+            "tokens": torch.from_numpy(toks),
+            "fit_valid": torch.from_numpy(valid),
+            "label": torch.tensor(self.labels[idx], dtype=torch.long),
+        }
+        if self.concentrations is not None:
+            out["concentrations"] = torch.from_numpy(self.concentrations[idx])
+        return out
+
+
+class LineTokenLabeledDataset(LineFeaturesDataset):
+    """Labeled fine-tuning with line features + class/concentration targets."""
+
+    def __init__(
+        self,
+        features_path: str,
+        labels: np.ndarray,
+        concentrations: Optional[np.ndarray] = None,
+        indices: Optional[np.ndarray] = None,
+    ):
+        super().__init__(features_path, indices=indices)
+        self.labels = np.asarray(labels).astype(np.int64)
+        self.concentrations = None if concentrations is None else np.asarray(concentrations, dtype=np.float32)
+        assert len(self.labels) == len(self.indices)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        feats = super().__getitem__(idx)
+        out = {
+            "line_features": feats,
+            "spectrum": feats,  # legacy key for modules that read batch['spectrum']
+            "label": torch.tensor(self.labels[idx], dtype=torch.long),
+        }
+        if self.concentrations is not None:
+            out["concentrations"] = torch.from_numpy(self.concentrations[idx])
+        return out
+
+
 def create_data_loaders(
     train_spectra: np.ndarray,
     val_spectra: np.ndarray,

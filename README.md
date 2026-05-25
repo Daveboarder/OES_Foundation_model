@@ -1,445 +1,217 @@
 # LIBS Foundation Model
 
-A self-supervised foundation model for Laser Induced Breakdown Spectroscopy (LIBS) using a BERT-style transformer architecture with masked intensity prediction.
+A self-supervised foundation model for Laser Induced Breakdown Spectroscopy (LIBS) using a BERT-style transformer. Training uses the **physics-based LIBS pipeline** (Voigt synthesis, ~17k wavelength bins, HDF5 cache) with a choice of **bin (intensity) embedding** or **line-token embedding**.
 
 ## Overview
 
-This project implements a foundation model for LIBS spectroscopy that:
+1. **Pre-trains** on unlabeled spectra (Masked Intensity Prediction on bins, or masked line-feature prediction on spectral lines)
+2. **Fine-tunes** for classification, regression, and **binned quantification** (`quantification_binned` with decoded R²)
+3. **Data** — `config/libs_data.yaml` (~112k shots from the sample matrix) or `config/libs_data_smoke.yaml` for quick tests
 
-1. **Pre-trains** on unlabeled spectra using Masked Intensity Prediction (MIP) — predicting masked regions of the spectrum
-2. **Fine-tunes** for downstream tasks: material classification and element concentration regression
-3. Uses **synthetic data** with 5 material classes for development and testing
+See [ARCHITECTURE.md](ARCHITECTURE.md) for design detail, [PROJECT_SUMMARY.html](PROJECT_SUMMARY.html) / [PROJECT_SUMMARY.json](PROJECT_SUMMARY.json) for full CLI and layout reference.
 
-The key idea is that self-supervised pre-training learns useful spectral representations without labels, enabling better downstream performance with fewer labeled samples.
+## Embedding modes
 
-## Features
+| Mode | Config | CLI | Sequence | Pre-train target |
+|------|--------|-----|----------|------------------|
+| **Bin (intensity)** | `embedding_type: intensity` (default) | `--libs_data_config` only | ~17,428 bins + CLS | Masked bin intensities (MIP) |
+| **Line-token** | `embedding_type: line_token` | `--libs_data_config` + `--line_embedding_config` | ~2k–8k lines + CLS | Masked Voigt features (max_I, FWHM) |
+| **Line-token-linear** | `embedding_type: line_token_linear` | same CLI (default when `--line_embedding_config` is set) | ~2k–8k lines + CLS | Same MIP targets; reads pre-baked tokens |
 
-- **Self-supervised pre-training** via Masked Intensity Prediction (MIP)
-- **Contiguous + peak-biased masking** — masks variable-size blocks (25-100 bins) biased toward peak regions, with BERT-style 80/10/10 token replacement
-- **Transformer architecture** adapted for continuous spectral data (2048 bins)
-- **Synthetic data generation** with 5 material classes (Fe, Cu, Al, Ca, Mixed)
-- **Fine-tuning support** for classification and concentration regression
-- **Organized run management** — each run creates a timestamped folder with all outputs
-- **Comprehensive evaluation** with visualizations and metrics
-- **Two configs**: full training (A100) and local testing (16GB GPU)
+Checkpoints are **not interchangeable** between modes (different sequence length and weights).
+
+### Line-token pipeline (three HDF5 caches)
+
+Offline preprocessing (reusable across training runs):
+
+1. **Line dictionary** (`data/line_dictionary.py`) — theoretical intensities over a Te×Ne grid from `LIBS_data_vacuum.db`; keep lines above `intensity_threshold` → `line_dict_*.h5`
+2. **Line features** (`data/line_features.py`) — per-spectrum Voigt fit at each line centre → `line_features_*.h5` `[n_spectra, n_lines, 6]`
+3. **Line tokens** (`data/line_tokenization.py`) — merge dictionary + fits into one tensor per line → `line_tokens_*.h5` `[n_spectra, n_lines, 14]` (raw values + `feature_mean`/`feature_std` in attrs)
+
+At training time:
+
+- **`line_token`** — loads `line_features_*.h5`; `LineTokenEmbedding` concatenates quantum scalars + `nn.Embedding` element/ion + fit features at runtime.
+- **`line_token_linear`** — loads only `line_tokens_*.h5`; `LinearLineTokenEmbedding` z-scores the 14 channels and applies `nn.Linear(14, d_model)`.
+
+Build tokens once:
+
+```bash
+uv run python scripts/build_line_tokens.py \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding.yaml
+```
+
+**Token features (14 channels, stored raw):** wavelength, Ei, Ek, log10(gi/gk/Ak/I_theory), atomic number Z, ion_binary (0=I, 1=II+), max_intensity, FWHM, R², Δλ, RMSE. `fit_valid` is a separate uint8 mask for the encoder.
 
 ---
 
-## Quick Start
-
-### 1. Setup Environment
-
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
+## Quick start
 
 ```bash
 uv sync
 ```
 
-This creates a `.venv` and installs all dependencies from `uv.lock`.
-
-### 2. Explore Synthetic Data
+### Pre-train — bin embedding (RTX 4090)
 
 ```bash
-uv run python data/explorations/visualize_synthetic_data.py
+uv run python train_pretrain.py \
+  --config config/config_libs_4090.yaml \
+  --libs_data_config config/libs_data.yaml \
+  --experiment_name libs_bin_pretrain \
+  --num_workers 4
 ```
 
-Generates visualizations in `data/explorations/figures/`.
-
-### 3. Run Pre-training (Local Test)
+### Pre-train — line-token (runtime embedding)
 
 ```bash
-uv run python train_pretrain.py --config config/config_local.yaml --experiment_name my_test
+uv run python train_pretrain.py \
+  --config config/config_libs_token_4090.yaml \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding.yaml \
+  --experiment_name libs_line_pretrain \
+  --num_workers 4
 ```
 
-This creates a timestamped run directory like:
-```
-runs/pretrain_2024-02-05_14-30-25_my_test/
-├── config.yaml          # Copy of config used
-├── run_info.yaml        # Run metadata
-├── checkpoints/         # Model checkpoints
-│   ├── epoch=05-val_loss=0.0150.ckpt
-│   ├── last.ckpt
-│   └── final_model.pt
-└── logs/                # TensorBoard logs
-```
+First run builds `line_dict_*.h5` and `line_features_*.h5` (Voigt fits can take hours on full data).
 
-### 4. Evaluate the Model
+### Pre-train — line-token-linear (pre-baked tokens + `nn.Linear`)
 
 ```bash
-# Using run directory (recommended)
-uv run python evaluate_model.py --run_dir runs/pretrain_2024-02-05_14-30-25_my_test
+# Optional: materialize line_tokens_*.h5 first (skipped if already cached)
+uv run python scripts/build_line_tokens.py \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding.yaml
 
-# Or with explicit paths (legacy)
-uv run python evaluate_model.py \
-    --checkpoint runs/pretrain_2024-02-05_14-30-25_my_test/checkpoints/final_model.pt \
-    --config config/config_local.yaml \
-    --mode pretrain
+uv run python train_pretrain.py \
+  --config config/config_libs_token_linear_4090.yaml \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding.yaml \
+  --experiment_name libs_token_linear_pretrain \
+  --num_workers 4
 ```
 
-Evaluation outputs go to `{run_dir}/evaluation/`.
+Training only touches `line_tokens_*.h5` (dictionary and Voigt caches remain as intermediate artefacts).
 
-### 5. List All Runs
+### Fine-tune (binned quantification)
 
 ```bash
-uv run python list_runs.py                    # List all runs
-uv run python list_runs.py --type pretrain    # Filter by type
-uv run python list_runs.py --latest           # Show most recent
-uv run python list_runs.py --details runs/pretrain_...  # Show details
+uv run python train_finetune.py \
+  --config config/config_libs_4090.yaml \
+  --pretrain_run_dir runs/pretrain_<your_run> \
+  --libs_data_config config/libs_data.yaml \
+  --task quantification_binned \
+  --pool cls_mean \
+  --experiment_name libs_binned_ft
 ```
 
----
+Use the **same** `--config`, `--libs_data_config`, and (for line-token) `--line_embedding_config` as pre-training.
 
-## Run Directory Structure
-
-Each training run creates a self-contained folder with everything needed:
-
-```
-runs/
-├── pretrain_2024-02-05_14-30-25_my_experiment/
-│   ├── config.yaml          # Exact config used (for reproducibility)
-│   ├── run_info.yaml        # Metadata: params, samples, status, etc.
-│   ├── checkpoints/
-│   │   ├── epoch=05-val_loss=0.0150.ckpt
-│   │   ├── last.ckpt
-│   │   └── final_model.pt
-│   ├── logs/                # TensorBoard or W&B logs
-│   └── evaluation/          # Created by evaluate_model.py
-│       └── eval_2024-02-05_16-00-00/
-│           ├── pretrain_reconstruction_examples.png
-│           ├── pretrain_error_analysis.png
-│           └── pretrain_metrics.txt
-│
-├── finetune_2024-02-06_09-00-00_classification/
-│   ├── config.yaml
-│   ├── run_info.yaml        # Includes reference to pretrain run
-│   ├── checkpoints/
-│   └── evaluation/
+```bash
+uv run python list_runs.py --latest
+uv run tensorboard --logdir runs/
 ```
 
 ---
 
 ## Configuration
 
-Three configuration files are provided:
+### Model / training
 
-| Config | Use Case | GPU | Model Size | Data Size | Epochs |
-|--------|----------|-----|------------|-----------|--------|
-| `config/config_local.yaml` | Local testing | RTX 16GB | 3M params | 5k samples | 10 |
-| `config/config.yaml` | Standard training | 24-40GB | 3M params | 50k samples | 100 |
-| `config/config_a100.yaml` | Large-scale | A100 40-80GB | **500M params** | 500k samples | 100 |
+| Config | Embedding | GPU | Notes |
+|--------|-----------|-----|--------|
+| `config/config_libs_smoke.yaml` | bin | any | Smoke wiring |
+| `config/config_libs_4090.yaml` | bin | RTX 4090 | ~17k bins, 5 pretrain epochs |
+| `config/config_libs_a100.yaml` | bin | A100 | 60/30 epochs |
+| `config/config_libs_token_4090.yaml` | line_token | RTX 4090 | ~8k lines (default threshold) |
+| `config/config_libs_token.yaml` | line_token | any | Small model for smoke |
+| `config/config_libs_token_linear_4090.yaml` | line_token_linear | RTX 4090 | Pre-baked tokens + `nn.Linear` |
+| `config/config_libs_token_linear.yaml` | line_token_linear | any | Smoke for token-linear path |
 
-### Key Configuration Options
+### Data and line embedding
 
-```yaml
-# config/config.yaml (or config_local.yaml)
+| Config | Role |
+|--------|------|
+| `config/libs_data.yaml` | Full dataset (~2256 types × 50 shots) |
+| `config/libs_data_smoke.yaml` | 3 types × 6 shots |
+| `config/line_embedding.yaml` | Te/Ne grid, `intensity_threshold`, Voigt-fit settings |
+| `config/line_embedding_smoke.yaml` | `max_lines: 400` for fast tests |
 
-data:
-  n_bins: 2048                    # Spectrum resolution
-  n_classes: 5                    # Number of material classes
-  synthetic:
-    train_samples: 50000          # Training data size
-    noise_sigma: 0.02             # Noise level
-
-model:
-  d_model: 256                    # Transformer hidden dimension (1024 for A100)
-  n_heads: 8                      # Attention heads (16 for A100)
-  n_layers: 6                     # Transformer layers (24 for A100)
-  d_ff: 1024                      # Feed-forward dimension (4096 for A100)
-  dropout: 0.1                    # Dropout rate
-
-pretrain:
-  mask_ratio: 0.15                # Fraction of spectrum to mask
-  
-  # Contiguous block masking (recommended)
-  contiguous_masking: true
-  block_sizes: [25, 50, 100, 150] # Variable block sizes (randomly sampled)
-  
-  # Peak-biased masking (ensures masks cover peaks, not just noise)
-  peak_bias_enabled: true
-  peak_bias_ratio: 0.5            # 50% of masks must overlap with peaks
-  peak_threshold: 0.2             # Intensity threshold for peak detection
-  
-  batch_size: 64
-  epochs: 100
-  learning_rate: 1.0e-4
-
-finetune:
-  batch_size: 32
-  epochs: 50
-  freeze_encoder: false           # Whether to freeze pre-trained weights
-
-logging:
-  logger: "tensorboard"           # "tensorboard" or "wandb"
-
-device:
-  precision: "bf16-mixed"         # "bf16-mixed" (A100), 16 (older GPUs), 32 (full)
-```
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed documentation on masking strategies and model design.
+**Line threshold:** `line_dictionary.intensity_threshold` in `line_embedding.yaml` (default `1e-35`; `1e-33` keeps ~2,425 lines vs ~8,119 at `1e-35`).
 
 ---
 
-## Training Pipeline
+## Training CLI (essentials)
 
-### Step 1: Pre-training (Self-Supervised)
-
-Pre-train the transformer using Masked Intensity Prediction:
-
-```bash
-# Full training (A100)
-uv run python train_pretrain.py --config config/config.yaml --experiment_name pretrain_v1
-
-# Local testing (16GB GPU)
-uv run python train_pretrain.py --config config/config_local.yaml --experiment_name local_test
-```
-
-**Options:**
 | Flag | Description |
 |------|-------------|
-| `--config PATH` | Config file to use |
-| `--runs_dir DIR` | Base directory for runs (default: `runs/`) |
-| `--experiment_name NAME` | Name added to run folder |
-| `--save_data` | Save generated data to run directory |
-| `--early_stopping` | Enable early stopping on val loss |
-| `--num_workers N` | Data loading workers (default: 0) |
-| `--seed N` | Random seed (default: 42) |
+| `--config` | Model size, epochs, batch size |
+| `--libs_data_config` | **Required** for real LIBS data (`libs_data.yaml`) |
+| `--line_embedding_config` | Line-token modes (`line_embedding.yaml`); defaults to `line_token_linear` unless config sets `embedding_type` |
+| `--experiment_name` | Run folder suffix |
+| `--num_workers` | DataLoader workers (default 0) |
 
-**Output:** `runs/pretrain_{timestamp}_{experiment_name}/`
-
-### Step 2: Fine-tuning (Supervised)
-
-Fine-tune the pre-trained model for downstream tasks:
-
-```bash
-# Using pretrain run directory (recommended)
-uv run python train_finetune.py \
-    --pretrain_run_dir runs/pretrain_2024-02-05_14-30-25_my_test \
-    --task both \
-    --experiment_name finetune_v1
-
-# Or with explicit checkpoint path
-uv run python train_finetune.py \
-    --pretrained_checkpoint path/to/model.pt \
-    --config config/config.yaml \
-    --task both
-```
-
-**Options:**
-| Flag | Description |
-|------|-------------|
-| `--pretrain_run_dir PATH` | Pretrain run directory (auto-finds checkpoint) |
-| `--pretrained_checkpoint PATH` | Path to pre-trained model (legacy) |
-| `--task {classification,regression,both}` | Downstream task |
-| `--freeze_encoder` | Freeze encoder weights (linear probe) |
-
-**Output:** `runs/finetune_{timestamp}_{task}/`
-
-### Step 3: Evaluation
-
-Evaluate trained models with comprehensive visualizations:
-
-```bash
-# Evaluate using run directory (recommended)
-uv run python evaluate_model.py --run_dir runs/pretrain_2024-02-05_14-30-25_my_test
-
-# Auto-detects mode (pretrain/finetune) from run directory
-```
-
-**Outputs (saved to `{run_dir}/evaluation/`):**
-- `pretrain_reconstruction_examples.png` — Original vs reconstructed spectra
-- `pretrain_error_analysis.png` — Error distribution and analysis
-- `pretrain_embeddings_tsne.png` — t-SNE of learned representations
-- `finetune_classification.png` — Confusion matrix and accuracy
-- `finetune_regression.png` — Scatter plots for concentration prediction
-- `*_metrics.txt` — Numeric metrics summary
+**Fine-tune:** `--pretrain_run_dir`, `--task` (`quantification_binned`, `classification`, …), `--pool` (`cls`, `mean`, `cls_mean`).
 
 ---
 
-## Data Exploration
-
-Visualize synthetic data characteristics:
+## Compare bin vs line-token (same data)
 
 ```bash
-uv run python data/explorations/visualize_synthetic_data.py
+LIBS=config/libs_data.yaml
+SEED=42
+
+# Bin
+uv run python train_pretrain.py --config config/config_libs_4090.yaml \
+  --libs_data_config $LIBS --seed $SEED --experiment_name compare_bin
+
+# Line-token (runtime embedding)
+uv run python train_pretrain.py --config config/config_libs_token_4090.yaml \
+  --libs_data_config $LIBS --line_embedding_config config/line_embedding.yaml \
+  --seed $SEED --experiment_name compare_line
+
+# Line-token-linear (pre-baked tokens)
+uv run python train_pretrain.py --config config/config_libs_token_linear_4090.yaml \
+  --libs_data_config $LIBS --line_embedding_config config/line_embedding.yaml \
+  --seed $SEED --experiment_name compare_line_linear
 ```
 
-**Generated plots (`data/explorations/figures/`):**
-
-| File | Description |
-|------|-------------|
-| `01_all_classes.png` | Example spectra for all 5 material classes |
-| `02_class_comparison.png` | All classes overlaid (no noise) |
-| `03_noise_effect.png` | Effect of noise and baseline |
-| `04_intra_class_variation.png` | Variation within same class |
-| `05_mixed_spectra.png` | Mixed material spectra |
-| `06_peak_positions.png` | Peak positions by class |
-| `07_dataset_statistics.png` | Dataset statistics |
-| `08_masking_preview.png` | Contiguous masking visualization |
+Match `d_model`, `n_layers`, and epochs in both configs before comparing metrics.
 
 ---
 
-## Project Structure
+## Project layout (main paths)
 
 ```
-self_supervised_LIBS/
+LIBS_foundation/
 ├── config/
-│   ├── config.yaml              # Full training config
-│   ├── config_local.yaml        # Local testing config (16GB GPU)
-│   └── config_a100.yaml         # Large-scale A100 config
+│   ├── config_libs_{4090,a100,smoke}.yaml      # bin embedding
+│   ├── config_libs_token_{4090,}.yaml          # line_token (runtime embedding)
+│   ├── config_libs_token_linear_{4090,}.yaml   # line_token_linear (pre-baked tokens)
+│   ├── libs_data.yaml, libs_data_smoke.yaml
+│   └── line_embedding.yaml, line_embedding_smoke.yaml
 ├── data/
-│   ├── synthetic_generator.py   # Synthetic LIBS data generation
-│   ├── dataset.py               # PyTorch Dataset classes
-│   └── explorations/            # Data visualization scripts
+│   ├── libs_pipeline.py
+│   ├── line_dictionary.py, line_features.py, line_tokenization.py
+│   ├── line_embedding_pipeline.py
+│   └── dataset.py
+├── scripts/build_line_tokens.py                # offline tokenization CLI
 ├── models/
-│   ├── libs_transformer.py      # Main transformer architecture
-│   ├── positional_encoding.py   # Positional encoding variants
-│   └── heads.py                 # Classification/regression heads
-├── training/
-│   ├── pretrain.py              # Pre-training Lightning module
-│   └── finetune.py              # Fine-tuning Lightning module
-├── utils/
-│   ├── metrics.py               # Evaluation metrics and plotting
-│   └── run_manager.py           # Run directory management
-├── runs/                        # [Created] Run directories
-│   ├── pretrain_2024-02-05.../
-│   └── finetune_2024-02-06.../
-├── train_pretrain.py            # Pre-training entry point
-├── train_finetune.py            # Fine-tuning entry point
-├── evaluate_model.py            # Post-training evaluation
-├── list_runs.py                 # List and inspect runs
-└── pyproject.toml               # Project configuration
+│   ├── libs_transformer.py, line_token_embedding.py, heads.py
+├── training/pretrain.py, training/finetune.py
+├── train_pretrain.py, train_finetune.py
+└── run_pretrain_libs.slurm, run_finetune_libs.slurm
 ```
 
 ---
 
-## Model Architecture
-
-```
-Input: 2048-bin spectrum (normalized to [0,1])
-   │
-   ▼
-┌─────────────────────────────────┐
-│  Linear Embedding (1 → 256)    │
-│  + Sinusoidal Positional Enc   │
-│  + [CLS] Token                 │
-└─────────────────────────────────┘
-   │
-   ▼
-┌─────────────────────────────────┐
-│  Transformer Encoder           │
-│  - 6 layers                    │
-│  - 8 attention heads           │
-│  - 256 hidden dim              │
-│  - 1024 FFN dim                │
-└─────────────────────────────────┘
-   │
-   ├──────────────────┐
-   ▼                  ▼
-[CLS] Token      Sequence Output
-   │                  │
-   ▼                  ▼
-Classification    MIP Prediction
-/ Regression      (pre-training)
-```
-
-**Pre-training objective**: Masked Intensity Prediction (MIP)
-- Mask 15% of bins in contiguous blocks (variable sizes: 25-100 bins), biased toward peak regions
-- BERT-style 80/10/10: 80% get learnable mask embedding, 10% random value, 10% unchanged
-- Model predicts original intensities at all masked positions (MSE loss)
-- Forces the model to learn spectral context: if it sees certain lines, it must predict others
-
-**Downstream tasks**:
-- Classification: Material type (5 classes)
-- Regression: Element concentrations (5 values, sum to 1)
-
----
-
-## Logging
-
-### TensorBoard (default)
+## SLURM (A100, bin embedding)
 
 ```bash
-# Start TensorBoard
-tensorboard --logdir runs/
-
-# View at http://localhost:6006
+sbatch run_pretrain_libs.slurm
+sbatch run_finetune_libs.slurm runs/pretrain_<timestamp>_libs_pretrain_a100
 ```
 
-### Weights & Biases
-
-Edit config to enable:
-```yaml
-logging:
-  logger: "wandb"
-  wandb:
-    project: "libs-foundation-model"
-    entity: null  # Your username or team
-```
-
-Then login:
-```bash
-wandb login
-```
-
----
-
-## Hardware Requirements
-
-| Config | GPU VRAM | System RAM | Notes |
-|--------|----------|------------|-------|
-| `config_local.yaml` | 8-16 GB | 16 GB | RTX 3080/4060 Ti |
-| `config.yaml` | 40+ GB | 32 GB | A100/H100 |
-
-**CUDA versions supported**: 11.8, 12.1, 12.4
-
----
-
-## Typical Workflow
-
-```bash
-# 1. Setup
-uv sync
-
-# 2. Explore data
-uv run python data/explorations/visualize_synthetic_data.py
-
-# 3. Quick local test
-uv run python train_pretrain.py --config config/config_local.yaml --experiment_name test1
-
-# 4. List runs
-uv run python list_runs.py --latest
-
-# 5. Evaluate (uses latest run)
-uv run python evaluate_model.py --run_dir runs/pretrain_...
-
-# 6. Fine-tune from the pretrain run
-uv run python train_finetune.py \
-    --pretrain_run_dir runs/pretrain_... \
-    --task both
-
-# 7. Evaluate fine-tuned model
-uv run python evaluate_model.py --run_dir runs/finetune_...
-
-# 8. Full training on A100
-uv run python train_pretrain.py --config config/config_a100.yaml --experiment_name full_v1
-```
-
----
-
-## SLURM Example
-
-```bash
-#!/bin/bash
-#SBATCH --job-name=libs_pretrain
-#SBATCH --gres=gpu:1
-#SBATCH --mem=40G
-#SBATCH --time=24:00:00
-
-# Inside container
-uv run python train_pretrain.py \
-    --config config/config_a100.yaml \
-    --experiment_name slurm_run
-```
+Extend SLURM scripts with `--line_embedding_config config/line_embedding.yaml` and `config_libs_token_4090.yaml` (runtime) or `config_libs_token_linear_4090.yaml` (pre-baked tokens) for line-token runs.
 
 ---
 

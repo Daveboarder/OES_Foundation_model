@@ -1,0 +1,48 @@
+# Smoke / dev config: line_token_linear (pre-baked tokens + nn.Linear)
+# Usage:
+#   uv run python train_pretrain.py --config config/config_libs_token_linear.yaml \
+#     --libs_data_config config/libs_data_smoke.yaml \
+#     --line_embedding_config config/line_embedding_smoke.yaml
+
+data:
+  n_bins: 2048
+  n_classes: 3
+  n_elements: 60
+  n_concentration_bins: 50
+  synthetic:
+    val_fraction: 0.34
+
+model:
+  embedding_type: line_token_linear
+  d_model: 64
+  n_heads: 2
+  n_layers: 2
+  d_ff: 128
+  dropout: 0.0
+  max_seq_len: 4096
+  n_mip_target_channels: 2
+
+pretrain:
+  mask_ratio: 0.15
+  batch_size: 2
+  epochs: 2
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+
+finetune:
+  batch_size: 2
+  epochs: 2
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder: false
+
+logging:
+  logger: tensorboard
+  log_every_n_steps: 1
+  val_check_interval: 1.0
+
+device:
+  accelerator: auto
+  precision: "32"

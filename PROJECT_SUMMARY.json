@@ -1,0 +1,2083 @@
+{
+  "$schema_version": "1.0",
+  "$template_notes": [
+    "This document is both a summary of the LIBS Foundation Model and a reusable template.",
+    "To adapt it to a new project: keep the top-level keys, replace the values inside each section,",
+    "and prune sections that do not apply. Sections marked with '$template' contain guidance only;",
+    "remove or replace them when filling in a real project.",
+    "All filesystem paths are RELATIVE to the project root unless explicitly absolute.",
+    "Use shape strings like '[N, n_bins]' for tensor/array shapes."
+  ],
+  "project_metadata": {
+    "name": "libs-foundation-model",
+    "display_name": "LIBS Foundation Model",
+    "version": "0.1.0",
+    "description": "Self-supervised LIBS foundation model (BERT-style transformer) on physics-based Voigt spectra. Supports bin (intensity) embedding, runtime line-token embedding (LineTokenEmbedding), and pre-baked line-token-linear embedding (nn.Linear on 14-feature HDF5 tokens from data/line_tokenization.py).",
+    "domain": "spectroscopy",
+    "license": "MIT",
+    "language": "Python",
+    "python_required": ">=3.10",
+    "package_manager": "uv",
+    "build_backend": "hatchling",
+    "documentation_files": [
+      "README.md",
+      "ARCHITECTURE.md"
+    ],
+    "$template_hint": "Set name/description/version/license to match the new project. `package_manager` may be 'uv' | 'pip' | 'poetry' | 'conda'."
+  },
+  "environment": {
+    "core_dependencies": [
+      {
+        "name": "torch",
+        "version": ">=2.0.0",
+        "purpose": "Tensor library + autograd"
+      },
+      {
+        "name": "torchvision",
+        "version": ">=0.15.0",
+        "purpose": "Required by torch index"
+      },
+      {
+        "name": "torchaudio",
+        "version": ">=2.0.0",
+        "purpose": "Required by torch index"
+      },
+      {
+        "name": "lightning",
+        "version": ">=2.0.0,<2.5",
+        "purpose": "Training loop, callbacks, loggers"
+      },
+      {
+        "name": "torchmetrics",
+        "version": ">=1.0.0,<1.6",
+        "purpose": "Metric primitives"
+      },
+      {
+        "name": "numpy",
+        "version": ">=1.24.0",
+        "purpose": "Numeric arrays"
+      },
+      {
+        "name": "h5py",
+        "version": ">=3.8.0",
+        "purpose": "HDF5 cache for the LIBS pipeline"
+      },
+      {
+        "name": "pandas",
+        "version": ">=2.0.0",
+        "purpose": "Sample table I/O"
+      },
+      {
+        "name": "openpyxl",
+        "version": ">=3.1.0",
+        "purpose": "Read Samples_Fe_matrix.xlsx"
+      },
+      {
+        "name": "scipy",
+        "version": ">=1.10.0",
+        "purpose": "wofz (Voigt profile) for spectrum synthesis"
+      },
+      {
+        "name": "pyyaml",
+        "version": ">=6.0",
+        "purpose": "YAML config loading"
+      },
+      {
+        "name": "omegaconf",
+        "version": ">=2.3.0",
+        "purpose": "(Imported via deps; reserved for richer config support)"
+      },
+      {
+        "name": "matplotlib",
+        "version": ">=3.7.0",
+        "purpose": "Plots"
+      },
+      {
+        "name": "seaborn",
+        "version": ">=0.12.0",
+        "purpose": "Plots"
+      },
+      {
+        "name": "scikit-learn",
+        "version": ">=1.2.0",
+        "purpose": "K-means clustering of compositions, metrics"
+      },
+      {
+        "name": "tensorboard",
+        "version": ">=2.12.0",
+        "purpose": "Default training logger"
+      },
+      {
+        "name": "wandb",
+        "version": ">=0.15.0",
+        "purpose": "Optional cloud logger"
+      },
+      {
+        "name": "tqdm",
+        "version": ">=4.65.0",
+        "purpose": "Progress bars"
+      }
+    ],
+    "dev_dependencies": [
+      {
+        "name": "pytest",
+        "version": ">=7.0.0"
+      },
+      {
+        "name": "black",
+        "version": ">=23.0.0"
+      },
+      {
+        "name": "ruff",
+        "version": ">=0.1.0"
+      },
+      {
+        "name": "ipykernel",
+        "version": ">=6.0.0"
+      },
+      {
+        "name": "jupyter",
+        "version": ">=1.0.0"
+      }
+    ],
+    "index_overrides": {
+      "torch_index_name": "pytorch-cu124",
+      "torch_index_url": "https://download.pytorch.org/whl/cu124",
+      "packages_using_index": [
+        "torch",
+        "torchvision",
+        "torchaudio"
+      ]
+    },
+    "supported_cuda": [
+      "11.8",
+      "12.1",
+      "12.4"
+    ]
+  },
+  "architecture": {
+    "model_family": "transformer_encoder",
+    "embedding_modes": [
+      {
+        "name": "intensity",
+        "config_key": "model.embedding_type: intensity (default)",
+        "sequence": "n_bins wavelength bins + CLS (~17429 with libs pipeline)",
+        "embedding_module": "SpectralEmbedding in models/libs_transformer.py",
+        "pretrain_objective": "Masked Intensity Prediction (MIP) on bin intensities"
+      },
+      {
+        "name": "line_token",
+        "config_key": "model.embedding_type: line_token",
+        "cli": "--line_embedding_config config/line_embedding.yaml (required)",
+        "sequence": "n_lines spectral lines + CLS (threshold-dependent, e.g. ~2425 @ 1e-33, ~8119 @ 1e-35)",
+        "embedding_module": "LineTokenEmbedding in models/line_token_embedding.py",
+        "pretrain_objective": "Masked line-feature prediction (max_I, FWHM channels); invalid Voigt fits masked via key_padding_mask",
+        "assets": [
+          "external_data/cache/line_dict_{hash}.h5",
+          "external_data/cache/line_features_{hash}.h5"
+        ]
+      },
+      {
+        "name": "line_token_linear",
+        "config_key": "model.embedding_type: line_token_linear",
+        "cli": "--line_embedding_config (defaults to line_token_linear when set without explicit embedding_type)",
+        "sequence": "n_lines + CLS; training reads line_tokens_{hash}.h5 only",
+        "embedding_module": "LinearLineTokenEmbedding in models/line_token_embedding.py",
+        "pretrain_objective": "Masked MIP on max_intensity + FWHM (channels 9,10 in token tensor)",
+        "assets": [
+          "external_data/cache/line_dict_{hash}.h5",
+          "external_data/cache/line_features_{hash}.h5",
+          "external_data/cache/line_tokens_{hash}.h5"
+        ],
+        "notes": "Tokenization is a separate offline step (scripts/build_line_tokens.py). Training z-scores raw features using attrs feature_mean/std."
+      }
+    ],
+    "input_bin_mode": {
+      "type": "1D spectrum",
+      "shape": "[B, n_bins]",
+      "n_bins_libs_pipeline": 17428,
+      "value_range": "normalized [0, 1]"
+    },
+    "input_line_token_mode": {
+      "type": "line tokens",
+      "shape": "[B, n_lines, features]",
+      "line_dictionary": "Te×Ne theoretical grid from LIBS_data_vacuum.db",
+      "line_features": "[n_spectra, n_lines, 6] Voigt fit channels"
+    },
+    "embedding_intensity": {
+      "intensity_projection": "Linear(1, d_model/2) -> GELU -> Linear(d_model/2, d_model)",
+      "cls_token": "learnable prepended at position 0",
+      "mask_token": "replaces type-1 masked positions only",
+      "positional_encoding": "fixed sinusoidal, max_len = n_bins + 1",
+      "final": "LayerNorm"
+    },
+    "embedding_line_token": {
+      "quantum_scalars": "7 normalized scalars per line",
+      "categorical": "element + ion embeddings",
+      "fit_features": "5 Voigt-fit features (max_I, FWHM, R2, delta_lambda, RMSE)",
+      "projection": "concat -> Linear -> d_model",
+      "positional_encoding": "sinusoidal on line centre wavelength",
+      "padding": "key_padding_mask from fit_valid"
+    },
+    "encoder_block": "PreNorm MultiHeadAttention (SDPA, need_weights=False) + FFN + residual",
+    "outputs": {
+      "cls_embedding": "[B, d_model]",
+      "sequence_embeddings": "[B, seq_len-1, d_model]",
+      "mip_predictions": "bin intensities or line features depending on mode"
+    },
+    "model_sizes": [
+      {
+        "config": "config/config_libs_smoke.yaml",
+        "embedding": "intensity",
+        "d_model": 32,
+        "n_heads": 2,
+        "n_layers": 1,
+        "use_case": "Pipeline wiring smoke"
+      },
+      {
+        "config": "config/config_libs_4090.yaml",
+        "embedding": "intensity",
+        "d_model": 128,
+        "n_heads": 4,
+        "n_layers": 4,
+        "approx_params": 819201,
+        "use_case": "Bin embedding RTX 4090"
+      },
+      {
+        "config": "config/config_libs_a100.yaml",
+        "embedding": "intensity",
+        "d_model": 256,
+        "n_heads": 8,
+        "n_layers": 6,
+        "approx_params": 4839937,
+        "use_case": "Bin embedding A100"
+      },
+      {
+        "config": "config/config_libs_token_4090.yaml",
+        "embedding": "line_token",
+        "d_model": 128,
+        "n_heads": 4,
+        "n_layers": 4,
+        "use_case": "Line-token RTX 4090"
+      },
+      {
+        "config": "config/config_libs_token.yaml",
+        "embedding": "line_token",
+        "d_model": 32,
+        "n_heads": 2,
+        "n_layers": 1,
+        "use_case": "Line-token smoke"
+      },
+      {
+        "config": "config/config_libs_token_linear_4090.yaml",
+        "embedding": "line_token_linear",
+        "d_model": 128,
+        "n_heads": 4,
+        "n_layers": 4,
+        "use_case": "Pre-baked tokens + nn.Linear, RTX 4090"
+      },
+      {
+        "config": "config/config_libs_token_linear.yaml",
+        "embedding": "line_token_linear",
+        "d_model": 64,
+        "n_heads": 2,
+        "n_layers": 2,
+        "use_case": "Pre-baked tokens smoke"
+      }
+    ],
+    "pretrain_objectives": [
+      {
+        "mode": "intensity",
+        "name": "MIP",
+        "loss": "MSE on masked bin intensities"
+      },
+      {
+        "mode": "line_token",
+        "name": "Masked line-feature MIP",
+        "loss": "MSE on masked max_I and FWHM (channels 0,1)"
+      },
+      {
+        "mode": "line_token_linear",
+        "name": "Masked token MIP",
+        "loss": "MSE on masked max_intensity and FWHM (token channels 9, 10)"
+      }
+    ],
+    "downstream_tasks": [
+      {
+        "task": "classification",
+        "loss": "cross-entropy",
+        "head": "ClassificationHead"
+      },
+      {
+        "task": "quantification",
+        "loss": "MSE on concentration vector",
+        "head": "RegressionHead"
+      },
+      {
+        "task": "quantification_binned",
+        "loss": "per-element CE on 1000 bins",
+        "head": "BinnedQuantificationHead"
+      },
+      {
+        "task": "regression",
+        "loss": "alias of quantification",
+        "head": "RegressionHead"
+      },
+      {
+        "task": "both",
+        "loss": "classification + regression",
+        "head": "ClassificationHead + RegressionHead"
+      }
+    ],
+    "input_line_token_linear_mode": {
+      "type": "pre-baked line tokens",
+      "shape": "[B, n_lines, 14]",
+      "fit_valid": "[B, n_lines] uint8 separate dataset for key_padding_mask",
+      "feature_channels": [
+        "central_wavelength",
+        "Ei",
+        "Ek",
+        "log10_gi",
+        "log10_gk",
+        "log10_Ak",
+        "log10_theoretical_intensity",
+        "atomic_number",
+        "ion_binary",
+        "max_intensity",
+        "fwhm",
+        "r2",
+        "delta_lambda",
+        "rmse"
+      ],
+      "categorical_encoding": "atomic_number (Z) + ion_binary (0=I, 1=II+); no nn.Embedding at train time"
+    },
+    "embedding_line_token_linear": {
+      "input": "14 raw float features per line from line_tokens HDF5",
+      "normalization": "z-score at load using feature_mean / feature_std in HDF5 attrs",
+      "projection": "nn.Linear(14, d_model) + DynamicWavelengthEncoding + CLS + LayerNorm",
+      "padding": "key_padding_mask from fit_valid (Voigt fit success)",
+      "mip_targets": "max_intensity (9), fwhm (10)"
+    }
+  },
+  "project_layout": {
+    "$convention": "Each entry: { path, kind: 'dir'|'file', role: short string, see_also: optional [paths] }",
+    "tree": [
+      {
+        "path": "config/",
+        "kind": "dir",
+        "role": "All YAML configuration files."
+      },
+      {
+        "path": "config/config_libs_smoke.yaml",
+        "kind": "file",
+        "role": "Tiny smoke-test model config for the physics pipeline."
+      },
+      {
+        "path": "config/config_libs_4090.yaml",
+        "kind": "file",
+        "role": "Real-LIBS pipeline config tuned for RTX 4090 (24 GB)."
+      },
+      {
+        "path": "config/config_libs_a100.yaml",
+        "kind": "file",
+        "role": "Real-LIBS pipeline config tuned for A100 80 GB."
+      },
+      {
+        "path": "config/libs_data.yaml",
+        "kind": "file",
+        "role": "Physics-based LIBS pipeline parameters + downstream split/cluster settings."
+      },
+      {
+        "path": "config/libs_data_smoke.yaml",
+        "kind": "file",
+        "role": "Smoke version of the LIBS pipeline config (3 types x 6 shots)."
+      },
+      {
+        "path": "data/",
+        "kind": "dir",
+        "role": "Datasets + synthetic data + physics pipeline."
+      },
+      {
+        "path": "data/dataset.py",
+        "kind": "file",
+        "role": "LIBSDataset, MaskedLIBSDataset, LabeledLIBSDataset; LineFeaturesStore + line-token datasets; LineTokensDataset, MaskedLineTokensDataset, LineTokensLabeledDataset."
+      },
+      {
+        "path": "data/libs_pipeline.py",
+        "kind": "file",
+        "role": "Voigt-profile spectrum synthesis with SQLite DB; cached HDF5 outputs; split helpers."
+      },
+      {
+        "path": "data/explorations/",
+        "kind": "dir",
+        "role": "Data exploration / visualization scripts and figures."
+      },
+      {
+        "path": "models/",
+        "kind": "dir",
+        "role": "Model and head implementations."
+      },
+      {
+        "path": "models/libs_transformer.py",
+        "kind": "file",
+        "role": "SpectralEmbedding, LineToken paths, LIBSTransformer (intensity | line_token | line_token_linear)."
+      },
+      {
+        "path": "config/config_libs_token_4090.yaml",
+        "kind": "file",
+        "role": "Line-token embedding config for RTX 4090."
+      },
+      {
+        "path": "config/config_libs_token.yaml",
+        "kind": "file",
+        "role": "Small line-token model for smoke tests."
+      },
+      {
+        "path": "config/line_embedding.yaml",
+        "kind": "file",
+        "role": "Te/Ne grid, intensity_threshold, Voigt-fit window settings."
+      },
+      {
+        "path": "config/line_embedding_smoke.yaml",
+        "kind": "file",
+        "role": "Smoke line embedding (max_lines: 400)."
+      },
+      {
+        "path": "data/line_dictionary.py",
+        "kind": "file",
+        "role": "Theoretical line dictionary over Te×Ne; HDF5 cache."
+      },
+      {
+        "path": "data/line_features.py",
+        "kind": "file",
+        "role": "Per-spectrum Voigt fits at line centres; HDF5 cache."
+      },
+      {
+        "path": "data/line_embedding_pipeline.py",
+        "kind": "file",
+        "role": "prepare_line_token_assets(), prepare_line_tokens_assets()."
+      },
+      {
+        "path": "models/line_token_embedding.py",
+        "kind": "file",
+        "role": "LineTokenEmbedding + LinearLineTokenEmbedding."
+      },
+      {
+        "path": "models/positional_encoding.py",
+        "kind": "file",
+        "role": "SinusoidalPositionalEncoding."
+      },
+      {
+        "path": "models/heads.py",
+        "kind": "file",
+        "role": "ClassificationHead, RegressionHead, BinnedQuantificationHead, MaskedPredictionHead, MultiTaskHead, LIBSModelWithHeads."
+      },
+      {
+        "path": "training/",
+        "kind": "dir",
+        "role": "Lightning modules + data modules."
+      },
+      {
+        "path": "training/pretrain.py",
+        "kind": "file",
+        "role": "LIBSPretrainModule + PretrainDataModule (MIP)."
+      },
+      {
+        "path": "training/finetune.py",
+        "kind": "file",
+        "role": "LIBSFinetuneModule + FinetuneDataModule (classification / quantification)."
+      },
+      {
+        "path": "utils/",
+        "kind": "dir",
+        "role": "Helpers shared across training and evaluation."
+      },
+      {
+        "path": "utils/metrics.py",
+        "kind": "file",
+        "role": "Numeric metrics + plotting functions used by evaluate_model.py."
+      },
+      {
+        "path": "utils/run_manager.py",
+        "kind": "file",
+        "role": "RunManager (timestamped run dirs, checkpoint resolution, run_info.yaml)."
+      },
+      {
+        "path": "scripts/check_libs_pipeline.py",
+        "kind": "file",
+        "role": "Sanity-check the physics-based pipeline (plots + assertions)."
+      },
+      {
+        "path": "notebooks/demo.ipynb",
+        "kind": "file",
+        "role": "Jupyter demo notebook."
+      },
+      {
+        "path": "train_pretrain.py",
+        "kind": "file",
+        "role": "Pre-training entry point (CLI)."
+      },
+      {
+        "path": "train_finetune.py",
+        "kind": "file",
+        "role": "Fine-tuning entry point (CLI)."
+      },
+      {
+        "path": "evaluate_model.py",
+        "kind": "file",
+        "role": "Post-training evaluation entry point (CLI)."
+      },
+      {
+        "path": "list_runs.py",
+        "kind": "file",
+        "role": "Discover and inspect runs."
+      },
+      {
+        "path": "run_pretrain_libs.slurm",
+        "kind": "file",
+        "role": "SLURM pre-training wrapper for real LIBS pipeline on A100."
+      },
+      {
+        "path": "run_finetune_libs.slurm",
+        "kind": "file",
+        "role": "SLURM fine-tuning wrapper for binned quantification on A100."
+      },
+      {
+        "path": "run_eval.slurm",
+        "kind": "file",
+        "role": "SLURM wrapper for evaluation."
+      },
+      {
+        "path": "runs/",
+        "kind": "dir",
+        "role": "Created at runtime; one folder per training run."
+      },
+      {
+        "path": "external_data/",
+        "kind": "dir",
+        "role": "Source DBs, sample matrices, wavelength JSON, cached HDF5 + splits."
+      },
+      {
+        "path": "pyproject.toml",
+        "kind": "file",
+        "role": "Package metadata (uv + hatchling)."
+      },
+      {
+        "path": "requirements.txt",
+        "kind": "file",
+        "role": "Pip-style dependency list (uv is recommended)."
+      },
+      {
+        "path": "uv.lock",
+        "kind": "file",
+        "role": "Locked dependency resolution for reproducible installs."
+      },
+      {
+        "path": "data/line_tokenization.py",
+        "kind": "file",
+        "role": "Combines dict + Voigt fits into line_tokens_{hash}.h5 (14 features, raw + stats)."
+      },
+      {
+        "path": "scripts/build_line_tokens.py",
+        "kind": "file",
+        "role": "Standalone CLI to materialize line_tokens cache."
+      },
+      {
+        "path": "config/config_libs_token_linear_4090.yaml",
+        "kind": "file",
+        "role": "line_token_linear model for RTX 4090."
+      },
+      {
+        "path": "config/config_libs_token_linear.yaml",
+        "kind": "file",
+        "role": "line_token_linear smoke config."
+      }
+    ]
+  },
+  "entry_points": [
+    {
+      "script": "train_pretrain.py",
+      "purpose": "Generate or load spectra, build masked dataset, train transformer with MIP, save checkpoints.",
+      "cli": [
+        {
+          "flag": "--config",
+          "type": "path",
+          "default": "config/config_libs_4090.yaml",
+          "description": "Model/training YAML."
+        },
+        {
+          "flag": "--libs_data_config",
+          "type": "path",
+          "default": null,
+          "description": "Physics-based pipeline (required for production)."
+        },
+        {
+          "flag": "--line_embedding_config",
+          "type": "path",
+          "default": null,
+          "description": "Line-token mode: Te/Ne grid, threshold, Voigt-fit settings."
+        },
+        {
+          "flag": "--runs_dir",
+          "type": "path",
+          "default": "runs"
+        },
+        {
+          "flag": "--experiment_name",
+          "type": "str",
+          "default": null
+        },
+        {
+          "flag": "--save_data",
+          "type": "flag",
+          "default": false
+        },
+        {
+          "flag": "--contiguous_masking",
+          "type": "flag",
+          "default": false
+        },
+        {
+          "flag": "--early_stopping",
+          "type": "flag",
+          "default": false
+        },
+        {
+          "flag": "--num_workers",
+          "type": "int",
+          "default": 0
+        },
+        {
+          "flag": "--seed",
+          "type": "int",
+          "default": 42
+        }
+      ],
+      "writes": [
+        "runs/pretrain_{timestamp}_{experiment}/{config.yaml, run_info.yaml, checkpoints/*, logs/*}"
+      ],
+      "notes": "Supports line_token_linear via prepare_line_tokens_assets."
+    },
+    {
+      "script": "train_finetune.py",
+      "purpose": "Load encoder from a pretrain run, attach task head(s), fine-tune on labeled data.",
+      "cli": [
+        {
+          "flag": "--config",
+          "type": "path",
+          "default": "config/config_libs_4090.yaml"
+        },
+        {
+          "flag": "--runs_dir",
+          "type": "path",
+          "default": "runs"
+        },
+        {
+          "flag": "--pretrain_run_dir",
+          "type": "path",
+          "default": null
+        },
+        {
+          "flag": "--task",
+          "type": "enum",
+          "choices": [
+            "classification",
+            "quantification",
+            "quantification_binned",
+            "regression",
+            "both"
+          ],
+          "default": "quantification_binned"
+        },
+        {
+          "flag": "--libs_data_config",
+          "type": "path",
+          "default": null
+        },
+        {
+          "flag": "--line_embedding_config",
+          "type": "path",
+          "default": null
+        },
+        {
+          "flag": "--pool",
+          "type": "enum",
+          "choices": [
+            "cls",
+            "mean",
+            "cls_mean"
+          ],
+          "default": "cls_mean"
+        },
+        {
+          "flag": "--freeze_encoder",
+          "type": "flag",
+          "default": false
+        },
+        {
+          "flag": "--seed",
+          "type": "int",
+          "default": 42
+        },
+        {
+          "flag": "--experiment_name",
+          "type": "str",
+          "default": null
+        },
+        {
+          "flag": "--early_stopping",
+          "type": "flag",
+          "default": false
+        },
+        {
+          "flag": "--num_workers",
+          "type": "int",
+          "default": 0
+        }
+      ],
+      "writes": [
+        "runs/finetune_{timestamp}_{experiment}/{config.yaml, run_info.yaml (incl. pretrain_run), checkpoints/*, logs/*}"
+      ]
+    },
+    {
+      "script": "evaluate_model.py",
+      "purpose": "Auto-detect mode from run_dir, run inference on a held-out test set, render figures + metrics.",
+      "cli": [
+        {
+          "flag": "--run_dir",
+          "type": "path",
+          "required": true
+        },
+        {
+          "flag": "--mode",
+          "type": "enum",
+          "choices": [
+            "pretrain",
+            "finetune"
+          ],
+          "default": null,
+          "description": "Auto from run_dir name if omitted."
+        }
+      ],
+      "writes": [
+        "{run_dir}/evaluation/eval_{timestamp}/*.png + *_metrics.txt"
+      ]
+    },
+    {
+      "script": "list_runs.py",
+      "purpose": "Discover runs and print summaries / details.",
+      "cli": [
+        {
+          "flag": "--runs_dir",
+          "type": "path",
+          "default": "runs"
+        },
+        {
+          "flag": "--type",
+          "type": "enum",
+          "choices": [
+            "pretrain",
+            "finetune"
+          ],
+          "default": null
+        },
+        {
+          "flag": "--details",
+          "type": "path",
+          "default": null
+        },
+        {
+          "flag": "--latest",
+          "type": "flag",
+          "default": false
+        }
+      ],
+      "writes": [
+        "stdout only"
+      ]
+    },
+    {
+      "script": "scripts/check_libs_pipeline.py",
+      "purpose": "Sanity-check the physics-based LIBS pipeline (Te/Ne in range, concentrations sum to 1, plot batch).",
+      "cli": [
+        {
+          "flag": "--libs_data_config",
+          "type": "path"
+        },
+        {
+          "flag": "--n_types",
+          "type": "int"
+        },
+        {
+          "flag": "--n_per_type",
+          "type": "int"
+        }
+      ],
+      "writes": [
+        "sanity_checks/{timestamp}/*"
+      ]
+    }
+  ],
+  "configurations": {
+    "model_training_configs": [
+      {
+        "path": "config/config_libs_smoke.yaml",
+        "use_case": "Smoke-test wiring for the physics pipeline.",
+        "model_params_approx": null,
+        "data_train_samples": "from libs pipeline",
+        "epochs": 2,
+        "batch_size": 2,
+        "logger": "tensorboard",
+        "precision": "32"
+      },
+      {
+        "path": "config/config_libs_4090.yaml",
+        "use_case": "Real-LIBS sanity run on RTX 4090 (24 GB).",
+        "model_params_approx": 819201,
+        "data_train_samples": "from libs pipeline",
+        "epochs": 5,
+        "batch_size": 8,
+        "accumulate_grad_batches": 4,
+        "logger": "tensorboard",
+        "precision": "bf16-mixed"
+      },
+      {
+        "path": "config/config_libs_a100.yaml",
+        "use_case": "Real-LIBS full run on A100 80 GB.",
+        "model_params_approx": 4839937,
+        "data_train_samples": "from libs pipeline",
+        "epochs": 60,
+        "batch_size": 16,
+        "accumulate_grad_batches": 4,
+        "logger": "tensorboard",
+        "precision": "bf16-mixed"
+      },
+      {
+        "path": "config/config_libs_token_4090.yaml",
+        "use_case": "Line-token pretrain/finetune on RTX 4090.",
+        "embedding_type": "line_token",
+        "requires": "--line_embedding_config",
+        "epochs": 5,
+        "batch_size": 8,
+        "logger": "tensorboard",
+        "precision": "bf16-mixed"
+      },
+      {
+        "path": "config/config_libs_token.yaml",
+        "use_case": "Line-token smoke (tiny model).",
+        "embedding_type": "line_token",
+        "requires": "--line_embedding_config config/line_embedding_smoke.yaml",
+        "epochs": 2,
+        "batch_size": 2,
+        "logger": "tensorboard",
+        "precision": "32"
+      },
+      {
+        "path": "config/config_libs_token_linear.yaml",
+        "embedding_type": "line_token_linear",
+        "use_case": "Smoke"
+      },
+      {
+        "path": "config/config_libs_token_linear_4090.yaml",
+        "embedding_type": "line_token_linear",
+        "use_case": "RTX 4090"
+      }
+    ],
+    "data_pipeline_configs": [
+      {
+        "path": "config/libs_data.yaml",
+        "use_case": "Standard physics-based runs (~2256 sample types).",
+        "n_samples_per_type": 50,
+        "max_sample_types": null,
+        "downstream": {
+          "n_clusters": 10,
+          "n_concentration_bins": 1000,
+          "val_fraction": 0.15,
+          "test_fraction": 0.15
+        }
+      },
+      {
+        "path": "config/libs_data_smoke.yaml",
+        "use_case": "Tiny smoke test (3 sample types).",
+        "n_samples_per_type": 6,
+        "max_sample_types": 3,
+        "downstream": {
+          "n_clusters": 3,
+          "n_concentration_bins": 50,
+          "val_fraction": 0.2,
+          "test_fraction": 0.2
+        }
+      },
+      {
+        "path": "config/line_embedding.yaml",
+        "use_case": "Line dictionary + Voigt-fit parameters.",
+        "intensity_threshold_default": "1e-35",
+        "note": "~8119 lines at default; ~2425 at 1e-33"
+      }
+    ],
+    "schema_model_training": {
+      "data": {
+        "n_bins": "int (overridden at runtime when --libs_data_config is set)",
+        "n_classes": "int (overridden to libs_data.downstream.n_clusters by train_finetune.py)",
+        "synthetic": {
+          "train_samples": "int",
+          "val_samples": "int",
+          "test_samples": "int",
+          "labeled_samples": "int (finetune only)",
+          "noise_sigma": "float",
+          "peak_width_range": "[int, int]",
+          "intensity_variation": "float",
+          "val_fraction": "float (smoke / libs path only)"
+        }
+      },
+      "model": {
+        "d_model": "int",
+        "n_heads": "int",
+        "n_layers": "int",
+        "d_ff": "int",
+        "dropout": "float",
+        "max_seq_len": "int (= n_bins + 1; auto-updated)",
+        "embedding_type": "'intensity' | 'line_token'"
+      },
+      "pretrain": {
+        "mask_ratio": "float",
+        "mask_token_prob": "float",
+        "random_token_prob": "float",
+        "contiguous_masking": "bool",
+        "block_sizes": "list[int]",
+        "peak_bias_enabled": "bool",
+        "peak_bias_ratio": "float",
+        "peak_threshold": "float",
+        "batch_size": "int",
+        "epochs": "int",
+        "learning_rate": "float",
+        "weight_decay": "float",
+        "warmup_epochs": "int",
+        "min_lr": "float",
+        "accumulate_grad_batches": "int (optional)"
+      },
+      "finetune": {
+        "batch_size": "int",
+        "epochs": "int",
+        "learning_rate": "float",
+        "weight_decay": "float",
+        "freeze_encoder": "bool"
+      },
+      "logging": {
+        "logger": "'tensorboard' | 'wandb'",
+        "log_every_n_steps": "int",
+        "val_check_interval": "float",
+        "wandb": {
+          "project": "str",
+          "entity": "str|null",
+          "tags": "list[str]"
+        }
+      },
+      "device": {
+        "accelerator": "'auto' | 'gpu' | 'cpu'",
+        "precision": "'bf16-mixed' | '16' | '32'"
+      }
+    },
+    "schema_libs_data": {
+      "paths": {
+        "db": "external_data/Source/LIBS_data_vacuum.db",
+        "sample_matrix": "external_data/Source/Samples_Fe_matrix.xlsx",
+        "wavelength_json": "external_data/Data/VASKUT K8.json",
+        "cache_dir": "external_data/cache"
+      },
+      "ranges": {
+        "te": "[Kmin, Kmax]",
+        "ne": "[Nmin, Nmax]  (cm^-3, log-uniform)"
+      },
+      "generation": {
+        "n_samples_per_type": "int",
+        "max_sample_types": "int | null",
+        "number_density": "float",
+        "optical_path": "float",
+        "n_workers": "int",
+        "seed": "int",
+        "verbose": "bool"
+      },
+      "downstream": {
+        "elements_to_predict": "list[str] | null  (null = all non-meta columns, ~60)",
+        "n_clusters": "int  (K-means -> classification labels)",
+        "n_concentration_bins": "int  (per-element bin CE)",
+        "splits": {
+          "val_fraction": "float",
+          "test_fraction": "float",
+          "seed": "int"
+        }
+      }
+    },
+    "runtime_overrides": [
+      {
+        "trigger": "--libs_data_config set",
+        "field": "data.n_bins",
+        "new_value": "len(wavelength array) from VASKUT JSON",
+        "applies_in": [
+          "train_pretrain.py",
+          "train_finetune.py"
+        ]
+      },
+      {
+        "trigger": "--libs_data_config set",
+        "field": "model.max_seq_len",
+        "new_value": "data.n_bins + 1",
+        "applies_in": [
+          "train_pretrain.py",
+          "train_finetune.py"
+        ]
+      },
+      {
+        "trigger": "--libs_data_config set",
+        "field": "data.n_classes",
+        "new_value": "libs_data.downstream.n_clusters",
+        "applies_in": [
+          "train_finetune.py"
+        ]
+      },
+      {
+        "trigger": "--libs_data_config set",
+        "field": "data.n_elements",
+        "new_value": "len(libs_data.downstream.elements_to_predict) or all ~60 columns",
+        "applies_in": [
+          "train_finetune.py"
+        ]
+      },
+      {
+        "trigger": "--libs_data_config set",
+        "field": "data.n_concentration_bins",
+        "new_value": "libs_data.downstream.n_concentration_bins",
+        "applies_in": [
+          "train_finetune.py"
+        ]
+      },
+      {
+        "trigger": "CLI flag --contiguous_masking",
+        "field": "pretrain.contiguous_masking",
+        "new_value": "true",
+        "applies_in": [
+          "train_pretrain.py"
+        ]
+      },
+      {
+        "trigger": "config.logging.logger == 'wandb'",
+        "field": "Lightning logger",
+        "new_value": "WandbLogger(project, entity, name=run_name, tags+['pretrain'|'finetune'+task])",
+        "applies_in": [
+          "train_pretrain.py",
+          "train_finetune.py"
+        ]
+      },
+      {
+        "trigger": "config.pretrain.accumulate_grad_batches > 1",
+        "field": "Trainer arg accumulate_grad_batches",
+        "new_value": "from config",
+        "applies_in": [
+          "train_pretrain.py"
+        ]
+      },
+      {
+        "trigger": "--line_embedding_config set",
+        "field": "model.embedding_type",
+        "new_value": "'intensity' | 'line_token' | 'line_token_linear'",
+        "applies_in": [
+          "train_pretrain.py",
+          "train_finetune.py"
+        ]
+      },
+      {
+        "trigger": "line_token mode",
+        "field": "model.max_seq_len",
+        "new_value": "n_lines + 1 from line dictionary",
+        "applies_in": [
+          "train_pretrain.py",
+          "train_finetune.py"
+        ]
+      }
+    ],
+    "persistence": {
+      "config_copy": "Source YAML is copied verbatim into {run_dir}/config.yaml by RunManager._copy_config.",
+      "pipeline_config": "libs_data.yaml is referenced (not copied) and recorded in run_info.yaml under libs_data_config.",
+      "pipeline_cache": "External data is cached to external_data/cache/synthetic_cache_{md5}.h5 keyed by the generation config hash; matching splits live in splits_{md5}.json.",
+      "line_embedding_config": "Referenced in run_info.yaml; line caches under external_data/cache/line_dict_*.h5 and line_features_*.h5"
+    }
+  },
+  "modules": {
+    "data.dataset": {
+      "file": "data/dataset.py",
+      "classes": [
+        {
+          "name": "LIBSDataset",
+          "role": "Base wrapper for spectra arrays.",
+          "key_methods": [
+            "__len__",
+            "__getitem__"
+          ]
+        },
+        {
+          "name": "MaskedLIBSDataset",
+          "role": "MIP dataset with multiple masking strategies + 80/10/10 replacement + masking stats.",
+          "key_methods": [
+            "_create_random_mask",
+            "_create_contiguous_mask",
+            "_detect_peaks",
+            "_apply_masking",
+            "get_masking_stats"
+          ]
+        },
+        {
+          "name": "LabeledLIBSDataset",
+          "role": "Supervised dataset (spectra + labels + optional concentrations)."
+        },
+        {
+          "name": "MaskedLineTokenDataset",
+          "role": "Line-token MIP with feature-channel masking."
+        },
+        {
+          "name": "LineTokenLabeledDataset",
+          "role": "Supervised line-token finetune dataset."
+        },
+        {
+          "name": "LineFeaturesStore",
+          "role": "HDF5-backed line feature access."
+        },
+        {
+          "name": "LineTokensDataset",
+          "role": "Reads tokens + fit_valid from line_tokens HDF5."
+        },
+        {
+          "name": "MaskedLineTokensDataset",
+          "role": "MIP masking on max_I/FWHM channels."
+        },
+        {
+          "name": "LineTokensLabeledDataset",
+          "role": "Fine-tune with pre-baked tokens."
+        }
+      ],
+      "functions": [
+        {
+          "name": "create_data_loaders",
+          "role": "Build train/val pretrain loaders."
+        },
+        {
+          "name": "create_labeled_data_loaders",
+          "role": "Build train/val finetune loaders."
+        },
+        {
+          "name": "libs_worker_init_fn",
+          "role": "Per-worker numpy RNG re-seed for reproducible masking across epochs."
+        }
+      ]
+    },
+    "data.libs_pipeline": {
+      "file": "data/libs_pipeline.py",
+      "classes": [
+        {
+          "name": "SyntheticLIBSDataset",
+          "role": "Materialises physics-based spectra and caches them to HDF5."
+        }
+      ],
+      "functions": [
+        {
+          "name": "load_wavelength",
+          "role": "Read wavelength axis from VASKUT JSON."
+        },
+        {
+          "name": "load_sample_types",
+          "role": "Parse the sample matrix XLSX into sample-type dicts."
+        },
+        {
+          "name": "create_spectra",
+          "role": "Vectorised Voigt-profile synthesis for one shot."
+        },
+        {
+          "name": "generate_synthetic_spectra",
+          "role": "Multiprocess-capable batch synthesis."
+        },
+        {
+          "name": "extract_finetune_labels",
+          "role": "Extract per-element concentrations + sample_type ids."
+        },
+        {
+          "name": "cluster_compositions",
+          "role": "K-means cluster labels on concentration vectors."
+        },
+        {
+          "name": "get_or_make_splits",
+          "role": "Deterministic train/val/test split cached beside spectra."
+        },
+        {
+          "name": "build_dataset_from_config",
+          "role": "Top-level entry: cfg dict -> SyntheticLIBSDataset."
+        }
+      ]
+    },
+    "models.libs_transformer": {
+      "file": "models/libs_transformer.py",
+      "classes": [
+        {
+          "name": "SpectralEmbedding",
+          "role": "Intensity projection + CLS + mask token + positional encoding + LayerNorm."
+        },
+        {
+          "name": "TransformerEncoderBlock",
+          "role": "PreNorm MHA + FFN with residual connections."
+        },
+        {
+          "name": "LIBSTransformer",
+          "role": "SpectralEmbedding or LineTokenEmbedding; key_padding_mask for invalid lines."
+        }
+      ]
+    },
+    "models.positional_encoding": {
+      "file": "models/positional_encoding.py",
+      "classes": [
+        {
+          "name": "SinusoidalPositionalEncoding",
+          "role": "Standard fixed sin/cos encoding (max_len = n_bins+1)."
+        }
+      ]
+    },
+    "models.heads": {
+      "file": "models/heads.py",
+      "classes": [
+        {
+          "name": "ClassificationHead",
+          "role": "MLP -> class logits."
+        },
+        {
+          "name": "RegressionHead",
+          "role": "MLP -> concentration vector (sigmoid)."
+        },
+        {
+          "name": "BinnedQuantificationHead",
+          "role": "One MLP branch per element producing n_bins logits."
+        },
+        {
+          "name": "MaskedPredictionHead",
+          "role": "MLP -> per-bin intensity prediction."
+        },
+        {
+          "name": "MultiTaskHead",
+          "role": "Joint classification + regression head."
+        },
+        {
+          "name": "LIBSModelWithHeads",
+          "role": "Encoder + chosen heads packaged together."
+        }
+      ],
+      "functions": [
+        {
+          "name": "concentration_to_bin",
+          "role": "Map float concentration in [0,1] to bin index in [0, n_bins-1]."
+        },
+        {
+          "name": "bin_to_concentration",
+          "role": "Inverse of concentration_to_bin."
+        }
+      ]
+    },
+    "training.pretrain": {
+      "file": "training/pretrain.py",
+      "classes": [
+        {
+          "name": "LIBSPretrainModule",
+          "role": "Lightning module for MIP. AdamW + cosine + linear warmup. Loss on all 15% of masked bins."
+        },
+        {
+          "name": "PretrainDataModule",
+          "role": "Wraps MaskedLIBSDataset. Logs masking statistics at setup time."
+        }
+      ]
+    },
+    "training.finetune": {
+      "file": "training/finetune.py",
+      "classes": [
+        {
+          "name": "LIBSFinetuneModule",
+          "role": "Lightning module with task dispatch (classification | quantification | quantification_binned | both). Encoder LR = 0.1 * head LR. Pool = cls | mean | cls_mean."
+        },
+        {
+          "name": "FinetuneDataModule",
+          "role": "Wraps LabeledLIBSDataset."
+        }
+      ]
+    },
+    "utils.metrics": {
+      "file": "utils/metrics.py",
+      "functions": [
+        "compute_classification_metrics",
+        "compute_regression_metrics",
+        "compute_mip_metrics",
+        "format_metrics",
+        "plot_confusion_matrix",
+        "plot_spectra_comparison",
+        "plot_embeddings_tsne",
+        "plot_regression_scatter"
+      ]
+    },
+    "utils.run_manager": {
+      "file": "utils/run_manager.py",
+      "classes": [
+        {
+          "name": "RunManager",
+          "role": "Owns the on-disk layout of a run. Copies config, manages directories, persists run_info.yaml, and resolves the best checkpoint for a given mode."
+        }
+      ],
+      "functions": [
+        {
+          "name": "list_runs",
+          "role": "List run directories, optionally filtered by type."
+        },
+        {
+          "name": "find_latest_run",
+          "role": "Return the most recently modified run."
+        }
+      ]
+    },
+    "data.line_dictionary": {
+      "file": "data/line_dictionary.py",
+      "role": "Theoretical intensities over Te×Ne; absolute threshold filter."
+    },
+    "data.line_features": {
+      "file": "data/line_features.py",
+      "role": "Voigt fits per spectrum per line; 6 channels including fit_valid."
+    },
+    "data.line_embedding_pipeline": {
+      "file": "data/line_embedding_pipeline.py",
+      "functions": [
+        "prepare_line_token_assets",
+        "prepare_line_tokens_assets",
+        "load_line_embedding_config"
+      ],
+      "role": "Orchestrates dictionary + features + norm stats."
+    },
+    "models.line_token_embedding": {
+      "file": "models/line_token_embedding.py",
+      "classes": [
+        {
+          "name": "LineTokenEmbedding",
+          "role": "Runtime concat: quantum + element/ion nn.Embedding + fit features -> MLP -> d_model."
+        },
+        {
+          "name": "LinearLineTokenEmbedding",
+          "role": "Pre-baked tokens: z-score + nn.Linear(14, d_model) + wavelength PE."
+        },
+        {
+          "name": "DynamicWavelengthEncoding",
+          "role": "Sinusoidal PE on physical wavelength (nm)."
+        }
+      ]
+    },
+    "data.line_tokenization": {
+      "file": "data/line_tokenization.py",
+      "functions": [
+        "build_line_tokens_cache",
+        "atomic_number",
+        "ion_binary"
+      ],
+      "classes": [
+        {
+          "name": "LineTokensStore",
+          "role": "Lazy HDF5 reader for line_tokens_*.h5."
+        }
+      ],
+      "role": "Offline tokenization: dict + Voigt -> 14-feature tensor per line per spectrum."
+    }
+  },
+  "file_relationships": {
+    "$key": "Each entry: { source: file, imports: [{module, symbols}], reads/writes: [paths] }",
+    "graph": [
+      {
+        "source": "train_pretrain.py",
+        "imports": [
+          {
+            "module": "data.libs_pipeline",
+            "symbols": [
+              "build_dataset_from_config"
+            ]
+          },
+          {
+            "module": "models.libs_transformer",
+            "symbols": [
+              "LIBSTransformer"
+            ]
+          },
+          {
+            "module": "training.pretrain",
+            "symbols": [
+              "LIBSPretrainModule",
+              "PretrainDataModule"
+            ]
+          },
+          {
+            "module": "utils.run_manager",
+            "symbols": [
+              "RunManager"
+            ]
+          },
+          {
+            "module": "data.line_embedding_pipeline",
+            "symbols": [
+              "prepare_line_token_assets"
+            ]
+          }
+        ],
+        "reads": [
+          "config/*.yaml",
+          "config/libs_data*.yaml (if --libs_data_config)",
+          "config/line_embedding*.yaml (if --line_embedding_config)"
+        ],
+        "writes": [
+          "runs/pretrain_{timestamp}_{exp}/{config.yaml, run_info.yaml, checkpoints/{best.ckpt,last.ckpt,model_latest.pt,model_latest_info.txt,final_model.pt}, logs/}"
+        ]
+      },
+      {
+        "source": "train_finetune.py",
+        "imports": [
+          {
+            "module": "data.dataset",
+            "symbols": [
+              "LabeledLIBSDataset",
+              "LineTokenLabeledDataset",
+              "MaskedLineTokenDataset"
+            ]
+          },
+          {
+            "module": "data.libs_pipeline",
+            "symbols": [
+              "build_dataset_from_config",
+              "cluster_compositions",
+              "extract_finetune_labels",
+              "get_or_make_splits"
+            ]
+          },
+          {
+            "module": "models.libs_transformer",
+            "symbols": [
+              "LIBSTransformer"
+            ]
+          },
+          {
+            "module": "training.finetune",
+            "symbols": [
+              "LIBSFinetuneModule",
+              "FinetuneDataModule"
+            ]
+          },
+          {
+            "module": "utils.run_manager",
+            "symbols": [
+              "RunManager"
+            ]
+          }
+        ],
+        "reads": [
+          "config/*.yaml",
+          "{pretrain_run_dir}/checkpoints/* (resolved via RunManager.get_checkpoint_for_mode('pretrain'))"
+        ],
+        "writes": [
+          "runs/finetune_{timestamp}_{exp}/{config.yaml, run_info.yaml, checkpoints/{best.ckpt,last.ckpt,encoder_latest.pt,final_encoder.pt}, logs/}"
+        ]
+      },
+      {
+        "source": "evaluate_model.py",
+        "imports": [
+          {
+            "module": "data.dataset",
+            "symbols": [
+              "MaskedLIBSDataset",
+              "LabeledLIBSDataset"
+            ]
+          },
+          {
+            "module": "models.libs_transformer",
+            "symbols": [
+              "LIBSTransformer"
+            ]
+          },
+          {
+            "module": "models.heads",
+            "symbols": [
+              "ClassificationHead",
+              "RegressionHead"
+            ]
+          },
+          {
+            "module": "utils.metrics",
+            "symbols": [
+              "compute_classification_metrics",
+              "compute_regression_metrics",
+              "compute_mip_metrics",
+              "format_metrics",
+              "plot_confusion_matrix",
+              "plot_spectra_comparison",
+              "plot_embeddings_tsne",
+              "plot_regression_scatter"
+            ]
+          },
+          {
+            "module": "utils.run_manager",
+            "symbols": [
+              "RunManager"
+            ]
+          }
+        ],
+        "reads": [
+          "{run_dir}/config.yaml",
+          "{run_dir}/checkpoints/* (resolved via get_checkpoint_for_mode(mode))"
+        ],
+        "writes": [
+          "{run_dir}/evaluation/eval_{timestamp}/{*.png, *_metrics.txt}"
+        ]
+      },
+      {
+        "source": "list_runs.py",
+        "imports": [
+          {
+            "module": "utils.run_manager",
+            "symbols": [
+              "list_runs",
+              "find_latest_run"
+            ]
+          }
+        ],
+        "reads": [
+          "runs/*/run_info.yaml"
+        ],
+        "writes": []
+      },
+      {
+        "source": "training/pretrain.py",
+        "imports": [
+          {
+            "module": "data.dataset",
+            "symbols": [
+              "MaskedLIBSDataset",
+              "libs_worker_init_fn"
+            ]
+          }
+        ],
+        "reads": [],
+        "writes": []
+      },
+      {
+        "source": "training/finetune.py",
+        "imports": [
+          {
+            "module": "data.dataset",
+            "symbols": [
+              "LabeledLIBSDataset"
+            ]
+          },
+          {
+            "module": "models.heads",
+            "symbols": [
+              "BinnedQuantificationHead",
+              "ClassificationHead",
+              "RegressionHead",
+              "bin_to_concentration",
+              "concentration_to_bin"
+            ]
+          }
+        ],
+        "reads": [],
+        "writes": []
+      },
+      {
+        "source": "models/libs_transformer.py",
+        "imports": [
+          {
+            "module": "models.positional_encoding",
+            "symbols": [
+              "SinusoidalPositionalEncoding"
+            ]
+          }
+        ],
+        "reads": [],
+        "writes": []
+      },
+      {
+        "source": "data/libs_pipeline.py",
+        "imports": [],
+        "reads": [
+          "external_data/Source/LIBS_data_vacuum.db",
+          "external_data/Source/Samples_Fe_matrix.xlsx",
+          "external_data/Data/VASKUT K8.json"
+        ],
+        "writes": [
+          "external_data/cache/synthetic_cache_{md5}.h5",
+          "external_data/cache/splits_{md5}.json"
+        ]
+      }
+    ]
+  },
+  "data_flow": {
+    "data_source": {
+      "name": "physics_pipeline",
+      "source": "build_dataset_from_config",
+      "cache": "synthetic_cache_{md5}.h5"
+    },
+    "line_token_assets": {
+      "dictionary": "line_dict_{hash}.h5",
+      "features": "line_features_{hash}.h5",
+      "trigger": "--line_embedding_config",
+      "tokens": "line_tokens_{hash}.h5",
+      "builder": "data/line_tokenization.build_line_tokens_cache"
+    },
+    "pretrain_path_intensity": "Spectra -> MaskedLIBSDataset -> SpectralEmbedding -> MIP",
+    "pretrain_path_line_token": "LineFeaturesStore -> MaskedLineTokenDataset -> LineTokenEmbedding -> masked max_I/FWHM MIP",
+    "finetune_path": "Labeled / LineTokenLabeled -> pooled encoder -> task heads",
+    "evaluation_path": "evaluate_model.py on held-out test",
+    "pretrain_path_line_token_linear": "line_tokens HDF5 -> MaskedLineTokensDataset -> LinearLineTokenEmbedding -> masked max_I/FWHM MIP",
+    "tokenization_cli": "scripts/build_line_tokens.py"
+  },
+  "training_workflow": {
+    "steps": [
+      {
+        "id": 1,
+        "name": "Environment setup",
+        "command": "uv sync"
+      },
+      {
+        "id": 2,
+        "name": "Check physics pipeline",
+        "command": "uv run python scripts/check_libs_pipeline.py --libs_data_config config/libs_data_smoke.yaml"
+      },
+      {
+        "id": 3,
+        "name": "Pre-train bin (smoke)",
+        "command": "uv run python train_pretrain.py --config config/config_libs_smoke.yaml --libs_data_config config/libs_data_smoke.yaml"
+      },
+      {
+        "id": 4,
+        "name": "Pre-train bin (4090)",
+        "command": "uv run python train_pretrain.py --config config/config_libs_4090.yaml --libs_data_config config/libs_data.yaml --experiment_name libs_bin --num_workers 4"
+      },
+      {
+        "id": 5,
+        "name": "Pre-train line-token (4090)",
+        "command": "uv run python train_pretrain.py --config config/config_libs_token_4090.yaml --libs_data_config config/libs_data.yaml --line_embedding_config config/line_embedding.yaml --experiment_name libs_line --num_workers 4"
+      },
+      {
+        "id": 6,
+        "name": "Fine-tune binned (bin)",
+        "command": "uv run python train_finetune.py --config config/config_libs_4090.yaml --pretrain_run_dir runs/pretrain_<ts> --libs_data_config config/libs_data.yaml --task quantification_binned --pool cls_mean"
+      },
+      {
+        "id": 7,
+        "name": "Fine-tune binned (line-token)",
+        "command": "uv run python train_finetune.py --config config/config_libs_token_4090.yaml --pretrain_run_dir runs/pretrain_<ts> --libs_data_config config/libs_data.yaml --line_embedding_config config/line_embedding.yaml --task quantification_binned --pool cls_mean"
+      },
+      {
+        "id": 8,
+        "name": "Inspect runs",
+        "command": "uv run python list_runs.py --latest"
+      },
+      {
+        "id": 9,
+        "name": "A100 SLURM",
+        "command": "sbatch run_pretrain_libs.slurm && sbatch run_finetune_libs.slurm runs/pretrain_<ts>"
+      },
+      {
+        "id": 5.5,
+        "name": "Build line tokens cache (optional standalone)",
+        "command": "uv run python scripts/build_line_tokens.py --libs_data_config config/libs_data.yaml --line_embedding_config config/line_embedding.yaml"
+      },
+      {
+        "id": 10,
+        "name": "Build line tokens (standalone)",
+        "command": "uv run python scripts/build_line_tokens.py --libs_data_config config/libs_data.yaml --line_embedding_config config/line_embedding.yaml"
+      },
+      {
+        "id": 11,
+        "name": "Pre-train line_token_linear (4090)",
+        "command": "uv run python train_pretrain.py --config config/config_libs_token_linear_4090.yaml --libs_data_config config/libs_data.yaml --line_embedding_config config/line_embedding.yaml --experiment_name libs_token_linear --num_workers 4"
+      },
+      {
+        "id": 12,
+        "name": "Fine-tune binned (line_token_linear)",
+        "command": "uv run python train_finetune.py --config config/config_libs_token_linear_4090.yaml --pretrain_run_dir runs/pretrain_<ts> --libs_data_config config/libs_data.yaml --line_embedding_config config/line_embedding.yaml --task quantification_binned --pool cls_mean"
+      }
+    ]
+  },
+  "run_management": {
+    "factory": "utils.run_manager.RunManager",
+    "run_name_pattern": "{run_type}_{YYYY-MM-DD_HH-MM-SS}_{experiment_name?}",
+    "directory_layout": [
+      "runs/{run_name}/",
+      "runs/{run_name}/config.yaml",
+      "runs/{run_name}/run_info.yaml",
+      "runs/{run_name}/checkpoints/",
+      "runs/{run_name}/logs/",
+      "runs/{run_name}/evaluation/eval_{YYYY-MM-DD_HH-MM-SS}/"
+    ],
+    "checkpoint_resolution": {
+      "pretrain_preference": [
+        "final_model.pt",
+        "model_latest.pt",
+        "last.ckpt",
+        "any *.pt",
+        "any *.ckpt"
+      ],
+      "finetune_preference": [
+        "last.ckpt",
+        "final_encoder.pt",
+        "encoder_latest.pt",
+        "any *.pt",
+        "any *.ckpt"
+      ]
+    },
+    "run_info_yaml_fields": {
+      "common": [
+        "run_type",
+        "run_name",
+        "timestamp",
+        "experiment_name",
+        "run_dir",
+        "model_params",
+        "train_samples",
+        "val_samples",
+        "batch_size",
+        "epochs",
+        "status",
+        "seed"
+      ],
+      "pretrain_only": [
+        "mask_ratio",
+        "contiguous_masking",
+        "block_sizes",
+        "peak_bias_enabled",
+        "best_val_loss",
+        "final_model"
+      ],
+      "finetune_only": [
+        "task",
+        "pool",
+        "n_elements",
+        "n_concentration_bins",
+        "element_names",
+        "libs_data_config",
+        "freeze_encoder",
+        "pretrain_run",
+        "pretrain_checkpoint",
+        "best_metric",
+        "final_encoder",
+        "test_results"
+      ]
+    }
+  },
+  "logging": {
+    "loggers": [
+      {
+        "name": "tensorboard",
+        "default_in": [
+          "config/config_libs_smoke.yaml",
+          "config/config_libs_4090.yaml",
+          "config/config_libs_a100.yaml",
+          "config/config_libs_token_4090.yaml",
+          "config/config_libs_token.yaml"
+        ],
+        "location": "{run_dir}/logs/events.out.tfevents.* + hparams.yaml",
+        "view": "tensorboard --logdir runs/"
+      },
+      {
+        "name": "wandb",
+        "default_in": [
+          "config/config_libs_token_4090.yaml",
+          "config/config_libs_token.yaml"
+        ],
+        "location": "{run_dir}/logs/wandb/ + cloud project",
+        "auth": "wandb login",
+        "config_keys": [
+          "logging.wandb.project",
+          "logging.wandb.entity",
+          "logging.wandb.tags"
+        ]
+      }
+    ],
+    "callbacks": [
+      {
+        "name": "ModelCheckpoint",
+        "purpose": "Save best (by monitor) + last.ckpt."
+      },
+      {
+        "name": "LearningRateMonitor",
+        "purpose": "Log LR per step."
+      },
+      {
+        "name": "SaveRawModelCallback",
+        "purpose": "Save plain encoder state_dict each epoch (pretrain)."
+      },
+      {
+        "name": "SaveRawEncoderCallback",
+        "purpose": "Save plain encoder state_dict each epoch (finetune)."
+      },
+      {
+        "name": "EarlyStopping",
+        "purpose": "Optional, gated by --early_stopping."
+      }
+    ],
+    "metric_keys": {
+      "pretrain": [
+        "train/loss",
+        "train/lr",
+        "val/loss",
+        "val/mae",
+        "val/r2",
+        "epoch"
+      ],
+      "finetune_classification": [
+        "train/cls_loss",
+        "train/accuracy",
+        "val/cls_loss",
+        "val/accuracy",
+        "val/balanced_accuracy",
+        "val/loss"
+      ],
+      "finetune_quantification": [
+        "train/reg_loss",
+        "train/reg_mae",
+        "train/reg_r2",
+        "val/reg_loss",
+        "val/reg_mae",
+        "val/reg_r2",
+        "val/loss"
+      ],
+      "finetune_quantification_binned": [
+        "train/bin_loss",
+        "train/bin_accuracy",
+        "train/decoded_mae",
+        "train/decoded_r2",
+        "val/bin_loss",
+        "val/bin_accuracy",
+        "val/decoded_mae",
+        "val/decoded_r2",
+        "val/loss"
+      ]
+    },
+    "monitor_metrics_per_task": {
+      "classification": {
+        "metric": "val/accuracy",
+        "mode": "max"
+      },
+      "quantification": {
+        "metric": "val/reg_mae",
+        "mode": "min"
+      },
+      "regression": {
+        "metric": "val/reg_mae",
+        "mode": "min"
+      },
+      "quantification_binned": {
+        "metric": "val/bin_accuracy",
+        "mode": "max"
+      },
+      "both": {
+        "metric": "val/loss",
+        "mode": "min"
+      },
+      "pretrain": {
+        "metric": "val/loss",
+        "mode": "min"
+      }
+    },
+    "console_output": [
+      "Run header printed by RunManager._create_directories.",
+      "Masking statistics printed by PretrainDataModule.setup (avg masked bins, peak coverage, ...).",
+      "Configuration dump for pretrain (mask ratio, block sizes, peak bias)."
+    ]
+  },
+  "evaluation": {
+    "pretrain_artifacts": [
+      {
+        "file": "pretrain_reconstruction_examples.png",
+        "description": "6 sample spectra: original vs predicted, masked regions shaded."
+      },
+      {
+        "file": "pretrain_error_analysis.png",
+        "description": "Error histogram, error-vs-true-intensity bar chart, predicted-vs-true scatter (R^2), per-class MAE."
+      },
+      {
+        "file": "pretrain_embeddings_tsne.png",
+        "description": "t-SNE of CLS embeddings colored by material class."
+      },
+      {
+        "file": "pretrain_metrics.txt",
+        "description": "MSE, RMSE, MAE, R^2 over masked positions."
+      }
+    ],
+    "finetune_artifacts": [
+      {
+        "file": "finetune_classification.png",
+        "description": "Confusion matrix + per-class accuracy + summary box."
+      },
+      {
+        "file": "finetune_regression.png",
+        "description": "2x3 scatter grid (per-element predicted vs true) + summary box."
+      },
+      {
+        "file": "finetune_embeddings_tsne.png",
+        "description": "t-SNE of fine-tuned CLS embeddings."
+      },
+      {
+        "file": "finetune_metrics.txt",
+        "description": "Classification + regression metrics side-by-side."
+      }
+    ],
+    "metric_definitions": {
+      "MIP": [
+        "mse",
+        "rmse",
+        "mae",
+        "r2"
+      ],
+      "Classification": [
+        "accuracy",
+        "balanced_accuracy",
+        "f1_macro",
+        "f1_weighted",
+        "precision_macro",
+        "recall_macro",
+        "per_class_*",
+        "confusion_matrix"
+      ],
+      "Regression": [
+        "mse",
+        "mae",
+        "r2 (per output and averaged)"
+      ],
+      "Binned": [
+        "bin_accuracy",
+        "decoded_mae",
+        "decoded_r2"
+      ]
+    }
+  },
+  "deployment": {
+    "slurm_jobs": [
+      {
+        "script": "run_pretrain_libs.slurm",
+        "resources": {
+          "gres": "gpu:1",
+          "mem": "80G",
+          "time": "48:00:00",
+          "cpus_per_task": 8,
+          "ntasks": 1
+        },
+        "container": "enroot start --root sslibs",
+        "inner_command": "uv run python train_pretrain.py --config config/config_libs_a100.yaml --libs_data_config config/libs_data.yaml --experiment_name libs_pretrain_a100 --num_workers 4",
+        "writes_logs_to": "/scratch/vrabel/self_supervised_libs_remote/slurm_pretrain_libs_%j.{out,err}"
+      },
+      {
+        "script": "run_finetune_libs.slurm",
+        "positional_args": [
+          "pretrain_run_dir"
+        ],
+        "resources": {
+          "gres": "gpu:1",
+          "mem": "80G",
+          "time": "24:00:00",
+          "cpus_per_task": 8,
+          "ntasks": 1
+        },
+        "inner_command": "uv run python train_finetune.py --config config/config_libs_a100.yaml --pretrain_run_dir $PRETRAIN_RUN --libs_data_config config/libs_data.yaml --task quantification_binned --pool cls_mean --experiment_name libs_binned_q_a100 --num_workers 4"
+      },
+      {
+        "script": "run_eval.slurm",
+        "positional_args": [
+          "run_dir"
+        ],
+        "resources": {
+          "gres": "gpu:1",
+          "mem": "40G",
+          "time": "01:00:00",
+          "cpus_per_task": 4,
+          "ntasks": 1
+        },
+        "inner_command": "uv run python evaluate_model.py --run_dir $RUN_DIR"
+      }
+    ]
+  },
+  "external_resources": {
+    "files_required_for_libs_data_pipeline": [
+      {
+        "path": "external_data/Source/LIBS_data_vacuum.db",
+        "format": "SQLite",
+        "tables": [
+          "QuantParam",
+          "E_ion",
+          "PartF_var"
+        ],
+        "purpose": "Atomic line database for spectrum synthesis."
+      },
+      {
+        "path": "external_data/Source/Samples_Fe_matrix.xlsx",
+        "format": "XLSX",
+        "purpose": "Per-sample-type concentration ranges (one row per type, columns = elements)."
+      },
+      {
+        "path": "external_data/Data/VASKUT K8.json",
+        "format": "JSON",
+        "purpose": "Wavelength axis for the simulated detector."
+      }
+    ],
+    "cache": [
+      {
+        "path": "external_data/cache/synthetic_cache_{md5}.h5",
+        "purpose": "Materialised spectra + sample_table; reused when generation config hash matches."
+      },
+      {
+        "path": "external_data/cache/splits_{md5}.json",
+        "purpose": "Train/val/test index split tied to the spectra cache."
+      },
+      {
+        "path": "external_data/cache/line_dict_{hash}.h5",
+        "purpose": "Theoretical line dictionary."
+      },
+      {
+        "path": "external_data/cache/line_features_{hash}.h5",
+        "purpose": "Per-spectrum Voigt fit features."
+      },
+      {
+        "path": "external_data/cache/line_tokens_{hash}.h5",
+        "purpose": "Pre-baked per-spectrum token tensors [n_spectra, n_lines, 14] + fit_valid + norm stats; training input for line_token_linear."
+      }
+    ]
+  },
+  "glossary": {
+    "MIP": "Masked Intensity Prediction - the self-supervised objective: reconstruct masked intensities from context.",
+    "BERT 80/10/10": "Of the masked positions: 80% become a learnable mask token, 10% a random intensity, 10% are left unchanged.",
+    "Peak-biased masking": "A configurable fraction of masked bins is forced to overlap intensity peaks (threshold + +/-5-bin shoulder).",
+    "Run": "A single training execution; lives in runs/{type}_{timestamp}_{experiment}/.",
+    "libs_data pipeline": "Physics-based Voigt synthesis (Daveboarder/Element_Identification heritage), opted in via --libs_data_config.",
+    "Pool": "How encoder outputs feed downstream heads: cls (CLS only), mean (over bins), cls_mean (concat; head input = 2*d_model).",
+    "Line-token embedding": "One transformer token per retained emission line with Voigt-fit and quantum features.",
+    "Line dictionary": "Lines passing intensity_threshold on a Te×Ne theoretical grid.",
+    "Line tokens cache": "line_tokens_{hash}.h5: combined quantum + Voigt features per line, written by data/line_tokenization.py.",
+    "line_token_linear": "Embedding mode that reads pre-baked tokens and applies nn.Linear(14, d_model) after z-score normalization.",
+    "Separated tokenization": "Voigt fitting and feature assembly happen offline; training only loads HDF5 tokens (like synthetic_cache for spectra)."
+  },
+  "$template_filling_guide": {
+    "minimal_replacement_steps": [
+      "1) Replace `project_metadata` fields.",
+      "2) Update `environment.core_dependencies` (and remove `index_overrides` if not needed).",
+      "3) Rewrite `architecture` to describe the new model and tasks.",
+      "4) Rebuild `project_layout.tree` from the new repo structure.",
+      "5) List CLI scripts under `entry_points` (one object per script).",
+      "6) Describe YAML configs under `configurations` and their `runtime_overrides`.",
+      "7) Fill `modules` with one block per top-level package; keep classes/functions short.",
+      "8) Rebuild `file_relationships.graph` from imports and IO.",
+      "9) Adjust `logging` to match the actual logger backends and metric keys.",
+      "10) List concrete `evaluation` artifacts.",
+      "11) Keep or drop `deployment` based on whether SLURM/containerization is used.",
+      "12) Update `glossary` with project-specific terms."
+    ],
+    "fields_typically_dropped_for_other_projects": [
+      "external_resources (LIBS-specific files)",
+      "deployment.slurm_jobs (if not using SLURM)",
+      "configurations.data_pipeline_configs (if no separate data pipeline YAML)"
+    ]
+  }
+}

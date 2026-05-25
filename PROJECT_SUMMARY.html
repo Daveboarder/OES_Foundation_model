@@ -1,0 +1,1138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LIBS Foundation Model — Project Summary</title>
+<style>
+  :root {
+    --bg: #fafbfc;
+    --panel: #ffffff;
+    --ink: #1f2328;
+    --muted: #57606a;
+    --accent: #0969da;
+    --accent-soft: #ddf4ff;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --warn: #b45309;
+    --ok: #1a7f37;
+    --tag: #eef1f5;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+  }
+  .layout {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    min-height: 100vh;
+  }
+  nav.toc {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    padding: 22px 18px;
+  }
+  nav.toc h2 {
+    margin: 0 0 12px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+  }
+  nav.toc ol {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  nav.toc li { margin: 4px 0; }
+  nav.toc a {
+    text-decoration: none;
+    color: var(--ink);
+    display: block;
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 13.5px;
+  }
+  nav.toc a:hover { background: var(--accent-soft); color: var(--accent); }
+  nav.toc .sub { padding-left: 14px; font-size: 12.5px; color: var(--muted); }
+  main {
+    padding: 36px 48px 80px;
+    max-width: 1100px;
+  }
+  header.hero {
+    border-left: 4px solid var(--accent);
+    padding: 4px 0 4px 16px;
+    margin-bottom: 36px;
+  }
+  header.hero .eyebrow {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  header.hero h1 {
+    margin: 6px 0 8px;
+    font-size: 30px;
+    line-height: 1.15;
+  }
+  header.hero p {
+    color: var(--muted);
+    margin: 0;
+    max-width: 75ch;
+  }
+  section { margin: 40px 0; scroll-margin-top: 12px; }
+  section > h2 {
+    font-size: 22px;
+    margin: 0 0 14px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  section > h3 { margin-top: 26px; font-size: 17px; }
+  section > h4 { margin-top: 20px; font-size: 14.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  p { margin: 10px 0; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 4px 0; }
+  code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 13px;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; border: none; padding: 0; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  th, td {
+    border-bottom: 1px solid var(--border);
+    padding: 9px 12px;
+    text-align: left;
+    vertical-align: top;
+    font-size: 13.5px;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    color: var(--ink);
+  }
+  tr:last-child td { border-bottom: none; }
+  .tag {
+    display: inline-block;
+    background: var(--tag);
+    color: var(--ink);
+    border-radius: 12px;
+    padding: 2px 9px;
+    font-size: 11.5px;
+    margin-right: 4px;
+    border: 1px solid var(--border);
+  }
+  .tag.accent { background: var(--accent-soft); color: var(--accent); border-color: #b6e0fe; }
+  .tag.warn   { background: #fff8e1; color: var(--warn); border-color: #f4d58d; }
+  .tag.ok     { background: #e6f6ec; color: var(--ok);   border-color: #b6dec5; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .card h4 { margin-top: 0; color: var(--ink); text-transform: none; letter-spacing: 0; font-size: 14px; }
+  .arrow { color: var(--accent); }
+  .muted { color: var(--muted); }
+  footer {
+    color: var(--muted);
+    font-size: 12.5px;
+    margin-top: 60px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border);
+  }
+  details {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin: 10px 0;
+  }
+  details > summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .ascii {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    white-space: pre;
+    overflow-x: auto;
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ─────────── Sidebar TOC ─────────── -->
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#overview">1. Overview</a></li>
+    <li><a href="#functionality">2. Functionality</a></li>
+    <li><a href="#layout">3. Project Layout</a></li>
+    <li><a href="#entrypoints">4. Entry-Point Scripts</a></li>
+    <li><a href="#configurations">5. Configurations</a>
+      <ul class="sub">
+        <li><a href="#cfg-model">5.1 Model configs</a></li>
+        <li><a href="#cfg-data">5.2 Data pipeline configs</a></li>
+        <li><a href="#cfg-relations">5.3 Relationships</a></li>
+      </ul>
+    </li>
+    <li><a href="#modules">6. Modules &amp; Classes</a></li>
+    <li><a href="#filerels">7. File Relationships</a></li>
+    <li><a href="#dataflow">8. Data Flow</a></li>
+    <li><a href="#runmgmt">9. Run Management</a></li>
+    <li><a href="#logging">10. Logging</a></li>
+    <li><a href="#evaluation">11. Evaluation</a></li>
+    <li><a href="#deployment">12. Deployment (SLURM)</a></li>
+    <li><a href="#glossary">13. Glossary</a></li>
+  </ol>
+</nav>
+
+<!-- ─────────── Main ─────────── -->
+<main>
+
+<header class="hero">
+  <div class="eyebrow">Project Summary</div>
+  <h1>LIBS Foundation Model</h1>
+  <p>
+    A self-supervised foundation model for LIBS. A BERT-style transformer
+    pre-trains on physics-based Voigt spectra using <strong>bin (intensity)</strong>,
+    <strong>line-token</strong> (runtime embedding), or <strong>line-token-linear</strong>
+    (pre-baked 14-feature HDF5 tokens + <code>nn.Linear</code>), then fine-tunes for
+    classification, regression, and binned quantification.
+  </p>
+  <p style="margin-top:10px;">
+    <span class="tag accent">Python ≥ 3.10</span>
+    <span class="tag accent">PyTorch + Lightning</span>
+    <span class="tag accent">uv</span>
+    <span class="tag">CUDA 11.8 / 12.1 / 12.4</span>
+    <span class="tag ok">License: MIT</span>
+  </p>
+</header>
+
+<!-- ───────────── 1. Overview ───────────── -->
+<section id="overview">
+  <h2>1. Overview</h2>
+  <table>
+    <tr><th style="width:24%">Property</th><th>Value</th></tr>
+    <tr><td>Package name</td><td><code>libs-foundation-model</code> (v0.1.0)</td></tr>
+    <tr><td>Domain</td><td>Spectral analysis — LIBS plasma emission spectra</td></tr>
+    <tr><td>Pre-training objective</td><td>Bin MIP (masked intensities) or line-token MIP (masked max_I / FWHM); BERT 80/10/10 on bins</td></tr>
+    <tr><td>Downstream tasks</td><td>Classification, quantification (MSE regression), binned quantification (per-element CE), or joint</td></tr>
+    <tr><td>Model family</td><td>Transformer encoder; <code>SpectralEmbedding</code> (bins), <code>LineTokenEmbedding</code> (runtime), or <code>LinearLineTokenEmbedding</code> (pre-baked tokens)</td></tr>
+    <tr><td>Data</td><td>Physics pipeline via <code>--libs_data_config</code>; line caches <code>line_dict_*</code>, <code>line_features_*</code>, <code>line_tokens_*</code> via <code>--line_embedding_config</code></td></tr>
+    <tr><td>Training framework</td><td>PyTorch Lightning 2.x</td></tr>
+    <tr><td>Experiment tracking</td><td>TensorBoard (default) or Weights &amp; Biases</td></tr>
+    <tr><td>Run organisation</td><td><code>runs/{type}_{YYYY-MM-DD_HH-MM-SS}_{experiment_name}/</code> via <code>utils/run_manager.py</code></td></tr>
+  </table>
+
+  <h3>Command paths (RTX 4090)</h3>
+<pre><code># Bin embedding
+uv run python train_pretrain.py \
+  --config config/config_libs_4090.yaml \
+  --libs_data_config config/libs_data.yaml \
+  --experiment_name libs_bin --num_workers 4
+
+# Line-token (runtime embedding)
+uv run python train_pretrain.py \
+  --config config/config_libs_token_4090.yaml \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding.yaml \
+  --experiment_name libs_line --num_workers 4
+
+# Line-token-linear (pre-baked tokens; build once)
+uv run python scripts/build_line_tokens.py \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding.yaml
+uv run python train_pretrain.py \
+  --config config/config_libs_token_linear_4090.yaml \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding.yaml \
+  --experiment_name libs_token_linear --num_workers 4
+
+# Fine-tune (match pretrain mode + configs)
+uv run python train_finetune.py \
+  --config config/config_libs_4090.yaml \
+  --pretrain_run_dir runs/pretrain_... \
+  --libs_data_config config/libs_data.yaml \
+  --task quantification_binned --pool cls_mean
+
+# A100 (bin) via SLURM
+sbatch run_pretrain_libs.slurm
+sbatch run_finetune_libs.slurm runs/pretrain_...</code></pre>
+</section>
+
+<!-- ───────────── 2. Functionality ───────────── -->
+<section id="functionality">
+  <h2>2. Functionality</h2>
+
+  <h3>Pre-training (self-supervised)</h3>
+  <ul>
+    <li>15&nbsp;% of spectral bins are selected for masking using
+      <em>contiguous block</em> sampling with variable block sizes
+      (e.g. <code>[25, 50, 100, 150]</code>) and optional
+      <em>peak-biased</em> selection (target fraction of masks must
+      overlap intensity peaks).</li>
+    <li>BERT-style replacement at selected positions:
+      <span class="tag">80% → mask token</span>
+      <span class="tag">10% → random value</span>
+      <span class="tag">10% → unchanged</span>
+      (see <code>data/dataset.py</code> &mdash; <code>MaskedLIBSDataset</code>).</li>
+    <li>The encoder predicts the original intensity at every masked bin;
+      loss is MSE over all 15&nbsp;% (not just the mask-token 80&nbsp;%).</li>
+    <li>Mask <em>token-embedding</em> is applied only to type-1 positions
+      inside <code>SpectralEmbedding</code>; the other selected positions
+      keep their projected intensity vectors.</li>
+  </ul>
+  <h3>Pre-training — line-token modes</h3>
+  <ul>
+    <li>Requires <code>--line_embedding_config</code> (<code>config/line_embedding.yaml</code>).</li>
+    <li>Three HDF5 caches (built in order, all reusable):
+      <code>line_dict_*.h5</code> (theoretical dictionary),
+      <code>line_features_*.h5</code> (Voigt fits, 6 channels),
+      <code>line_tokens_*.h5</code> (14-feature tensor per line — <strong>separated tokenization</strong>).</li>
+    <li><code>scripts/build_line_tokens.py</code> materializes <code>line_tokens_*.h5</code> without training.</li>
+    <li><strong><code>line_token</code></strong> — <code>LineTokenEmbedding</code> assembles quantum + element/ion
+      <code>nn.Embedding</code> + fit features at runtime from <code>line_features_*.h5</code>.</li>
+    <li><strong><code>line_token_linear</code></strong> — <code>LinearLineTokenEmbedding</code> z-scores raw
+      14 channels from <code>line_tokens_*.h5</code> and applies <code>nn.Linear(14, d_model)</code>.</li>
+    <li>Token channels include atomic number Z and ion_binary (0=I, 1=II+); <code>fit_valid</code> is a separate mask.</li>
+    <li>MIP masks valid lines and predicts <code>max_intensity</code> + <code>fwhm</code>
+      (<code>MaskedLineTokenDataset</code> or <code>MaskedLineTokensDataset</code>).</li>
+  </ul>
+
+  <h3>Fine-tuning (supervised)</h3>
+  <ul>
+    <li>Loads encoder weights from a pretrain run (either a raw
+      <code>.pt</code> state-dict or a Lightning <code>.ckpt</code>).</li>
+    <li>Four task modes supported by <code>LIBSFinetuneModule</code>:
+      <ul>
+        <li><code>classification</code> — single label, CE loss</li>
+        <li><code>quantification</code> — concentration vector, MSE
+          (<code>regression</code> is a legacy alias)</li>
+        <li><code>quantification_binned</code> — per-element 1000-way CE
+          on discretised concentrations (mirrors upstream
+          Daveboarder/Element_Identification)</li>
+        <li><code>both</code> — joint classification + regression</li>
+      </ul>
+    </li>
+    <li>Pooling of the encoder output is configurable via
+      <code>--pool {cls,mean,cls_mean}</code>. The head input dimension
+      scales accordingly (<code>d_model</code> or <code>2·d_model</code>).</li>
+    <li>Separate AdamW parameter groups: encoder gets 0.1× the head LR;
+      cosine schedule with linear warmup.</li>
+  </ul>
+
+  <h3>Evaluation</h3>
+  <ul>
+    <li>Auto-detects mode from the run directory name
+      (<code>pretrain_…</code> vs <code>finetune_…</code>).</li>
+    <li>Pretrain eval renders reconstruction examples, error analysis,
+      CLS-embedding t-SNE, plus a <code>pretrain_metrics.txt</code> file.</li>
+    <li>Finetune eval renders confusion matrix, regression scatter,
+      t-SNE, plus <code>finetune_metrics.txt</code>.</li>
+  </ul>
+
+  <h3>Run discovery</h3>
+  <ul>
+    <li><code>list_runs.py</code> walks <code>runs/</code> and pretty-prints
+      every run (size, status, model params, masking config, best metric).
+      Supports <code>--type</code>, <code>--latest</code>, <code>--details</code>.</li>
+  </ul>
+</section>
+
+<!-- ───────────── 3. Project Layout ───────────── -->
+<section id="layout">
+  <h2>3. Project Layout</h2>
+<div class="ascii">LIBS_foundation/
+├── config/
+│   ├── config_libs_smoke.yaml       # Bin embedding smoke
+│   ├── config_libs_4090.yaml        # Bin embedding (RTX 4090)
+│   ├── config_libs_a100.yaml        # Bin embedding (A100)
+│   ├── config_libs_token_4090.yaml         # line_token (RTX 4090)
+│   ├── config_libs_token.yaml              # line_token smoke
+│   ├── config_libs_token_linear_4090.yaml  # line_token_linear (RTX 4090)
+│   ├── config_libs_token_linear.yaml       # line_token_linear smoke
+│   ├── line_embedding.yaml                 # Te/Ne grid, threshold, Voigt-fit
+│   ├── line_embedding_smoke.yaml           # max_lines: 400
+│   ├── libs_data.yaml                      # Physics pipeline (~112k shots)
+│   └── libs_data_smoke.yaml                # 3 types × 6 shots
+├── data/
+│   ├── dataset.py                   # Masked/Labeled + line-token datasets
+│   ├── libs_pipeline.py             # Voigt synthesis + HDF5 cache
+│   ├── line_dictionary.py           # Theoretical line dictionary
+│   ├── line_features.py             # Per-spectrum Voigt fits
+│   ├── line_tokenization.py         # line_tokens_*.h5 builder
+│   ├── line_embedding_pipeline.py   # prepare_line_token(s)_assets
+│   └── explorations/
+├── scripts/
+│   ├── check_libs_pipeline.py
+│   └── build_line_tokens.py         # Offline tokenization CLI
+├── models/
+│   ├── libs_transformer.py          # intensity | line_token | line_token_linear
+│   ├── line_token_embedding.py      # LineTokenEmbedding + LinearLineTokenEmbedding
+│   ├── positional_encoding.py
+│   └── heads.py
+├── training/
+│   ├── __init__.py
+│   ├── pretrain.py                  # LIBSPretrainModule + PretrainDataModule
+│   └── finetune.py                  # LIBSFinetuneModule + FinetuneDataModule
+├── utils/
+│   ├── __init__.py
+│   ├── metrics.py                   # classification/regression/MIP metrics + plots
+│   └── run_manager.py               # RunManager + list_runs + find_latest_run
+├── notebooks/
+│   └── demo.ipynb
+├── runs/                            # Created at runtime
+├── external_data/                   # Source DBs / cache for libs pipeline
+├── train_pretrain.py                # Entry point — pre-training
+├── train_finetune.py                # Entry point — fine-tuning
+├── evaluate_model.py                # Entry point — post-training evaluation
+├── list_runs.py                     # Entry point — run discovery
+├── run_pretrain_libs.slurm          # Real-LIBS pretrain on A100
+├── run_finetune_libs.slurm          # Real-LIBS binned finetune on A100
+├── run_eval.slurm
+├── README.md
+├── ARCHITECTURE.md
+├── pyproject.toml                   # uv / hatchling package config
+├── requirements.txt
+└── uv.lock</div>
+</section>
+
+<!-- ───────────── 4. Entry Points ───────────── -->
+<section id="entrypoints">
+  <h2>4. Entry-Point Scripts</h2>
+  <table>
+    <tr>
+      <th style="width:18%">Script</th>
+      <th style="width:32%">Purpose</th>
+      <th>Key arguments</th>
+      <th>Output</th>
+    </tr>
+    <tr>
+      <td><code>train_pretrain.py</code></td>
+      <td>Generate (or load) spectra, build masked dataset, train transformer with MIP.</td>
+      <td><code>--config</code>, <code>--libs_data_config</code>,
+          <code>--line_embedding_config</code>,
+          <code>--runs_dir</code>, <code>--experiment_name</code>,
+          <code>--save_data</code>, <code>--contiguous_masking</code>,
+          <code>--early_stopping</code>, <code>--num_workers</code>,
+          <code>--seed</code></td>
+      <td><code>runs/pretrain_…/{checkpoints,logs,config.yaml,run_info.yaml}</code></td>
+    </tr>
+    <tr>
+      <td><code>train_finetune.py</code></td>
+      <td>Load encoder from a pretrain run, attach task head(s), fine-tune.</td>
+      <td><code>--config</code>, <code>--pretrain_run_dir</code>,
+          <code>--libs_data_config</code>, <code>--line_embedding_config</code>,
+          <code>--task</code>
+          (classification | quantification | quantification_binned | regression | both),
+          <code>--pool</code> (cls | mean | cls_mean),
+          <code>--freeze_encoder</code>, <code>--experiment_name</code>,
+          <code>--early_stopping</code></td>
+      <td><code>runs/finetune_…/{checkpoints,logs,config.yaml,run_info.yaml}</code></td>
+    </tr>
+    <tr>
+      <td><code>evaluate_model.py</code></td>
+      <td>Auto-detect mode, run inference on held-out test data, render figures + metrics.</td>
+      <td><code>--run_dir</code>, <code>--mode</code> (auto if omitted)</td>
+      <td><code>{run_dir}/evaluation/eval_{timestamp}/</code></td>
+    </tr>
+    <tr>
+      <td><code>list_runs.py</code></td>
+      <td>Discover runs, print summary, show per-run details.</td>
+      <td><code>--runs_dir</code>, <code>--type</code>,
+          <code>--latest</code>, <code>--details RUN_DIR</code></td>
+      <td>stdout</td>
+    </tr>
+    <tr>
+      <td><code>scripts/check_libs_pipeline.py</code></td>
+      <td>Sanity-check the physics-based LIBS data pipeline.</td>
+      <td><code>--libs_data_config</code>, <code>--n_types</code>, <code>--n_per_type</code></td>
+      <td><code>sanity_checks/&lt;timestamp&gt;/</code></td>
+    </tr>
+  </table>
+</section>
+
+<!-- ───────────── 5. Configurations ───────────── -->
+<section id="configurations">
+  <h2>5. Configurations</h2>
+
+  <h3 id="cfg-model">5.1 Model / Training configs</h3>
+  <table>
+    <tr>
+      <th>File</th><th>Use case</th><th>GPU</th><th>Model size</th>
+      <th>Train samples</th><th>Epochs</th><th>Logger</th>
+    </tr>
+                <tr><td><code>config/config_libs_smoke.yaml</code></td><td>Pipeline wiring smoke test</td><td>any</td><td>tiny (d_model=32)</td><td>via libs pipeline</td><td>2</td><td>tensorboard</td></tr>
+    <tr><td><code>config/config_libs_4090.yaml</code></td><td>Real-LIBS sanity run</td><td>RTX 4090 24 GB</td><td>~0.82 M</td><td>via libs pipeline</td><td>5</td><td>tensorboard</td></tr>
+    <tr><td><code>config/config_libs_a100.yaml</code></td><td>Real-LIBS bin embedding</td><td>A100 80 GB</td><td>~4.84 M</td><td>via libs pipeline</td><td>60</td><td>tensorboard</td></tr>
+    <tr><td><code>config/config_libs_token_4090.yaml</code></td><td>line_token (RTX 4090)</td><td>RTX 4090</td><td>~0.82 M</td><td>via libs + line caches</td><td>5</td><td>tensorboard</td></tr>
+    <tr><td><code>config/config_libs_token.yaml</code></td><td>line_token smoke</td><td>any</td><td>tiny</td><td>smoke</td><td>2</td><td>tensorboard</td></tr>
+    <tr><td><code>config/config_libs_token_linear_4090.yaml</code></td><td>line_token_linear (RTX 4090)</td><td>RTX 4090</td><td>smaller</td><td>reads line_tokens HDF5</td><td>5</td><td>tensorboard</td></tr>
+    <tr><td><code>config/config_libs_token_linear.yaml</code></td><td>line_token_linear smoke</td><td>any</td><td>tiny</td><td>smoke</td><td>2</td><td>tensorboard</td></tr>
+  </table>
+
+  <h4>Shared schema (model / training configs)</h4>
+<pre><code>data:
+  n_bins: int               # spectrum length; overridden at runtime when using libs_data pipeline
+  n_classes: int            # overridden to libs_data.downstream.n_clusters (finetune)
+  synthetic:
+    train_samples / val_samples / test_samples / labeled_samples: int
+    noise_sigma: float
+    peak_width_range: [int, int]
+    intensity_variation: float
+    val_fraction: float     # smoke / libs-pipeline only
+
+model:
+  embedding_type: intensity | line_token | line_token_linear
+  d_model / n_heads / n_layers / d_ff: int
+  dropout: float
+  max_seq_len: int          # n_bins+1 or n_lines+1; auto-updated
+
+pretrain:
+  mask_ratio / mask_token_prob / random_token_prob: float
+  contiguous_masking: bool
+  block_sizes: list[int]
+  peak_bias_enabled: bool
+  peak_bias_ratio / peak_threshold: float
+  batch_size / epochs / warmup_epochs: int
+  learning_rate / weight_decay / min_lr: float
+  accumulate_grad_batches: int   # optional (used by A100 and 4090 libs configs)
+
+finetune:
+  batch_size / epochs: int
+  learning_rate / weight_decay: float
+  freeze_encoder: bool
+
+logging:
+  logger: "tensorboard" | "wandb"
+  log_every_n_steps: int
+  val_check_interval: float
+  wandb: { project, entity, tags }   # used only when logger == wandb
+
+device:
+  accelerator: "auto" | "gpu" | "cpu"
+  precision: "bf16-mixed" | "16" | "32"</code></pre>
+
+  <h3 id="cfg-data">5.2 Physics-based data pipeline configs</h3>
+  <table>
+    <tr><th>File</th><th>Use case</th><th>Sample types</th><th>Shots / type</th><th>Clusters</th><th>Bins for binned task</th></tr>
+    <tr><td><code>config/libs_data.yaml</code></td><td>Standard physics-based runs</td><td>~2256 (all)</td><td>50</td><td>10</td><td>1000</td></tr>
+    <tr><td><code>config/libs_data_smoke.yaml</code></td><td>Pipeline smoke test</td><td>3</td><td>6</td><td>3</td><td>50</td></tr>
+  </table>
+
+  <h3>5.2b Line-token / tokenization configs</h3>
+  <table>
+    <tr><th>File</th><th>Use case</th><th>Notes</th></tr>
+    <tr><td><code>config/line_embedding.yaml</code></td><td>Production</td><td><code>intensity_threshold</code> default <code>1e-35</code> (~8119 lines); Te/Ne grid; Voigt-fit window</td></tr>
+    <tr><td><code>config/line_embedding_smoke.yaml</code></td><td>Smoke</td><td><code>max_lines: 400</code></td></tr>
+  </table>
+  <p>Caches: <code>line_dict_{hash}.h5</code>, <code>line_features_{hash}.h5</code>,
+    <code>line_tokens_{hash}.h5</code> (14 raw features + <code>feature_mean</code>/<code>feature_std</code>).
+    Offline build: <code>scripts/build_line_tokens.py</code>.</p>
+
+<pre><code>paths:
+  db:              external_data/Source/LIBS_data_vacuum.db        # SQLite (QuantParam, E_ion, PartF_var)
+  sample_matrix:   external_data/Source/Samples_Fe_matrix.xlsx     # Per-type concentration ranges
+  wavelength_json: external_data/Data/VASKUT K8.json               # Wavelength axis
+  cache_dir:       external_data/cache                             # HDF5 cache + splits JSON
+
+ranges:
+  te: [6500.0, 11000.0]      # Plasma temperature (K) — uniform
+  ne: [1.0e+17, 5.0e+17]     # Electron density   (cm⁻³) — log-uniform
+
+generation:
+  n_samples_per_type, max_sample_types, number_density, optical_path,
+  n_workers, seed, verbose
+
+downstream:                  # consumed only by train_finetune.py
+  elements_to_predict: list[str] | null
+  n_clusters: int            # K-means → classification labels (overrides config.data.n_classes)
+  n_concentration_bins: int  # = bins for quantification_binned head
+  splits:
+    val_fraction, test_fraction, seed</code></pre>
+
+  <h3 id="cfg-relations">5.3 Configuration relationships</h3>
+  <p>
+    The model/training YAML and the data pipeline YAML are <em>independent</em>:
+    the data YAML is opted in via <code>--libs_data_config</code>. When supplied,
+    the training script overrides several model-config fields at runtime so the
+    transformer matches the real data:
+  </p>
+  <table>
+    <tr><th>Triggered by</th><th>Field overridden</th><th>New value</th><th>Affected file</th></tr>
+    <tr><td><code>--libs_data_config</code></td><td><code>data.n_bins</code></td><td>length of the wavelength array from <code>VASKUT K8.json</code></td><td><code>train_pretrain.py</code>, <code>train_finetune.py</code></td></tr>
+    <tr><td><code>--libs_data_config</code></td><td><code>model.max_seq_len</code></td><td><code>n_bins + 1</code></td><td>same</td></tr>
+    <tr><td><code>--libs_data_config</code> (finetune only)</td><td><code>data.n_classes</code></td><td><code>downstream.n_clusters</code></td><td><code>train_finetune.py</code></td></tr>
+    <tr><td><code>--libs_data_config</code> (finetune only)</td><td><code>data.n_elements</code></td><td>count of elements in <code>downstream.elements_to_predict</code> (or all ~60)</td><td><code>train_finetune.py</code></td></tr>
+    <tr><td><code>--libs_data_config</code> (finetune only)</td><td><code>data.n_concentration_bins</code></td><td><code>downstream.n_concentration_bins</code></td><td><code>train_finetune.py</code></td></tr>
+    <tr><td>CLI flag <code>--contiguous_masking</code></td><td><code>pretrain.contiguous_masking</code></td><td>forced <code>true</code></td><td><code>train_pretrain.py</code></td></tr>
+    <tr><td><code>config.logging.logger == "wandb"</code></td><td>logger selection</td><td><code>WandbLogger</code> instead of <code>TensorBoardLogger</code></td><td>both train scripts</td></tr>
+    <tr><td><code>config.pretrain.accumulate_grad_batches</code></td><td>trainer arg</td><td>added only if &gt; 1</td><td><code>train_pretrain.py</code></td></tr>
+  </table>
+
+  <p>
+    <strong>Persistence:</strong> the active model/training YAML is copied
+    verbatim into <code>{run_dir}/config.yaml</code> at run-start by
+    <code>RunManager._copy_config</code>. The data pipeline YAML is not
+    copied (it lives in <code>external_data/cache/synthetic_cache_*.h5</code>
+    via its hashed cache key), but the pipeline YAML's path is recorded in
+    <code>run_info.yaml</code> under <code>libs_data_config</code>.
+  </p>
+</section>
+
+<!-- ───────────── 6. Modules & Classes ───────────── -->
+<section id="modules">
+  <h2>6. Modules &amp; Classes</h2>
+
+  <div class="grid-2">
+    <div class="card">
+      <h4><code>data/dataset.py</code></h4>
+      <ul>
+        <li><code>LIBSDataset</code> — raw spectra wrapper.</li>
+        <li><code>MaskedLIBSDataset</code> — masking (random / contiguous /
+          variable / peak-biased) + BERT-style 80/10/10 replacement +
+          <code>get_masking_stats()</code>.</li>
+        <li><code>LabeledLIBSDataset</code> — spectra + labels + optional
+          concentrations.</li>
+        <li><code>MaskedLineTokenDataset</code>, <code>LineTokenLabeledDataset</code>,
+          <code>LineFeaturesStore</code> — runtime line-token path.</li>
+        <li><code>LineTokensDataset</code>, <code>MaskedLineTokensDataset</code>,
+          <code>LineTokensLabeledDataset</code> — pre-baked <code>line_tokens_*.h5</code>.</li>
+        <li><code>libs_worker_init_fn</code> — re-seeds the per-worker numpy
+          RNG so each epoch / worker gets a distinct, reproducible mask stream.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4><code>line_dictionary</code> · <code>line_features</code> · <code>line_tokenization</code></h4>
+      <ul>
+        <li>Theoretical line dictionary over Te×Ne → <code>line_dict_*.h5</code>.</li>
+        <li>Per-spectrum Voigt fits → <code>line_features_*.h5</code> (6 channels).</li>
+        <li><code>build_line_tokens_cache</code> → <code>line_tokens_*.h5</code> (14 raw features + stats).</li>
+        <li><code>prepare_line_token_assets</code> / <code>prepare_line_tokens_assets</code> in
+            <code>line_embedding_pipeline.py</code>.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4><code>data/libs_pipeline.py</code></h4>
+      <ul>
+        <li><code>load_wavelength</code>, <code>load_sample_types</code>,
+            <code>create_spectra</code> — physics-based Voigt synthesis with
+            an SQLite atomic-line DB.</li>
+        <li><code>SyntheticLIBSDataset</code> — materialises spectra,
+            caches them to HDF5 keyed by an md5 of the generation config.</li>
+        <li><code>extract_finetune_labels</code>,
+            <code>cluster_compositions</code>,
+            <code>get_or_make_splits</code> — downstream-label helpers
+            (concentration matrix, K-means cluster labels, deterministic
+            train/val/test splits saved beside the cache).</li>
+        <li><code>build_dataset_from_config</code> — top-level entry from
+            <code>libs_data.yaml</code>.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4><code>models/libs_transformer.py</code></h4>
+      <ul>
+        <li><code>SpectralEmbedding</code> — bin intensity MLP + mask token + PE.</li>
+        <li><code>LineTokenEmbedding</code> — runtime quantum + element/ion Embeddings + Voigt → MLP.</li>
+        <li><code>LinearLineTokenEmbedding</code> — z-score + <code>nn.Linear(14, d_model)</code> on pre-baked tokens.</li>
+        <li><code>TransformerEncoderBlock</code> — pre-norm MHA + FFN with
+          residual connections.</li>
+        <li><code>LIBSTransformer</code> — stacked encoder, final norm,
+          MIP head, helpers (<code>get_embeddings</code>,
+          <code>compute_mip_loss</code>, <code>freeze_encoder</code>,
+          <code>num_parameters</code>).</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4><code>models/heads.py</code></h4>
+      <ul>
+        <li><code>ClassificationHead</code>, <code>RegressionHead</code>,
+            <code>MaskedPredictionHead</code>, <code>MultiTaskHead</code>.</li>
+        <li><code>BinnedQuantificationHead</code> — one MLP branch per
+            element producing <code>n_bins</code> logits.</li>
+        <li><code>concentration_to_bin</code> /
+            <code>bin_to_concentration</code> — discretisation utilities.</li>
+        <li><code>LIBSModelWithHeads</code> — packaged encoder + heads.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4><code>training/pretrain.py</code></h4>
+      <ul>
+        <li><code>LIBSPretrainModule</code> — Lightning module: AdamW,
+            cosine + linear-warmup LR schedule, MSE on all 15 % of masked
+            bins (mask-embedding applied only to the 80 % "mask token"
+            positions).</li>
+        <li><code>PretrainDataModule</code> — wraps
+            <code>MaskedLIBSDataset</code>; logs masking statistics
+            (avg masked bins, peak coverage, …).</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4><code>training/finetune.py</code></h4>
+      <ul>
+        <li><code>LIBSFinetuneModule</code> — task-dispatched losses
+            (CE / MSE / per-element CE), pool = {cls, mean, cls_mean},
+            two AdamW param-groups (encoder LR ×0.1, head LR ×1).</li>
+        <li><code>FinetuneDataModule</code> — wraps
+            <code>LabeledLIBSDataset</code>.</li>
+        <li>Task-specific monitor:
+            <code>val/accuracy</code> (cls), <code>val/reg_mae</code>
+            (quant), <code>val/bin_accuracy</code> (binned), or
+            <code>val/loss</code>.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4><code>utils/run_manager.py</code></h4>
+      <ul>
+        <li><code>RunManager</code> — creates timestamped run dir,
+            copies the source config, exposes
+            <code>{run_dir, checkpoint_dir, log_dir, evaluation_dir}</code>,
+            persists <code>run_info.yaml</code>, picks the best checkpoint
+            for evaluation via <code>get_checkpoint_for_mode</code>.</li>
+        <li><code>list_runs</code>, <code>find_latest_run</code>.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4><code>utils/metrics.py</code></h4>
+      <ul>
+        <li>Numeric: <code>compute_classification_metrics</code>,
+            <code>compute_regression_metrics</code>,
+            <code>compute_mip_metrics</code>, <code>format_metrics</code>.</li>
+        <li>Plots: <code>plot_confusion_matrix</code>,
+            <code>plot_spectra_comparison</code>,
+            <code>plot_embeddings_tsne</code>,
+            <code>plot_regression_scatter</code>.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4><code>models/positional_encoding.py</code></h4>
+      <ul>
+        <li><code>SinusoidalPositionalEncoding</code> — fixed sin/cos
+          encoding, added element-wise after intensity projection.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────── 7. File relationships ───────────── -->
+<section id="filerels">
+  <h2>7. File Relationships</h2>
+  <table>
+    <tr><th style="width:32%">Consumer</th><th>Imports / Reads</th></tr>
+    <tr>
+      <td><code>train_pretrain.py</code></td>
+      <td>
+        <code>data.libs_pipeline.build_dataset_from_config</code> ·
+        <code>models.libs_transformer.LIBSTransformer</code> ·
+        <code>training.pretrain.{LIBSPretrainModule, PretrainDataModule}</code> ·
+        <code>utils.run_manager.RunManager</code> ·
+        YAML configs · CLI args.
+      </td>
+    </tr>
+    <tr>
+      <td><code>train_finetune.py</code></td>
+      <td>
+        <code>data.synthetic_generator</code> · <code>data.dataset.LabeledLIBSDataset</code> ·
+        <code>data.libs_pipeline.{build_dataset_from_config, cluster_compositions,
+              extract_finetune_labels, get_or_make_splits}</code> ·
+        <code>models.libs_transformer.LIBSTransformer</code> ·
+        <code>training.finetune.{LIBSFinetuneModule, FinetuneDataModule}</code> ·
+        <code>utils.run_manager.RunManager</code>.
+      </td>
+    </tr>
+    <tr>
+      <td><code>evaluate_model.py</code></td>
+      <td>
+        <code>data.line_embedding_pipeline.prepare_line_token_assets</code> ·
+        <code>data.dataset.{MaskedLIBSDataset, LabeledLIBSDataset}</code> ·
+        <code>models.libs_transformer.LIBSTransformer</code> ·
+        <code>models.heads.{ClassificationHead, RegressionHead}</code> ·
+        <code>utils.metrics.*</code> · <code>utils.run_manager.RunManager</code> ·
+        <code>{run_dir}/config.yaml</code> +
+        <code>{run_dir}/checkpoints/*</code>.
+      </td>
+    </tr>
+    <tr>
+      <td><code>list_runs.py</code></td>
+      <td><code>utils.run_manager.{list_runs, find_latest_run}</code> ·
+        each run's <code>run_info.yaml</code>.</td>
+    </tr>
+    <tr>
+      <td><code>training/pretrain.py</code></td>
+      <td><code>data.dataset.{MaskedLIBSDataset, libs_worker_init_fn}</code>
+          (lazy-imported inside <code>setup()</code> / dataloader functions).</td>
+    </tr>
+    <tr>
+      <td><code>training/finetune.py</code></td>
+      <td><code>data.dataset.LabeledLIBSDataset</code> ·
+          <code>models.heads.{BinnedQuantificationHead, ClassificationHead,
+                RegressionHead, bin_to_concentration, concentration_to_bin}</code>.</td>
+    </tr>
+    <tr>
+      <td><code>models/libs_transformer.py</code></td>
+      <td><code>models.positional_encoding.SinusoidalPositionalEncoding</code>.</td>
+    </tr>
+    <tr>
+      <td><code>data/libs_pipeline.py</code></td>
+      <td>SQLite DB · sample-matrix XLSX · wavelength JSON ·
+          per-config HDF5 cache (<code>external_data/cache/synthetic_cache_*.h5</code>) +
+          splits JSON (<code>splits_*.json</code>).</td>
+    </tr>
+  </table>
+
+  <h3>Cross-script artefact flow</h3>
+<div class="ascii">config/&lt;name&gt;.yaml ──┐
+                       ▼
+       train_pretrain.py ──► runs/pretrain_…/
+                              ├── config.yaml          (copy)
+                              ├── run_info.yaml        (status, params, best loss)
+                              ├── checkpoints/
+                              │     ├── last.ckpt      (Lightning)
+                              │     ├── best.ckpt
+                              │     ├── model_latest.pt
+                              │     ├── model_latest_info.txt
+                              │     └── final_model.pt (state_dict)
+                              └── logs/                (TensorBoard / wandb)
+
+       train_finetune.py  ──► runs/finetune_…/
+              ▲                ├── config.yaml
+              │                ├── run_info.yaml       (incl. pretrain_run)
+   --pretrain_run_dir          ├── checkpoints/
+                               │     ├── last.ckpt    (encoder + heads)
+                               │     ├── best.ckpt
+                               │     ├── encoder_latest.pt
+                               │     └── final_encoder.pt
+                               └── logs/
+
+       evaluate_model.py  ──► {run_dir}/evaluation/eval_&lt;timestamp&gt;/
+                              ├── pretrain_reconstruction_examples.png
+                              ├── pretrain_error_analysis.png
+                              ├── pretrain_embeddings_tsne.png
+                              ├── pretrain_metrics.txt
+                              ├── finetune_classification.png       (if finetune)
+                              ├── finetune_regression.png
+                              ├── finetune_embeddings_tsne.png
+                              └── finetune_metrics.txt</div>
+</section>
+
+<!-- ───────────── 8. Data flow ───────────── -->
+<section id="dataflow">
+  <h2>8. Data Flow</h2>
+<div class="ascii"> build_dataset_from_config(libs_data.yaml)
+   → SQLite + Voigt synthesis → synthetic_cache_{md5}.h5
+        │
+        ├─ intensity path ──► MaskedLIBSDataset ──► SpectralEmbedding ──┐
+        │                                                                 │
+        └─ line_token path ─► line_dict + line_features HDF5              │
+              MaskedLineTokenDataset ──► LineTokenEmbedding ──────────────┤
+        └─ line_token_linear ─► line_tokens HDF5 (14 ch, offline build)   │
+              MaskedLineTokensDataset ──► LinearLineTokenEmbedding ───────┤
+                                                                        ▼
+                    LIBSTransformer (+ key_padding_mask from fit_valid)
+                                                                        │
+              pretrain: MIP (bins or max_I/FWHM)    finetune: task heads</div>
+</section>
+
+<!-- ───────────── 9. Run management ───────────── -->
+<section id="runmgmt">
+  <h2>9. Run Management</h2>
+  <p>
+    <code>utils/run_manager.RunManager</code> is the single source of truth
+    for the on-disk layout of every experiment. It:
+  </p>
+  <ul>
+    <li>creates <code>runs/{type}_{timestamp}_{experiment_name}/</code>
+        at construction time;</li>
+    <li>copies the source YAML into <code>config.yaml</code> for
+        reproducibility;</li>
+    <li>persists metadata into <code>run_info.yaml</code> via
+        <code>save_run_info()</code> &mdash; written twice
+        (status=<code>running</code> at start, status=<code>completed</code>
+        at end, with best metric);</li>
+    <li>resolves the best checkpoint for evaluation:
+        <code>get_checkpoint_for_mode("pretrain")</code> prefers
+        <code>final_model.pt</code> → <code>model_latest.pt</code> →
+        <code>last.ckpt</code>;
+        <code>get_checkpoint_for_mode("finetune")</code> prefers
+        <code>last.ckpt</code> (encoder + heads) → <code>final_encoder.pt</code>.</li>
+  </ul>
+
+  <details>
+    <summary><code>run_info.yaml</code> — example (pretrain)</summary>
+<pre><code>run_type: pretrain
+run_name: pretrain_2026-05-15_11-13-41_my_test
+timestamp: 2026-05-15_11-13-41
+experiment_name: my_test
+run_dir: runs/pretrain_2026-05-15_11-13-41_my_test
+model_params: 4839937
+train_samples: 5000
+val_samples: 500
+batch_size: 16
+epochs: 10
+mask_ratio: 0.15
+contiguous_masking: true
+block_sizes: [25, 50, 100]
+peak_bias_enabled: true
+seed: 42
+status: completed
+best_val_loss: 0.0060864840634167194
+final_model: runs/.../checkpoints/final_model.pt</code></pre>
+  </details>
+
+  <details>
+    <summary><code>run_info.yaml</code> — finetune additions</summary>
+<pre><code>task: classification | quantification | quantification_binned | both
+pool: cls | mean | cls_mean
+n_elements: int
+n_concentration_bins: int
+element_names: [Fe, C, Mn, …]
+libs_data_config: config/libs_data.yaml | null
+pretrain_run: runs/pretrain_…
+pretrain_checkpoint: runs/pretrain_…/checkpoints/last.ckpt
+best_metric: 0.83
+test_results: { val/accuracy: …, val/reg_mae: …, … }</code></pre>
+  </details>
+</section>
+
+<!-- ───────────── 10. Logging ───────────── -->
+<section id="logging">
+  <h2>10. Logging</h2>
+
+  <h3>Backends</h3>
+  <table>
+    <tr><th>Backend</th><th>Activated by</th><th>Save location</th><th>Notes</th></tr>
+    <tr>
+      <td>TensorBoard <span class="tag ok">default</span></td>
+      <td><code>config.logging.logger == "tensorboard"</code></td>
+      <td><code>{run_dir}/logs/events.out.tfevents.*</code> +
+          <code>hparams.yaml</code></td>
+      <td>View with <code>tensorboard --logdir runs/</code>.</td>
+    </tr>
+    <tr>
+      <td>Weights &amp; Biases</td>
+      <td><code>config.logging.logger == "wandb"</code> (optional)</td>
+      <td><code>{run_dir}/logs/wandb/</code> + W&amp;B cloud</td>
+      <td>Requires <code>wandb login</code>;
+          <code>project</code>, <code>entity</code>, <code>tags</code>
+          come from <code>logging.wandb.*</code>.</td>
+    </tr>
+    <tr>
+      <td>Lightning console</td>
+      <td>always</td>
+      <td>stdout / stderr / SLURM <code>.out</code></td>
+      <td>Includes the masking-statistics block printed by
+          <code>PretrainDataModule.setup</code>.</td>
+    </tr>
+    <tr>
+      <td>File logs</td>
+      <td>always</td>
+      <td><code>{run_dir}/run_info.yaml</code>,
+          <code>{run_dir}/checkpoints/model_latest_info.txt</code></td>
+      <td>Lightweight metadata; written by RunManager and the custom
+          <code>SaveRaw*Callback</code>s.</td>
+    </tr>
+  </table>
+
+  <h3>Lightning callbacks</h3>
+  <ul>
+    <li><code>ModelCheckpoint</code> — saves the best checkpoint by the
+        task-specific monitor metric, plus <code>last.ckpt</code>.</li>
+    <li><code>LearningRateMonitor</code> — logs LR per step.</li>
+    <li><code>SaveRawModelCallback</code> /
+        <code>SaveRawEncoderCallback</code> — write a plain state_dict
+        each epoch for fast, dependency-free reload.</li>
+    <li><code>EarlyStopping</code> — optional, via <code>--early_stopping</code>.</li>
+  </ul>
+
+  <h3>Logged metrics</h3>
+  <table>
+    <tr><th>Phase</th><th>Metric keys</th></tr>
+    <tr>
+      <td>Pre-training</td>
+      <td><code>train/loss</code>, <code>train/lr</code>,
+          <code>val/loss</code>, <code>val/mae</code>, <code>val/r2</code>,
+          <code>epoch</code></td>
+    </tr>
+    <tr>
+      <td>Fine-tuning (classification)</td>
+      <td><code>train/cls_loss</code>, <code>train/accuracy</code>,
+          <code>val/cls_loss</code>, <code>val/accuracy</code>,
+          <code>val/balanced_accuracy</code>, <code>val/loss</code></td>
+    </tr>
+    <tr>
+      <td>Fine-tuning (quantification / regression)</td>
+      <td><code>*/reg_loss</code>, <code>*/reg_mae</code>, <code>*/reg_r2</code>,
+          <code>*/loss</code></td>
+    </tr>
+    <tr>
+      <td>Fine-tuning (quantification_binned)</td>
+      <td><code>*/bin_loss</code>, <code>*/bin_accuracy</code>,
+          <code>*/decoded_mae</code>, <code>*/decoded_r2</code>,
+          <code>*/loss</code></td>
+    </tr>
+  </table>
+</section>
+
+<!-- ───────────── 11. Evaluation ───────────── -->
+<section id="evaluation">
+  <h2>11. Evaluation</h2>
+  <p>
+    <code>evaluate_model.py</code> uses <code>RunManager.from_existing_run</code>
+    to load the config and the best checkpoint, generates a held-out test set
+    (different seed), and renders:
+  </p>
+  <table>
+    <tr><th>Mode</th><th>File</th><th>What it shows</th></tr>
+    <tr>
+      <td rowspan="4">pretrain</td>
+      <td><code>pretrain_reconstruction_examples.png</code></td>
+      <td>6 spectra: original vs predicted, with masked regions shaded.</td>
+    </tr>
+    <tr>
+      <td><code>pretrain_error_analysis.png</code></td>
+      <td>2×2 panel: error histogram · error vs intensity bin ·
+          predicted vs true scatter (R²) · per-class MAE.</td>
+    </tr>
+    <tr>
+      <td><code>pretrain_embeddings_tsne.png</code></td>
+      <td>t-SNE of CLS embeddings, coloured by material class.</td>
+    </tr>
+    <tr>
+      <td><code>pretrain_metrics.txt</code></td>
+      <td>MSE / RMSE / MAE / R² over masked positions.</td>
+    </tr>
+    <tr>
+      <td rowspan="4">finetune</td>
+      <td><code>finetune_classification.png</code></td>
+      <td>Confusion matrix + per-class accuracy + summary metrics.</td>
+    </tr>
+    <tr>
+      <td><code>finetune_regression.png</code></td>
+      <td>2×3 scatter grid (per-element predicted vs true) + summary box.</td>
+    </tr>
+    <tr>
+      <td><code>finetune_embeddings_tsne.png</code></td>
+      <td>t-SNE of CLS embeddings from the fine-tuned model.</td>
+    </tr>
+    <tr>
+      <td><code>finetune_metrics.txt</code></td>
+      <td>Classification and regression metrics side by side.</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ───────────── 12. Deployment ───────────── -->
+<section id="deployment">
+  <h2>12. Deployment (SLURM)</h2>
+  <p>
+    Three SLURM wrappers target the physics-based pipeline (bin embedding).
+    Add <code>--line_embedding_config</code> and a token config for line-token runs.
+    All run inside enroot (<code>sslibs</code>) at <code>/workspace</code>.
+  </p>
+  <table>
+    <tr><th>Script</th><th>Resources</th><th>Inner command</th></tr>
+    <tr>
+      <td><code>run_pretrain_libs.slurm</code></td>
+      <td>1×GPU, 80 G RAM, 48 h, 8 cpus</td>
+      <td><code>uv run python train_pretrain.py --config config/config_libs_a100.yaml --libs_data_config config/libs_data.yaml --experiment_name libs_pretrain_a100 --num_workers 4</code></td>
+    </tr>
+    <tr>
+      <td><code>run_finetune_libs.slurm $PRETRAIN_RUN</code></td>
+      <td>1×GPU, 80 G RAM, 24 h, 8 cpus</td>
+      <td><code>uv run python train_finetune.py --config config/config_libs_a100.yaml --pretrain_run_dir $PRETRAIN_RUN --libs_data_config config/libs_data.yaml --task quantification_binned --pool cls_mean --experiment_name libs_binned_q_a100 --num_workers 4</code></td>
+    </tr>
+    <tr>
+      <td><code>run_eval.slurm $RUN_DIR</code></td>
+      <td>1×GPU, 40 G RAM, 1 h, 4 cpus</td>
+      <td><code>uv run python evaluate_model.py --run_dir $RUN_DIR</code></td>
+    </tr>
+  </table>
+</section>
+
+<!-- ───────────── 13. Glossary ───────────── -->
+<section id="glossary">
+  <h2>13. Glossary</h2>
+  <dl>
+    <dt><strong>MIP</strong></dt><dd>Masked Intensity Prediction — the
+      self-supervised objective: predict the original intensity at masked
+      positions from the rest of the spectrum.</dd>
+    <dt><strong>BERT 80/10/10</strong></dt><dd>Of the masked positions:
+      80 % become a learnable mask token, 10 % a random intensity, 10 %
+      are left unchanged. Prevents the model from learning a shortcut on
+      the mask token alone.</dd>
+    <dt><strong>Peak-biased masking</strong></dt><dd>A configurable
+      fraction (<code>peak_bias_ratio</code>) of the masked bins is forced
+      to overlap with peak regions detected via a simple intensity
+      threshold + ±5-bin shoulder expansion.</dd>
+    <dt><strong>Run</strong></dt><dd>A single training execution; lives in
+      <code>runs/{type}_{timestamp}_{experiment_name}/</code>; contains a
+      copy of the config, all checkpoints, logs, evaluation outputs and a
+      <code>run_info.yaml</code> metadata file.</dd>
+    <dt><strong>libs_data pipeline</strong></dt><dd>Physics-based Voigt
+      synthesis via <code>--libs_data_config</code>; overrides
+      <code>n_bins</code>, <code>n_classes</code>, <code>n_elements</code>,
+      and <code>n_concentration_bins</code> at runtime.</dd>
+    <dt><strong>Line-token embedding</strong></dt><dd>One token per retained line;
+      <code>line_token</code> (runtime assembly) or <code>line_token_linear</code> (pre-baked HDF5).</dd>
+    <dt><strong>Line tokens cache</strong></dt><dd><code>line_tokens_{hash}.h5</code>:
+      14-feature tensor per line per spectrum; built by <code>data/line_tokenization.py</code>.</dd>
+    <dt><strong>Separated tokenization</strong></dt><dd>Voigt fitting and feature merge happen offline;
+      training loads <code>line_tokens_*.h5</code> only (like <code>synthetic_cache_*.h5</code> for spectra).</dd>
+    <dt><strong>Line dictionary</strong></dt><dd>Theoretical lines above
+      <code>intensity_threshold</code> on a Te×Ne grid (<code>line_dict_*.h5</code>).</dd>
+    <dt><strong>Pool</strong></dt><dd>How encoder outputs feed downstream
+      heads: <code>cls</code> (CLS token only), <code>mean</code> (mean over
+      bins), or <code>cls_mean</code> (concatenation of both — head input
+      dim is <code>2·d_model</code>).</dd>
+  </dl>
+</section>
+
+<footer>
+  Generated as a static project summary from the on-disk source tree.
+  Companion machine-readable version: <code>PROJECT_SUMMARY.json</code>
+  (intended as a reusable template).
+</footer>
+
+</main>
+</div>
+</body>
+</html>

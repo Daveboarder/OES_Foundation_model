@@ -1,0 +1,30 @@
+# Line-token embedding: theoretical dictionary + per-spectrum Voigt fits
+# Used with --line_embedding_config and model.embedding_type: line_token
+
+line_dictionary:
+  db_path: external_data/Source/LIBS_data_vacuum.db
+  te_range: [6500.0, 11000.0]   # K
+  ne_range: [1.0e17, 5.0e17]    # cm^-3
+  n_grid:
+    te: 10
+    ne: 10
+  ne_log_spaced: true
+  N: 1.0e-4
+  C: 1.0
+  l: 1.4e-4
+  intensity_threshold: 1.0e-33  # absolute (typical Ifin ~1e-32–1e-40 with default N,l)
+  wavelength_clip:              # null = use full DB range; set min/max to spectrometer span
+    min: null
+    max: null
+  # Optional: clip to VASKUT axis when libs_data paths are set
+  wavelength_json: external_data/Data/VASKUT K8.json
+  use_wavelength_json_clip: true
+  cache_dir: external_data/cache
+
+line_features:
+  window_nm: 0.3
+  gamma_init: 0.1
+  sigma_init: 0.006
+  r2_min: 0.85
+  workers: 64
+  cache_dir: external_data/cache

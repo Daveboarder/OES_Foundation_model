@@ -30,6 +30,7 @@ dependencies = [
     
     # Logging
     "tensorboard>=2.12.0",
+    "setuptools<82",  # pkg_resources removed in 82; required by tensorboard<2.21
     "wandb>=0.15.0",
     
     # Utilities

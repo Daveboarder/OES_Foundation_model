@@ -28,6 +28,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from data.synthetic_generator import SyntheticLIBSGenerator
 from data.libs_pipeline import build_dataset_from_config
+from data.line_embedding_pipeline import (
+    prepare_line_token_assets,
+    prepare_line_tokens_assets,
+)
 from models.libs_transformer import LIBSTransformer
 from training.pretrain import LIBSPretrainModule, PretrainDataModule
 from utils.run_manager import RunManager
@@ -121,8 +125,13 @@ def generate_data(config: dict, seed: int = 42, libs_config_path: str | None = N
     return train_spectra, val_spectra
 
 
-def create_model(config: dict) -> LIBSTransformer:
-    model = LIBSTransformer(
+def create_model(
+    config: dict,
+    line_dict_meta: dict | None = None,
+    line_token_meta: dict | None = None,
+) -> LIBSTransformer:
+    emb_type = config['model'].get('embedding_type', 'intensity')
+    kwargs = dict(
         n_bins=config['data']['n_bins'],
         d_model=config['model']['d_model'],
         n_heads=config['model']['n_heads'],
@@ -130,9 +139,81 @@ def create_model(config: dict) -> LIBSTransformer:
         d_ff=config['model']['d_ff'],
         dropout=config['model']['dropout'],
         n_classes=config['data']['n_classes'],
+        embedding_type=emb_type,
     )
-    print(f"Created model with {model.num_parameters:,} parameters")
+    if emb_type == 'line_token' and line_dict_meta is not None:
+        kwargs['n_lines'] = line_dict_meta['n_lines']
+        kwargs['line_dict_meta'] = line_dict_meta
+        kwargs['n_elements_vocab'] = line_dict_meta.get('n_elements', 53)
+    if emb_type == 'line_token_linear' and line_token_meta is not None:
+        kwargs['n_lines'] = line_token_meta['n_lines']
+        kwargs['line_token_meta'] = line_token_meta
+        kwargs['n_mip_target_channels'] = int(
+            config['model'].get('n_mip_target_channels', 2)
+        )
+    model = LIBSTransformer(**kwargs)
+    print(f"Created model ({emb_type}) with {model.num_parameters:,} parameters")
     return model
+
+
+def _prepare_line_token_libs(
+    config: dict, libs_config_path: str, line_embedding_config: str, seed: int,
+):
+    """Build caches and train/val index split for line-token + LIBS pipeline."""
+    libs_cfg = yaml.safe_load(open(libs_config_path))
+    libs_cfg.setdefault('generation', {})['seed'] = seed
+    ds = build_dataset_from_config(libs_cfg)
+    if len(ds) == 0:
+        raise RuntimeError("LIBS pipeline produced no spectra.")
+    meta = prepare_line_token_assets(
+        ds.spectra.astype(np.float32),
+        ds.wavelength,
+        line_embedding_config,
+        spectra_cache_key=ds.cache_key,
+        verbose=True,
+    )
+    n_lines = meta['n_lines']
+    print(f"Line dictionary: {n_lines} tokens")
+    config['data']['n_bins'] = n_lines
+    config['model']['max_seq_len'] = n_lines + 1
+
+    val_frac = config['data']['synthetic'].get('val_fraction', 0.1)
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(ds))
+    n_val = max(1, int(len(ds) * val_frac))
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    return meta, train_idx, val_idx
+
+
+def _prepare_line_tokens_linear_libs(
+    config: dict, libs_config_path: str, line_embedding_config: str, seed: int,
+):
+    """Pre-baked tokens path for the line_token_linear model."""
+    libs_cfg = yaml.safe_load(open(libs_config_path))
+    libs_cfg.setdefault('generation', {})['seed'] = seed
+    ds = build_dataset_from_config(libs_cfg)
+    if len(ds) == 0:
+        raise RuntimeError("LIBS pipeline produced no spectra.")
+    meta = prepare_line_tokens_assets(
+        ds.spectra.astype(np.float32),
+        ds.wavelength,
+        line_embedding_config,
+        spectra_cache_key=ds.cache_key,
+        verbose=True,
+    )
+    print(
+        f"Line tokens cache: {meta['n_lines']} lines × {meta['n_features']} features → "
+        f"{meta['line_tokens_path']}"
+    )
+    config['data']['n_bins'] = meta['n_lines']
+    config['model']['max_seq_len'] = meta['n_lines'] + 1
+
+    val_frac = config['data']['synthetic'].get('val_fraction', 0.1)
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(ds))
+    n_val = max(1, int(len(ds) * val_frac))
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    return meta, train_idx, val_idx
 
 
 def main(args):
@@ -147,19 +228,54 @@ def main(args):
 
     pl.seed_everything(args.seed)
 
-    train_spectra, val_spectra = generate_data(
-        config, seed=args.seed, libs_config_path=args.libs_data_config,
-    )
-    print(f"Train: {len(train_spectra)} samples | Val: {len(val_spectra)} samples | n_bins: {train_spectra.shape[1]}")
+    line_dict_meta = None
+    line_token_meta = None
+    train_indices = val_indices = None
+    line_features_path = None
+    line_tokens_path = None
+    train_spectra = val_spectra = None
 
-    if args.save_data:
+    requested_emb = config['model'].get('embedding_type', 'intensity')
+    # Default behaviour when --line_embedding_config is provided but the
+    # model config does not pin a flavour: use the new linear/tokenized path.
+    if args.line_embedding_config and requested_emb == 'intensity':
+        requested_emb = 'line_token_linear'
+        config['model']['embedding_type'] = requested_emb
+    use_line_token = requested_emb in ('line_token', 'line_token_linear')
+
+    if use_line_token:
+        if not args.line_embedding_config:
+            raise ValueError(f"embedding_type={requested_emb!r} requires --line_embedding_config")
+        if not args.libs_data_config:
+            raise ValueError(f"embedding_type={requested_emb!r} requires --libs_data_config")
+
+    if requested_emb == 'line_token':
+        line_dict_meta, train_indices, val_indices = _prepare_line_token_libs(
+            config, args.libs_data_config, args.line_embedding_config, args.seed,
+        )
+        line_features_path = line_dict_meta['line_features_path']
+        print(f"Train: {len(train_indices)} | Val: {len(val_indices)} | n_lines: {config['data']['n_bins']}")
+    elif requested_emb == 'line_token_linear':
+        line_token_meta, train_indices, val_indices = _prepare_line_tokens_linear_libs(
+            config, args.libs_data_config, args.line_embedding_config, args.seed,
+        )
+        line_tokens_path = line_token_meta['line_tokens_path']
+        print(f"Train: {len(train_indices)} | Val: {len(val_indices)} | n_lines: {config['data']['n_bins']}")
+    else:
+        train_spectra, val_spectra = generate_data(
+            config, seed=args.seed, libs_config_path=args.libs_data_config,
+        )
+        print(f"Train: {len(train_spectra)} samples | Val: {len(val_spectra)} samples | "
+              f"n_bins: {train_spectra.shape[1]}")
+
+    if args.save_data and train_spectra is not None:
         data_dir = run_mgr.run_dir / "data"
         data_dir.mkdir(exist_ok=True)
         np.save(data_dir / 'train_spectra.npy', train_spectra)
         np.save(data_dir / 'val_spectra.npy', val_spectra)
         print(f"Saved data to {data_dir}")
 
-    model = create_model(config)
+    model = create_model(config, line_dict_meta=line_dict_meta, line_token_meta=line_token_meta)
 
     pretrain_module = LIBSPretrainModule(
         model=model,
@@ -195,6 +311,10 @@ def main(args):
         peak_bias_ratio=peak_bias_ratio,
         peak_threshold=peak_threshold,
         num_workers=args.num_workers,
+        line_features_path=line_features_path,
+        line_tokens_path=line_tokens_path,
+        train_indices=train_indices,
+        val_indices=val_indices,
     )
 
     # Logger
@@ -267,10 +387,17 @@ def main(args):
     trainer = pl.Trainer(**trainer_kwargs)
 
     # Save run info
+    n_train = len(train_indices) if train_indices is not None else len(train_spectra)
+    n_val = len(val_indices) if val_indices is not None else len(val_spectra)
     run_mgr.save_run_info({
         "model_params": model.num_parameters,
-        "train_samples": len(train_spectra),
-        "val_samples": len(val_spectra),
+        "embedding_type": config['model'].get('embedding_type', 'intensity'),
+        "train_samples": n_train,
+        "val_samples": n_val,
+        "n_lines": config['data']['n_bins'] if use_line_token else None,
+        "line_features_path": line_features_path,
+        "line_tokens_path": line_tokens_path,
+        "line_embedding_config": args.line_embedding_config,
         "batch_size": config['pretrain']['batch_size'],
         "epochs": config['pretrain']['epochs'],
         "mask_ratio": config['pretrain']['mask_ratio'],
@@ -294,10 +421,17 @@ def main(args):
     print(f"\nSaved final model to {final_path}")
 
     # Update run info
+    n_train = len(train_indices) if train_indices is not None else len(train_spectra)
+    n_val = len(val_indices) if val_indices is not None else len(val_spectra)
     run_mgr.save_run_info({
         "model_params": model.num_parameters,
-        "train_samples": len(train_spectra),
-        "val_samples": len(val_spectra),
+        "embedding_type": config['model'].get('embedding_type', 'intensity'),
+        "train_samples": n_train,
+        "val_samples": n_val,
+        "n_lines": config['data']['n_bins'] if use_line_token else None,
+        "line_features_path": line_features_path,
+        "line_tokens_path": line_tokens_path,
+        "line_embedding_config": args.line_embedding_config,
         "batch_size": config['pretrain']['batch_size'],
         "epochs": config['pretrain']['epochs'],
         "mask_ratio": config['pretrain']['mask_ratio'],
@@ -329,6 +463,8 @@ if __name__ == "__main__":
                         help='Path to physics-based LIBS data pipeline config '
                              '(e.g. config/libs_data.yaml). If set, replaces the '
                              'legacy SyntheticLIBSGenerator with the realistic pipeline.')
+    parser.add_argument('--line_embedding_config', type=str, default=None,
+                        help='Path to config/line_embedding.yaml for line-as-token embedding.')
     parser.add_argument('--runs_dir', type=str, default='runs',
                         help='Base directory for all runs (default: runs/)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')

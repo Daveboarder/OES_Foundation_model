@@ -1,0 +1,56 @@
+# =============================================================================
+# Line-token embedding — RTX 4090 + full LIBS pipeline (config/libs_data.yaml)
+# =============================================================================
+# Sequence length ≈ n_lines (~8k after line_dictionary) + CLS, not 17k bins.
+# First run builds line_dict_*.h5 and line_features_*.h5 (Voigt fits are slow).
+#
+#   uv run python train_pretrain.py \
+#     --config config/config_libs_token_4090.yaml \
+#     --libs_data_config config/libs_data.yaml \
+#     --line_embedding_config config/line_embedding.yaml \
+#     --experiment_name libs_line_pretrain_4090 \
+#     --num_workers 4
+# =============================================================================
+
+data:
+  n_bins: 2048            # overridden to n_lines after dictionary build
+  n_classes: 10           # overridden from libs_data downstream.n_clusters
+  n_elements: 60
+  n_concentration_bins: 1000
+  synthetic:
+    val_fraction: 0.15
+
+model:
+  embedding_type: line_token
+  d_model: 128
+  n_heads: 4
+  n_layers: 4
+  d_ff: 512
+  dropout: 0.1
+  max_seq_len: 8192       # placeholder; set to n_lines + 1 after dict build
+
+pretrain:
+  mask_ratio: 0.15
+  batch_size: 4           # ~8k tokens; reduce to 2 if OOM
+  accumulate_grad_batches: 8
+  epochs: 5
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+
+finetune:
+  batch_size: 4
+  epochs: 5
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder: false
+
+logging:
+  logger: tensorboard
+  log_every_n_steps: 25
+  val_check_interval: 1.0
+
+device:
+  accelerator: gpu
+  precision: bf16-mixed

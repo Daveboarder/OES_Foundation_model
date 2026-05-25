@@ -36,8 +36,10 @@ wandb/
 # Data
 data/generated/
 *.npy
-*.h5
-*.hdf5
+**/*.h5
+**/*.H5
+**/*.hdf5
+**/*.HDF5
 
 # OS
 .DS_Store
@@ -71,3 +73,4 @@ run_local.ps1
 # Misc
 *.log
 .env
+myVenv/

@@ -8,9 +8,12 @@ This document describes the architecture, masking strategies, and design decisio
 
 1. [Overview](#overview)
 2. [Model Architecture](#model-architecture)
-3. [Masking Strategies](#masking-strategies)
-4. [Training Configurations](#training-configurations)
-5. [Evaluation Metrics](#evaluation-metrics)
+3. [Data Sources](#data-sources)
+4. [Masking Strategies](#masking-strategies)
+5. [Downstream Fine-Tuning](#downstream-fine-tuning)
+6. [Training Configurations](#training-configurations)
+7. [Evaluation Metrics](#evaluation-metrics)
+8. [Usage Examples](#usage-examples)
 
 ---
 
@@ -23,7 +26,21 @@ The LIBS Foundation Model is a self-supervised transformer for Laser Induced Bre
 1. **Peak-biased masking**: Ensures the model learns peak structure, not just noise
 2. **Variable block sizes**: Prevents the model from exploiting fixed masking patterns
 3. **Contiguous masking**: Forces global reasoning over local interpolation
-4. **Scalable architecture**: From 3M (local) to 500M+ (A100) parameters
+4. **Scalable architecture**: Encoder size scales with `d_model` and `n_layers`; sequence length is either **17,428 bins** (intensity mode) or **thousands of line tokens** (line-token mode)
+
+### Data and embedding modes
+
+All production training uses the **physics pipeline** via `--libs_data_config` (`config/libs_data.yaml`).
+
+| Embedding | `model.embedding_type` | Sequence | Pre-train target |
+|-----------|------------------------|----------|------------------|
+| **Bin (intensity)** | `intensity` (default) | ~17,428 bins + CLS | Masked bin intensities (MIP) |
+| **Line-token** | `line_token` | `n_lines` + CLS (threshold-dependent) | Masked Voigt features (`max_I`, `FWHM`) |
+| **Line-token-linear** | `line_token_linear` | `n_lines` + CLS | Same MIP targets; reads `line_tokens_*.h5` |
+
+Line-token modes require `--line_embedding_config` (`config/line_embedding.yaml`). When the flag is set and the model config does not pin `embedding_type`, training defaults to **`line_token_linear`**. Checkpoints are **not interchangeable** between modes.
+
+`--libs_data_config` overrides `data.n_bins` (intensity) or drives line-feature caches (line-token), and sets `model.max_seq_len` to `n_bins + 1` or `n_lines + 1`. Fine-tune also overrides `n_classes`, `n_elements`, and `n_concentration_bins` from the libs data config.
 
 ---
 
@@ -32,21 +49,22 @@ The LIBS Foundation Model is a self-supervised transformer for Laser Induced Bre
 ### Transformer Encoder (high-level)
 
 ```
-Input Spectrum (2048 bins, normalized 0-1)
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  Intensity Embedding (learned MLP)      │
-│  Each intensity scalar → d_model vector │
-│  + Mask token replacement               │
-│  (see Masking Strategies below)         │
-└─────────────────────────────────────────┘
-    │
-    ▼
+Intensity mode                    Line-token mode              Line-token-linear mode
+──────────────                  ───────────────              ──────────────────────
+Input [B, n_bins]               Input [B, L, 6] features       Input [B, L, 14] tokens
+    │                               │                            │
+    ▼                               ▼                            ▼
+SpectralEmbedding               LineTokenEmbedding           LinearLineTokenEmbedding
+MLP per bin                     runtime concat +             z-score + nn.Linear(14)
+                                element/ion Embeddings       (pre-baked HDF5)
+    │                               │                            │
+    └───────────────────────────────┴────────────────────────────┘
+                                    ▼
 ┌─────────────────────────────────────────┐
 │  + [CLS] Token (learned)                │
 │  + Sinusoidal Positional Encoding       │
-│  Sequence length: 2049 (2048 + 1)       │
+│  Seq len: n_bins+1  or  n_lines+1       │
+│  (line mode: key_padding_mask invalid)  │
 └─────────────────────────────────────────┘
     │
     ▼
@@ -70,16 +88,16 @@ Regression Head     Head (pre-training)
 
 The embedding pipeline transforms raw intensities into the initial residual stream:
 
-1. **Intensity projection** — a learned 2-layer MLP (`Linear(1→128) → GELU → Linear(128→256)`)
+1. **Intensity projection** — a learned 2-layer MLP (`Linear(1→d_model/2) → GELU → Linear(d_model/2→d_model)`)
    projects each scalar intensity independently to a d_model-dimensional vector. The same
-   weights are shared across all 2048 bins.
+   weights are shared across all `n_bins` positions.
 
 2. **Mask token replacement** (pretraining only) — masked positions have their projected
-   vectors replaced with a single learned mask token (one 256-dim vector, shared across all
+   vectors replaced with a single learned mask token (one d_model-dimensional vector, shared across all
    masked positions). See [How BERT-style Masking Works](#how-bert-style-masking-works-for-continuous-spectra)
    for the 80/10/10 replacement strategy.
 
-3. **[CLS] token** — a learned 256-dim vector prepended at position 0. It carries no spectral
+3. **[CLS] token** — a learned d_model-dimensional vector prepended at position 0. It carries no spectral
    information initially; through attention across all layers it accumulates a global summary
    of the entire spectrum. Used for downstream classification/regression.
 
@@ -139,7 +157,7 @@ Final LayerNorm → output heads
 **How to read this:**
 
 - The straight vertical line **is** the residual stream — it is never overwritten, only added to.
-- Self-attention reads all 2049 positions, computes interactions between them, and writes a
+- Self-attention reads all n_bins+1 positions, computes interactions between them, and writes a
   delta back. This is where tokens exchange information (masked positions gather context
   from unmasked neighbors).
 - FFN processes each position independently — per-token "thinking" with no cross-talk.
@@ -153,11 +171,17 @@ Final LayerNorm → output heads
 
 ### Model Configurations
 
-| Config | d_model | n_heads | n_layers | d_ff | Parameters |
-|--------|---------|---------|----------|------|------------|
-| Local (16GB) | 256 | 8 | 6 | 1024 | ~3M |
-| Standard | 256 | 8 | 6 | 1024 | ~3M |
-| A100 Large | 1024 | 16 | 24 | 4096 | ~500M |
+| Config file | Embedding | d_model | n_layers | Use case |
+|-------------|-----------|---------|----------|----------|
+| `config_libs_smoke.yaml` | intensity | 32 | 1 | Pipeline wiring smoke |
+| `config_libs_4090.yaml` | intensity | 128 | 4 | Bin embedding, RTX 4090 |
+| `config_libs_a100.yaml` | intensity | 256 | 6 | Bin embedding, A100 |
+| `config_libs_token.yaml` | line_token | 32 | 1 | Line-token smoke (+ `line_embedding_smoke.yaml`) |
+| `config_libs_token_4090.yaml` | line_token | 128 | 4 | Line-token, RTX 4090 (+ `line_embedding.yaml`) |
+| `config_libs_token_linear.yaml` | line_token_linear | 64 | 2 | Pre-baked tokens smoke |
+| `config_libs_token_linear_4090.yaml` | line_token_linear | 128 | 4 | Pre-baked tokens, RTX 4090 |
+
+At ~17k bins or ~8k lines, `LIBSTransformer` uses PyTorch SDPA (`need_weights=False`) for tractable bf16 attention on consumer GPUs.
 
 ### Parameter Count Formula
 
@@ -168,7 +192,74 @@ params ≈ n_layers × (4 × d_model² + 2 × d_model × d_ff)
 
 ---
 
+## Data Sources
+
+### Physics-based pipeline (`data/libs_pipeline.py` + `config/libs_data.yaml`)
+
+- Voigt-profile synthesis using `external_data/Source/LIBS_data_vacuum.db`, concentration ranges from `Samples_Fe_matrix.xlsx`, and wavelength axis from `external_data/Data/VASKUT K8.json`.
+- Materialises spectra once into `external_data/cache/synthetic_cache_{md5}.h5`; train/val/test splits in `splits_{md5}.json` are shared between pretrain and finetune.
+- Downstream labels: per-element concentrations from the sample table; classification labels via K-means on concentration vectors (`cluster_compositions`, `n_clusters` from `libs_data.yaml`).
+- Smoke variant: `config/libs_data_smoke.yaml` — 3 sample types × 6 shots per type.
+
+### Runtime overrides (`--libs_data_config`)
+
+| Field | New value | Scripts |
+|-------|-----------|---------|
+| `data.n_bins` | length of wavelength array | `train_pretrain.py`, `train_finetune.py` |
+| `model.max_seq_len` | `n_bins + 1` (intensity) or `n_lines + 1` (line-token) | same |
+| `data.n_classes` | `downstream.n_clusters` | `train_finetune.py` only |
+| `data.n_elements` | count of `elements_to_predict` (or all ~60) | `train_finetune.py` only |
+| `data.n_concentration_bins` | `downstream.n_concentration_bins` | `train_finetune.py` only |
+
+`run_info.yaml` records `libs_data_config`, and `line_embedding_config` when applicable.
+
+### Line-token assets (`--line_embedding_config`)
+
+Three HDF5 caches are built in sequence (additive — intermediate files are kept for debugging):
+
+| Step | Module | Output | Role |
+|------|--------|--------|------|
+| 1 | `data/line_dictionary.py` | `line_dict_{hash}.h5` | Theoretical intensities over Te×Ne; filter by `intensity_threshold` (default `1e-35` → ~8,119 lines; `1e-33` → ~2,425) |
+| 2 | `data/line_features.py` | `line_features_{hash}.h5` | Per-spectrum Voigt fits: `[n_spectra, n_lines, 6]` (`max_I`, `FWHM`, `R²`, `Δλ`, `RMSE`, `fit_valid`) |
+| 3 | `data/line_tokenization.py` | `line_tokens_{hash}.h5` | **Separated tokenization**: merged 14-feature tensor per line, raw values + `feature_mean`/`feature_std` attrs |
+
+**Standalone tokenization** (step 3 only, after 1–2 exist):
+
+```bash
+uv run python scripts/build_line_tokens.py \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding.yaml
+```
+
+Or all three via `prepare_line_tokens_assets()` (`data/line_embedding_pipeline.py`).
+
+#### `line_tokens_*.h5` layout
+
+```
+tokens          [n_spectra, n_lines, 14]  float32   # raw features (z-scored at train time)
+fit_valid       [n_spectra, n_lines]      uint8     # 1 = successful Voigt fit
+central_wavelength [n_lines]             float32   # for sinusoidal PE
+attrs: feature_names, feature_mean, feature_std, line_dict_hash, line_features_hash
+```
+
+**14 channels (indices):** 0 λ, 1 Ei, 2 Ek, 3–6 log10(gi/gk/Ak/I_theory), 7 atomic_number (Z), 8 ion_binary (0=I, 1=II+), 9 max_intensity, 10 fwhm, 11 r2, 12 delta_lambda, 13 rmse.
+
+#### Embedding at training time
+
+| Mode | Reads | Embedding module |
+|------|-------|------------------|
+| `line_token` | `line_features_*.h5` | `LineTokenEmbedding` — 7 quantum scalars + `nn.Embedding` element/ion + 5 fit features → 2-layer MLP |
+| `line_token_linear` | `line_tokens_*.h5` only | `LinearLineTokenEmbedding` — z-score using stored stats → `nn.Linear(14, d_model)` |
+
+Invalid Voigt fits use `key_padding_mask` from the separate `fit_valid` dataset (not mixed into the 14 feature channels).
+
+Pre-training masks a fraction of valid lines and predicts masked `max_intensity` and `fwhm` (`MaskedLineTokenDataset` or `MaskedLineTokensDataset`, `training/pretrain.py`).
+
+---
+
 ## Masking Strategies
+
+Masking below applies to **intensity (bin) mode**. Line-token modes mask entire line tokens and zero the `max_intensity` / `fwhm` channels in the input (indices 9–10 in `line_tokens_*.h5`, or channels 0–1 in `line_features_*.h5`).
 
 The masking strategy is crucial for learning useful representations. We implement several options:
 
@@ -245,15 +336,64 @@ Masking Statistics (from 100 samples):
 
 ---
 
+## Downstream Fine-Tuning
+
+Fine-tuning attaches task-specific heads to the frozen or jointly trained `LIBSTransformer` encoder via `LIBSFinetuneModule` (`training/finetune.py`). Heads live in `models/heads.py`.
+
+### Pooling (`--pool`)
+
+The encoder returns `cls_embedding` and `sequence_embeddings`. Fine-tuning collapses them before the heads:
+
+| Pool | Representation | Head input dim |
+|------|----------------|----------------|
+| `cls` | CLS token only | `d_model` |
+| `mean` | Mean over wavelength bins (excluding CLS) | `d_model` |
+| `cls_mean` | Concatenation of CLS and mean-pool | `2 × d_model` |
+
+### Task modes (`--task`)
+
+| Task | Head | Loss | Targets in batch |
+|------|------|------|------------------|
+| `classification` | `ClassificationHead` | Cross-entropy | `label` |
+| `quantification` | `RegressionHead` (sigmoid) | MSE | `concentrations` |
+| `quantification_binned` | `BinnedQuantificationHead` | Per-element CE on 1000 bins | `concentrations` (bins encoded on the fly) |
+| `regression` | alias of `quantification` | MSE | `concentrations` |
+| `both` | classification + regression | CE + MSE | `label` + `concentrations` |
+
+`BinnedQuantificationHead` uses one small MLP branch per element, each outputting `n_concentration_bins` logits (default 1000). `concentration_to_bin` / `bin_to_concentration` in `models/heads.py` map between float targets in [0, 1] and bin indices.
+
+### Optimizer split
+
+AdamW with two parameter groups: encoder at `0.1 × learning_rate`, heads at full `learning_rate`; cosine schedule with linear warmup.
+
+### Checkpointing
+
+`ModelCheckpoint` monitors task-specific metrics: `val/accuracy` (classification), `val/reg_mae` (quantification), `val/bin_accuracy` (binned), or `val/loss` (`both`). Lightning checkpoints store `encoder.*` and head weights; `final_encoder.pt` is a raw encoder state dict for evaluation reload.
+
+---
+
 ## Training Configurations
 
-### Configuration Files
+### Model / training YAML files
 
-| File | Use Case | GPU Memory | Model Size |
-|------|----------|------------|------------|
-| `config_local.yaml` | Local testing | 8-16 GB | 3M |
-| `config.yaml` | Standard training | 24-40 GB | 3M |
-| `config_a100.yaml` | Large-scale | 40-80 GB | 500M |
+| File | Embedding | GPU | Pretrain epochs | Finetune epochs | Logger |
+|------|-----------|-----|-----------------|-----------------|--------|
+| `config_libs_smoke.yaml` | intensity | any | 2 | 2 | tensorboard |
+| `config_libs_4090.yaml` | intensity | RTX 4090 | 5 | 5 | tensorboard |
+| `config_libs_a100.yaml` | intensity | A100 | 60 | 30 | tensorboard |
+| `config_libs_token.yaml` | line_token | any | 2 | 2 | tensorboard |
+| `config_libs_token_4090.yaml` | line_token | RTX 4090 | 5 | 5 | tensorboard |
+| `config_libs_token_linear.yaml` | line_token_linear | any | 2 | 2 | tensorboard |
+| `config_libs_token_linear_4090.yaml` | line_token_linear | RTX 4090 | 5 | 5 | tensorboard |
+
+Pair with `--libs_data_config config/libs_data.yaml`. Line-token configs also require `--line_embedding_config config/line_embedding.yaml` (or `line_embedding_smoke.yaml`).
+
+### Data pipeline YAML files
+
+| File | Sample types | Shots / type | Clusters | Binned bins |
+|------|--------------|--------------|----------|-------------|
+| `libs_data.yaml` | ~2256 (all) | 50 | 10 | 1000 |
+| `libs_data_smoke.yaml` | 3 | 6 | 3 | 50 |
 
 ### Key Parameters
 
@@ -290,9 +430,20 @@ pretrain:
 
 | Config | Train | Validation | Test |
 |--------|-------|------------|------|
-| Local | 5,000 | 500 | 500 |
-| Standard | 50,000 | 5,000 | 5,000 |
-| A100 | 500,000 | 50,000 | 50,000 |
+| `libs_data_smoke.yaml` | 18 | 4 | 4 |
+| `libs_data.yaml` (cached) | ~79,030 | ~16,935 | ~16,935 | splits from `splits_{md5}.json` |
+
+### SLURM deployment
+
+| Script | Purpose |
+|--------|---------|
+| `run_pretrain_libs.slurm` | Bin-embedding pretrain (`config_libs_a100.yaml` + `libs_data.yaml`) |
+| `run_finetune_libs.slurm` | Binned finetune (`quantification_binned`, `cls_mean`) |
+| `run_eval.slurm` | Post-training evaluation |
+
+For line-token runs, mirror these scripts with `config_libs_token_4090.yaml` (runtime embedding) or `config_libs_token_linear_4090.yaml` (pre-baked tokens) and `--line_embedding_config config/line_embedding.yaml`.
+
+All SLURM jobs run in the `sslibs` enroot container with the workspace mounted at `/workspace`.
 
 ---
 
@@ -317,13 +468,25 @@ pretrain:
 | F1 (macro) | Macro F1 score |
 | Confusion Matrix | Per-class prediction analysis |
 
-### Fine-tuning (Regression)
+### Fine-tuning (Regression / quantification)
 
 | Metric | Description |
 |--------|-------------|
 | MSE | Mean squared error |
 | MAE | Mean absolute error |
-| R² | Per-element R² scores |
+| R² | Per-element R² scores (averaged) |
+
+### Fine-tuning (Binned quantification)
+
+| Metric | Description |
+|--------|-------------|
+| `bin_accuracy` | Fraction of (sample, element) pairs with correct argmax bin |
+| `decoded_mae` | MAE after mapping predicted bins back to [0, 1] concentrations |
+| `decoded_r2` | R² on decoded concentrations — primary signal for whether the model beats the per-element mean |
+
+`bin_accuracy` alone can be misleading when most elements are near-zero (predicting bin 0 scores well). Prefer `decoded_mae` and `decoded_r2` for model selection.
+
+`evaluate_model.py` currently loads classification and regression heads only; binned runs should be judged from TensorBoard logs and `run_info.yaml` `test_results` until evaluation support is extended.
 
 ---
 
@@ -399,44 +562,76 @@ mask_ratio: 0.30  # 30% masking
 
 ## Usage Examples
 
-### Running Pre-training
+### Running pre-training
 
 ```bash
-# Local testing (quick)
+# Bin embedding — RTX 4090
 uv run python train_pretrain.py \
-    --config config/config_local.yaml \
-    --experiment_name local_test
+    --config config/config_libs_4090.yaml \
+    --libs_data_config config/libs_data.yaml \
+    --experiment_name libs_bin_pretrain \
+    --num_workers 4
 
-# A100 full training
+# Line-token embedding — RTX 4090 (builds line caches on first run)
 uv run python train_pretrain.py \
-    --config config/config_a100.yaml \
-    --experiment_name a100_v1
+    --config config/config_libs_token_4090.yaml \
+    --libs_data_config config/libs_data.yaml \
+    --line_embedding_config config/line_embedding.yaml \
+    --experiment_name libs_line_pretrain \
+    --num_workers 4
+
+# Line-token-linear — pre-baked tokens (optional standalone build first)
+uv run python scripts/build_line_tokens.py \
+    --libs_data_config config/libs_data.yaml \
+    --line_embedding_config config/line_embedding.yaml
+uv run python train_pretrain.py \
+    --config config/config_libs_token_linear_4090.yaml \
+    --libs_data_config config/libs_data.yaml \
+    --line_embedding_config config/line_embedding.yaml \
+    --experiment_name libs_token_linear_pretrain \
+    --num_workers 4
+
+# A100 bin embedding via SLURM
+sbatch run_pretrain_libs.slurm
 ```
 
-### Checking Masking Statistics
+### Running fine-tuning
 
-```python
-from data.dataset import MaskedLIBSDataset
-from data.synthetic_generator import SyntheticLIBSGenerator
+```bash
+# Binned quantification — bin embedding (match pretrain config)
+uv run python train_finetune.py \
+    --config config/config_libs_4090.yaml \
+    --pretrain_run_dir runs/pretrain_<timestamp>_libs_bin_pretrain \
+    --libs_data_config config/libs_data.yaml \
+    --task quantification_binned \
+    --pool cls_mean \
+    --num_workers 4
 
-# Generate data
-gen = SyntheticLIBSGenerator(seed=42)
-spectra, _, _ = gen.generate_dataset(n_samples=1000)
+# Binned quantification — line-token (match pretrain + line_embedding_config)
+uv run python train_finetune.py \
+    --config config/config_libs_token_4090.yaml \
+    --pretrain_run_dir runs/pretrain_<timestamp>_libs_line_pretrain \
+    --libs_data_config config/libs_data.yaml \
+    --line_embedding_config config/line_embedding.yaml \
+    --task quantification_binned \
+    --pool cls_mean
 
-# Create dataset with peak-biased masking
-dataset = MaskedLIBSDataset(
-    spectra=spectra,
-    mask_ratio=0.15,
-    contiguous_masking=True,
-    block_sizes=[25, 50, 100, 150],
-    peak_bias_enabled=True,
-    peak_bias_ratio=0.5,
-)
-
-# Check statistics
-stats = dataset.get_masking_stats(n_samples=100)
-print(f"Peak coverage: {stats['peak_coverage']:.1%}")
+sbatch run_finetune_libs.slurm runs/pretrain_<timestamp>_libs_pretrain_a100
 ```
+
+### Evaluation and run discovery
+
+```bash
+uv run python list_runs.py --latest
+uv run python evaluate_model.py --run_dir runs/pretrain_<timestamp>_...
+uv run python evaluate_model.py --run_dir runs/finetune_<timestamp>_... --mode finetune
+```
+
+Runs are stored under `runs/{type}_{timestamp}_{experiment}/` with `config.yaml`, `run_info.yaml`, `checkpoints/`, `logs/`, and optional `evaluation/`. See `PROJECT_SUMMARY.json` / `PROJECT_SUMMARY.html` for full layout and CLI reference.
+
+### Checking masking statistics (bin mode)
+
+Load cached spectra from the libs pipeline, wrap in `MaskedLIBSDataset`, and call `get_masking_stats(n_samples=100)` — see `PretrainDataModule.setup()` logging during training.
 
 ---
 

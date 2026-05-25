@@ -8,9 +8,10 @@ Adapted for continuous intensity values with masked intensity prediction.
 import math
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 from .positional_encoding import SinusoidalPositionalEncoding
+from .line_token_embedding import LineTokenEmbedding, LinearLineTokenEmbedding
 
 
 class SpectralEmbedding(nn.Module):
@@ -216,19 +217,55 @@ class LIBSTransformer(nn.Module):
         d_ff: int = 1024,
         dropout: float = 0.1,
         n_classes: int = 5,
+        embedding_type: str = "intensity",
+        n_lines: int = 0,
+        line_dict_meta: Optional[dict] = None,
+        n_elements_vocab: int = 53,
+        n_ion_states: int = 10,
+        line_token_meta: Optional[dict] = None,
+        n_mip_target_channels: int = 2,
     ):
         super().__init__()
         
         self.n_bins = n_bins
+        self.n_lines = n_lines
         self.d_model = d_model
         self.n_layers = n_layers
+        self.embedding_type = embedding_type
+        self.n_mip_target_channels = int(n_mip_target_channels)
         
-        # Spectral embedding
-        self.embedding = SpectralEmbedding(
-            d_model=d_model,
-            n_bins=n_bins,
-            dropout=dropout,
-        )
+        if embedding_type == "line_token":
+            self.embedding = LineTokenEmbedding(
+                d_model=d_model,
+                n_elements=n_elements_vocab,
+                n_ion_states=n_ion_states,
+                dropout=dropout,
+                dict_meta=line_dict_meta,
+            )
+            if line_dict_meta is not None:
+                self.n_lines = int(line_dict_meta.get("n_lines", n_lines))
+        elif embedding_type == "line_token_linear":
+            if line_token_meta is None:
+                raise ValueError(
+                    "embedding_type='line_token_linear' requires line_token_meta "
+                    "(use prepare_line_tokens_assets)"
+                )
+            self.embedding = LinearLineTokenEmbedding(
+                n_features=line_token_meta["n_features"],
+                d_model=d_model,
+                feature_mean=line_token_meta["feature_mean"],
+                feature_std=line_token_meta["feature_std"],
+                central_wavelength=line_token_meta["central_wavelength"],
+                dropout=dropout,
+            )
+            self.n_lines = int(line_token_meta["n_lines"])
+            self.n_features = int(line_token_meta["n_features"])
+        else:
+            self.embedding = SpectralEmbedding(
+                d_model=d_model,
+                n_bins=n_bins,
+                dropout=dropout,
+            )
         
         # Transformer encoder blocks
         self.encoder_blocks = nn.ModuleList([
@@ -244,13 +281,22 @@ class LIBSTransformer(nn.Module):
         # Final layer normalization
         self.final_norm = nn.LayerNorm(d_model)
         
-        # Masked intensity prediction head
-        self.mip_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, 1),
-        )
+        # Masked prediction head (bin intensity or line features)
+        if embedding_type in ("line_token", "line_token_linear"):
+            out_dim = 2 if embedding_type == "line_token" else self.n_mip_target_channels
+            self.mip_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, out_dim),
+            )
+        else:
+            self.mip_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, 1),
+            )
         
         # Initialize weights
         self._init_weights()
@@ -268,48 +314,62 @@ class LIBSTransformer(nn.Module):
     
     def forward(
         self,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, Dict[str, torch.Tensor]],
         mask: Optional[torch.Tensor] = None,
         return_attention: bool = False,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the transformer.
         
         Args:
-            x: Input spectrum of shape [batch_size, n_bins]
-            mask: Optional boolean mask of shape [batch_size, n_bins]
+            x: [B, n_bins] spectrum (intensity mode) or dict with 'line_features' [B, L, 6]
+            mask: Optional boolean mask (intensity mode only)
+            key_padding_mask: Optional [B, seq_len] True = ignore (line mode; from embedding)
             return_attention: Whether to return attention weights
             
         Returns:
-            Dictionary with:
-            - 'cls_embedding': CLS token embedding [batch_size, d_model]
-            - 'sequence_output': Full sequence output [batch_size, n_bins + 1, d_model]
-            - 'mip_predictions': Masked intensity predictions [batch_size, n_bins]
-            - 'attention_weights': (optional) List of attention weights per layer
+            Dictionary with cls_embedding, sequence_output, mip_predictions, ...
         """
-        # Embed input
-        hidden = self.embedding(x, mask=mask)
+        if self.embedding_type == "line_token":
+            if isinstance(x, dict):
+                line_features = x["line_features"]
+            else:
+                line_features = x
+            hidden, kpm = self.embedding(line_features)
+            if key_padding_mask is None:
+                key_padding_mask = kpm
+        elif self.embedding_type == "line_token_linear":
+            if isinstance(x, dict):
+                tokens = x["tokens"]
+                fit_valid = x.get("fit_valid")
+            else:
+                tokens, fit_valid = x, None
+            hidden, kpm = self.embedding(tokens, fit_valid=fit_valid)
+            if key_padding_mask is None:
+                key_padding_mask = kpm
+        else:
+            hidden = self.embedding(x, mask=mask)
         
-        # Store attention weights if requested
         attention_weights = []
-        
-        # Pass through encoder blocks
         for block in self.encoder_blocks:
-            hidden, attn = block(hidden, need_weights=return_attention)
+            hidden, attn = block(
+                hidden,
+                key_padding_mask=key_padding_mask,
+                need_weights=return_attention,
+            )
             if return_attention and attn is not None:
                 attention_weights.append(attn)
         
-        # Final normalization
         hidden = self.final_norm(hidden)
-        
-        # Extract CLS embedding (first token)
         cls_embedding = hidden[:, 0, :]
-        
-        # Extract sequence embeddings (excluding CLS)
         sequence_embeddings = hidden[:, 1:, :]
         
-        # Masked intensity prediction
-        mip_predictions = self.mip_head(sequence_embeddings).squeeze(-1)
+        mip_out = self.mip_head(sequence_embeddings)
+        if self.embedding_type in ("line_token", "line_token_linear"):
+            mip_predictions = mip_out  # [B, L, n_target_channels]
+        else:
+            mip_predictions = mip_out.squeeze(-1)  # [B, n_bins]
         
         result = {
             'cls_embedding': cls_embedding,
@@ -317,22 +377,17 @@ class LIBSTransformer(nn.Module):
             'sequence_embeddings': sequence_embeddings,
             'mip_predictions': mip_predictions,
         }
-        
+        if key_padding_mask is not None:
+            result['key_padding_mask'] = key_padding_mask
         if return_attention:
             result['attention_weights'] = attention_weights
-        
         return result
     
-    def get_embeddings(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Get CLS embeddings for downstream tasks.
-        
-        Args:
-            x: Input spectrum of shape [batch_size, n_bins]
-            
-        Returns:
-            CLS embeddings of shape [batch_size, d_model]
-        """
+    def get_embeddings(
+        self,
+        x: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """CLS embeddings for downstream tasks."""
         output = self.forward(x, mask=None, return_attention=False)
         return output['cls_embedding']
     
@@ -342,26 +397,20 @@ class LIBSTransformer(nn.Module):
         targets: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute masked intensity prediction loss.
-        
-        Args:
-            predictions: Predicted intensities [batch_size, n_bins]
-            targets: Target intensities [batch_size, n_bins]
-            mask: Boolean mask indicating masked positions [batch_size, n_bins]
-            
-        Returns:
-            Mean squared error loss over masked positions
-        """
-        # Only compute loss on masked positions
-        masked_predictions = predictions[mask]
-        masked_targets = targets[mask]
+        """MSE over masked positions (bins or line channels)."""
+        if predictions.dim() == 3:
+            # Line-token: predictions/targets [B, L, C], mask [B, L] or [B, L, C]
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(-1).expand_as(predictions)
+            masked_predictions = predictions[mask]
+            masked_targets = targets[mask]
+        else:
+            masked_predictions = predictions[mask]
+            masked_targets = targets[mask]
         
         if masked_predictions.numel() == 0:
             return torch.tensor(0.0, device=predictions.device)
-        
-        loss = nn.functional.mse_loss(masked_predictions, masked_targets)
-        return loss
+        return nn.functional.mse_loss(masked_predictions, masked_targets)
     
     @property
     def num_parameters(self) -> int:

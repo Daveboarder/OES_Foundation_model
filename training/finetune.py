@@ -9,6 +9,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from typing import Any, Dict, Optional, Literal
 import math
+import numpy as np
 
 from models.heads import (
     BinnedQuantificationHead,
@@ -137,18 +138,31 @@ class LIBSFinetuneModule(pl.LightningModule):
         cls = encoder_output['cls_embedding']
         if self.pool == 'cls':
             return cls
-        seq = encoder_output['sequence_embeddings']  # [B, n_bins, d_model]
-        mean = seq.mean(dim=1)
+        seq = encoder_output['sequence_embeddings']  # [B, L, d_model]
+        kpm = encoder_output.get('key_padding_mask')
+        if kpm is not None and kpm.size(1) == seq.size(1) + 1:
+            valid = (~kpm[:, 1:]).unsqueeze(-1).float()
+            denom = valid.sum(dim=1).clamp(min=1.0)
+            mean = (seq * valid).sum(dim=1) / denom
+        else:
+            mean = seq.mean(dim=1)
         if self.pool == 'mean':
             return mean
         return torch.cat([cls, mean], dim=-1)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _encode(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if 'tokens' in batch:
+            return self.encoder({'tokens': batch['tokens'], 'fit_valid': batch.get('fit_valid')})
+        if 'line_features' in batch:
+            return self.encoder({'line_features': batch['line_features']})
+        return self.encoder(batch['spectrum'])
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
 
         Args:
-            x: Input spectrum [batch_size, n_bins]
+            batch: Dict with 'spectrum' or 'line_features'
 
         Returns:
             Dict with at least 'cls_embedding' and 'representation', plus
@@ -159,7 +173,10 @@ class LIBSFinetuneModule(pl.LightningModule):
                                        'concentrations_pred' [B, n_elements] (argmax-decoded)
               - both:                  'class_logits' + 'concentrations'
         """
-        encoder_output = self.encoder(x)
+        if isinstance(batch, dict):
+            encoder_output = self._encode(batch)
+        else:
+            encoder_output = self.encoder(batch)
         representation = self._pool(encoder_output)
 
         result = {
@@ -292,7 +309,7 @@ class LIBSFinetuneModule(pl.LightningModule):
             batch: dict containing 'spectrum' plus task-specific targets
             stage: 'train', 'val', or 'test' (prefix for logged metrics)
         """
-        outputs = self(batch['spectrum'])
+        outputs = self(batch)
         total_loss = torch.tensor(0.0, device=self.device)
         on_step = (stage == 'train')
         log_kw = dict(on_step=on_step, on_epoch=True, prog_bar=False, sync_dist=(stage != 'train'))
@@ -407,14 +424,18 @@ class FinetuneDataModule(pl.LightningDataModule):
     
     def __init__(
         self,
-        train_spectra,
-        train_labels,
-        val_spectra,
-        val_labels,
+        train_spectra=None,
+        train_labels=None,
+        val_spectra=None,
+        val_labels=None,
         train_concentrations=None,
         val_concentrations=None,
         batch_size: int = 32,
         num_workers: int = 0,
+        line_features_path: Optional[str] = None,
+        line_tokens_path: Optional[str] = None,
+        train_indices: Optional[np.ndarray] = None,
+        val_indices: Optional[np.ndarray] = None,
     ):
         super().__init__()
         self.train_spectra = train_spectra
@@ -425,22 +446,58 @@ class FinetuneDataModule(pl.LightningDataModule):
         self.val_concentrations = val_concentrations
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.line_features_path = line_features_path
+        self.line_tokens_path = line_tokens_path
+        self.train_indices = train_indices
+        self.val_indices = val_indices
     
     def setup(self, stage: Optional[str] = None):
         """Setup datasets."""
-        from data.dataset import LabeledLIBSDataset
+        from data.dataset import (
+            LabeledLIBSDataset,
+            LineTokenLabeledDataset,
+            LineTokensLabeledDataset,
+        )
+        import numpy as np
         
         if stage == 'fit' or stage is None:
-            self.train_dataset = LabeledLIBSDataset(
-                spectra=self.train_spectra,
-                labels=self.train_labels,
-                concentrations=self.train_concentrations,
-            )
-            self.val_dataset = LabeledLIBSDataset(
-                spectra=self.val_spectra,
-                labels=self.val_labels,
-                concentrations=self.val_concentrations,
-            )
+            if self.line_tokens_path:
+                self.train_dataset = LineTokensLabeledDataset(
+                    self.line_tokens_path,
+                    self.train_labels,
+                    concentrations=self.train_concentrations,
+                    indices=self.train_indices,
+                )
+                self.val_dataset = LineTokensLabeledDataset(
+                    self.line_tokens_path,
+                    self.val_labels,
+                    concentrations=self.val_concentrations,
+                    indices=self.val_indices,
+                )
+            elif self.line_features_path:
+                self.train_dataset = LineTokenLabeledDataset(
+                    self.line_features_path,
+                    self.train_labels,
+                    concentrations=self.train_concentrations,
+                    indices=self.train_indices,
+                )
+                self.val_dataset = LineTokenLabeledDataset(
+                    self.line_features_path,
+                    self.val_labels,
+                    concentrations=self.val_concentrations,
+                    indices=self.val_indices,
+                )
+            else:
+                self.train_dataset = LabeledLIBSDataset(
+                    spectra=self.train_spectra,
+                    labels=self.train_labels,
+                    concentrations=self.train_concentrations,
+                )
+                self.val_dataset = LabeledLIBSDataset(
+                    spectra=self.val_spectra,
+                    labels=self.val_labels,
+                    concentrations=self.val_concentrations,
+                )
     
     def train_dataloader(self):
         return torch.utils.data.DataLoader(

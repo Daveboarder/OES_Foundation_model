@@ -1,0 +1,58 @@
+# =============================================================================
+# LIBS Foundation Model — A100 80 GB config for the real LIBS pipeline
+# =============================================================================
+# Use together with config/libs_data.yaml. Sized for a 17,429-token sequence
+# (17,428 wavelength bins + 1 CLS) at bf16 on a single A100 80 GB.
+#
+# Architecture matches the medium-scale `config.yaml` design (d_model=256,
+# n_layers=6) but batch size and accumulation are tuned for the long sequence.
+# Training scripts auto-override data.n_bins / model.max_seq_len / data.n_classes
+# / data.n_elements from the libs_data.yaml pipeline output.
+# =============================================================================
+
+data:
+  n_bins: 2048            # placeholder; libs pipeline overrides to 17428
+  n_classes: 5            # placeholder; libs pipeline overrides to n_clusters (10)
+  synthetic:
+    val_fraction: 0.15
+
+model:
+  d_model: 256
+  n_heads: 8
+  n_layers: 6
+  d_ff: 1024
+  dropout: 0.1
+  max_seq_len: 2049       # placeholder; libs pipeline overrides to 17429
+
+pretrain:
+  mask_ratio: 0.15
+  mask_token_prob: 0.8
+  random_token_prob: 0.1
+  contiguous_masking: true
+  block_sizes: [25, 50, 100, 150]
+  peak_bias_enabled: true
+  peak_bias_ratio: 0.5
+  peak_threshold: 0.2
+  batch_size: 16
+  accumulate_grad_batches: 4     # effective batch 64
+  epochs: 60
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+
+finetune:
+  batch_size: 16
+  epochs: 30
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder: false
+
+logging:
+  logger: "tensorboard"
+  log_every_n_steps: 50
+  val_check_interval: 0.5
+
+device:
+  accelerator: "gpu"
+  precision: "bf16-mixed"

@@ -51,5 +51,5 @@ logging:
   val_check_interval: 1.0
 
 device:
-  accelerator: "cpu"
+  accelerator: "gpu"
   precision: "32"

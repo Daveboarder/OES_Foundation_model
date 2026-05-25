@@ -1,0 +1,26 @@
+# Fast smoke settings for line-token pipeline (fewer lines, same physics)
+
+line_dictionary:
+  db_path: external_data/Source/LIBS_data_vacuum.db
+  te_range: [6500.0, 11000.0]
+  ne_range: [1.0e17, 5.0e17]
+  n_grid:
+    te: 5
+    ne: 5
+  ne_log_spaced: true
+  N: 1.0e-4
+  C: 1.0
+  l: 1.4e-4
+  intensity_threshold: 1.0e-35
+  max_lines: 400
+  wavelength_json: external_data/Data/VASKUT K8.json
+  use_wavelength_json_clip: true
+  cache_dir: external_data/cache
+
+line_features:
+  window_nm: 0.3
+  gamma_init: 0.1
+  sigma_init: 0.006
+  r2_min: 0.85
+  workers: 2
+  cache_dir: external_data/cache
