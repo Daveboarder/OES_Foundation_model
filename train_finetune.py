@@ -416,6 +416,10 @@ def main(args):
     n_elements = config['data'].get('n_elements', config['data']['n_classes'])
     n_concentration_bins = config['data'].get('n_concentration_bins', 1000)
 
+    ft_epochs = int(config['finetune']['epochs'])
+    ft_warmup = int(config['finetune'].get('warmup_epochs', min(1, max(0, ft_epochs - 1))))
+    ft_warmup = max(1, min(ft_warmup, ft_epochs - 1)) if ft_epochs > 1 else 1
+
     finetune_module = LIBSFinetuneModule(
         encoder=encoder,
         task=args.task,
@@ -425,8 +429,8 @@ def main(args):
         freeze_encoder=args.freeze_encoder,
         learning_rate=config['finetune']['learning_rate'],
         weight_decay=config['finetune']['weight_decay'],
-        warmup_epochs=5,
-        max_epochs=config['finetune']['epochs'],
+        warmup_epochs=ft_warmup,
+        max_epochs=ft_epochs,
         pool=args.pool,
     )
 

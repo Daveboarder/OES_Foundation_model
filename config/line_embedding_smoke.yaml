@@ -11,7 +11,11 @@ line_dictionary:
   N: 1.0e-4
   C: 1.0
   l: 1.4e-4
-  intensity_threshold: 1.0e-35
+  selection:
+    mode: top_percent_per_element
+    percent: 10
+    min_keep: 10
+  intensity_threshold: 1.0e-35  # legacy fallback when selection.mode=threshold
   max_lines: 400
   wavelength_json: external_data/Data/VASKUT K8.json
   use_wavelength_json_clip: true

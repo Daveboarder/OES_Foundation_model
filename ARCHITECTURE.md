@@ -219,7 +219,7 @@ Three HDF5 caches are built in sequence (additive — intermediate files are kep
 
 | Step | Module | Output | Role |
 |------|--------|--------|------|
-| 1 | `data/line_dictionary.py` | `line_dict_{hash}.h5` | Theoretical intensities over Te×Ne; filter by `intensity_threshold` (default `1e-35` → ~8,119 lines; `1e-33` → ~2,425) |
+| 1 | `data/line_dictionary.py` | `line_dict_{hash}.h5` | Theoretical intensities over Te×Ne; default selection keeps top 10% most intense lines per element (`min_keep: 10`, legacy threshold mode still supported) |
 | 2 | `data/line_features.py` | `line_features_{hash}.h5` | Per-spectrum Voigt fits: `[n_spectra, n_lines, 6]` (`max_I`, `FWHM`, `R²`, `Δλ`, `RMSE`, `fit_valid`) |
 | 3 | `data/line_tokenization.py` | `line_tokens_{hash}.h5` | **Separated tokenization**: merged 14-feature tensor per line, raw values + `feature_mean`/`feature_std` attrs |
 

@@ -397,7 +397,7 @@ sbatch run_finetune_libs.slurm runs/pretrain_...</code></pre>
 ├── data/
 │   ├── dataset.py                   # Masked/Labeled + line-token datasets
 │   ├── libs_pipeline.py             # Voigt synthesis + HDF5 cache
-│   ├── line_dictionary.py           # Theoretical line dictionary
+│   ├── line_dictionary.py           # Theoretical line dictionary (top-10% per element default)
 │   ├── line_features.py             # Per-spectrum Voigt fits
 │   ├── line_tokenization.py         # line_tokens_*.h5 builder
 │   ├── line_embedding_pipeline.py   # prepare_line_token(s)_assets
@@ -562,7 +562,7 @@ device:
   <h3>5.2b Line-token / tokenization configs</h3>
   <table>
     <tr><th>File</th><th>Use case</th><th>Notes</th></tr>
-    <tr><td><code>config/line_embedding.yaml</code></td><td>Production</td><td><code>intensity_threshold</code> default <code>1e-35</code> (~8119 lines); Te/Ne grid; Voigt-fit window</td></tr>
+    <tr><td><code>config/line_embedding.yaml</code></td><td>Production</td><td>Default selection: <code>top_percent_per_element</code> (<code>percent: 10</code>, <code>min_keep: 10</code>); Te/Ne grid; Voigt-fit window; legacy <code>intensity_threshold</code> via <code>selection.mode=threshold</code></td></tr>
     <tr><td><code>config/line_embedding_smoke.yaml</code></td><td>Smoke</td><td><code>max_lines: 400</code></td></tr>
   </table>
   <p>Caches: <code>line_dict_{hash}.h5</code>, <code>line_features_{hash}.h5</code>,
@@ -1117,8 +1117,9 @@ test_results: { val/accuracy: …, val/reg_mae: …, … }</code></pre>
       14-feature tensor per line per spectrum; built by <code>data/line_tokenization.py</code>.</dd>
     <dt><strong>Separated tokenization</strong></dt><dd>Voigt fitting and feature merge happen offline;
       training loads <code>line_tokens_*.h5</code> only (like <code>synthetic_cache_*.h5</code> for spectra).</dd>
-    <dt><strong>Line dictionary</strong></dt><dd>Theoretical lines above
-      <code>intensity_threshold</code> on a Te×Ne grid (<code>line_dict_*.h5</code>).</dd>
+    <dt><strong>Line dictionary</strong></dt><dd>Theoretical lines selected on a Te×Ne grid
+      (default: top 10% per element, keep all if fewer than 10 lines; legacy
+      <code>intensity_threshold</code> mode available) (<code>line_dict_*.h5</code>).</dd>
     <dt><strong>Pool</strong></dt><dd>How encoder outputs feed downstream
       heads: <code>cls</code> (CLS token only), <code>mean</code> (mean over
       bins), or <code>cls_mean</code> (concatenation of both — head input

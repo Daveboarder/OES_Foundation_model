@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 from pathlib import Path
@@ -131,6 +132,36 @@ def _wavelength_clip_bounds(cfg: dict, project_root: Path) -> tuple[float | None
     return wmin, wmax
 
 
+def _select_lines_for_element(
+    element_records: list[dict[str, Any]],
+    selection_cfg: dict[str, Any],
+    threshold: float,
+) -> list[dict[str, Any]]:
+    """Select lines for one element based on config mode."""
+    mode = str(selection_cfg.get("mode", "top_percent_per_element")).strip().lower()
+    if mode == "threshold":
+        return [r for r in element_records if r["theoretical_intensity"] >= threshold]
+    if mode != "top_percent_per_element":
+        raise ValueError(
+            f"Unknown line_dictionary.selection.mode='{mode}'. "
+            "Expected 'top_percent_per_element' or 'threshold'."
+        )
+
+    percent = float(selection_cfg.get("percent", 10.0))
+    min_keep = int(selection_cfg.get("min_keep", 10))
+    if percent <= 0.0:
+        raise ValueError("line_dictionary.selection.percent must be > 0")
+    if min_keep < 1:
+        raise ValueError("line_dictionary.selection.min_keep must be >= 1")
+
+    n = len(element_records)
+    if n < min_keep:
+        k = n
+    else:
+        k = max(1, int(math.ceil((percent / 100.0) * n)))
+    return sorted(element_records, key=lambda r: r["theoretical_intensity"], reverse=True)[:k]
+
+
 def build_line_dictionary(cfg: dict, project_root: Path | None = None, verbose: bool = True) -> str:
     """
     Build or load cached line dictionary HDF5.
@@ -158,6 +189,13 @@ def build_line_dictionary(cfg: dict, project_root: Path | None = None, verbose: 
     C = float(ld_cfg["C"])
     l_path = float(ld_cfg["l"])
     threshold = float(ld_cfg["intensity_threshold"])
+    selection_cfg = dict(ld_cfg.get("selection", {}))
+    if "mode" not in selection_cfg:
+        selection_cfg["mode"] = "top_percent_per_element"
+    if "percent" not in selection_cfg:
+        selection_cfg["percent"] = 10.0
+    if "min_keep" not in selection_cfg:
+        selection_cfg["min_keep"] = 10
     wmin, wmax = _wavelength_clip_bounds(ld_cfg, project_root)
 
     elements = _list_elements(db_path)
@@ -166,6 +204,8 @@ def build_line_dictionary(cfg: dict, project_root: Path | None = None, verbose: 
               f"Te×Ne = {len(te_grid)}×{len(ne_grid)}, threshold={threshold}")
 
     records: list[dict[str, Any]] = []
+    kept_by_element: dict[str, int] = {}
+    total_by_element: dict[str, int] = {}
 
     for elem in elements:
         # Accumulate max intensity per (wl, ion_state) — lines are unique in DB per row
@@ -198,12 +238,22 @@ def build_line_dictionary(cfg: dict, project_root: Path | None = None, verbose: 
                             "Ne_opt": float(Ne),
                         }
 
-        for rec in best.values():
-            if rec["theoretical_intensity"] >= threshold:
-                records.append(rec)
+        elem_records = list(best.values())
+        total_by_element[elem] = len(elem_records)
+        selected = _select_lines_for_element(
+            element_records=elem_records,
+            selection_cfg=selection_cfg,
+            threshold=threshold,
+        )
+        kept_by_element[elem] = len(selected)
+        records.extend(selected)
 
     if not records:
-        raise RuntimeError("No lines passed intensity threshold — lower intensity_threshold.")
+        mode = selection_cfg.get("mode", "top_percent_per_element")
+        raise RuntimeError(
+            f"No lines selected for mode '{mode}'. "
+            "Adjust line_dictionary.selection or intensity_threshold."
+        )
 
     df = pd.DataFrame(records).sort_values("central_wavelength").reset_index(drop=True)
     max_lines = ld_cfg.get("max_lines")
@@ -220,7 +270,20 @@ def build_line_dictionary(cfg: dict, project_root: Path | None = None, verbose: 
     df["ion_state_id"] = df["ion_state"].map(lambda s: ION_STATE_TO_ID.get(s, 0))
 
     if verbose:
-        print(f"  Kept {len(df)} lines (threshold={threshold})")
+        mode = str(selection_cfg.get("mode", "top_percent_per_element"))
+        if mode == "threshold":
+            print(f"  Kept {len(df)} lines (threshold={threshold})")
+        else:
+            pct = float(selection_cfg.get("percent", 10.0))
+            min_keep = int(selection_cfg.get("min_keep", 10))
+            print(
+                f"  Kept {len(df)} lines (mode={mode}, percent={pct}, min_keep={min_keep})"
+            )
+            summary = ", ".join(
+                f"{e}:{kept_by_element.get(e, 0)}/{total_by_element.get(e, 0)}"
+                for e in sorted(total_by_element)
+            )
+            print(f"  Kept per element (kept/total): {summary}")
 
     str_dt = h5py.string_dtype(encoding="utf-8")
     with h5py.File(out_path, "w") as f:

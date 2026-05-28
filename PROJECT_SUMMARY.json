@@ -435,7 +435,7 @@
       {
         "path": "config/line_embedding.yaml",
         "kind": "file",
-        "role": "Te/Ne grid, intensity_threshold, Voigt-fit window settings."
+        "role": "Te/Ne grid, line selection mode (top_percent_per_element by default), Voigt-fit window settings."
       },
       {
         "path": "config/line_embedding_smoke.yaml",
@@ -911,8 +911,8 @@
       {
         "path": "config/line_embedding.yaml",
         "use_case": "Line dictionary + Voigt-fit parameters.",
-        "intensity_threshold_default": "1e-35",
-        "note": "~8119 lines at default; ~2425 at 1e-33"
+        "selection_default": "top_percent_per_element (percent=10, min_keep=10)",
+        "legacy_threshold_mode": "selection.mode=threshold with intensity_threshold"
       }
     ],
     "schema_model_training": {
@@ -1338,7 +1338,7 @@
     },
     "data.line_dictionary": {
       "file": "data/line_dictionary.py",
-      "role": "Theoretical intensities over Te×Ne; absolute threshold filter."
+      "role": "Theoretical intensities over Te×Ne; default per-element top-percent selection with legacy threshold mode."
     },
     "data.line_features": {
       "file": "data/line_features.py",
@@ -2054,7 +2054,7 @@
     "libs_data pipeline": "Physics-based Voigt synthesis (Daveboarder/Element_Identification heritage), opted in via --libs_data_config.",
     "Pool": "How encoder outputs feed downstream heads: cls (CLS only), mean (over bins), cls_mean (concat; head input = 2*d_model).",
     "Line-token embedding": "One transformer token per retained emission line with Voigt-fit and quantum features.",
-    "Line dictionary": "Lines passing intensity_threshold on a Te×Ne theoretical grid.",
+    "Line dictionary": "Theoretical lines selected on a Te×Ne grid (default: top 10% per element, keep all if <10; legacy threshold mode available).",
     "Line tokens cache": "line_tokens_{hash}.h5: combined quantum + Voigt features per line, written by data/line_tokenization.py.",
     "line_token_linear": "Embedding mode that reads pre-baked tokens and applies nn.Linear(14, d_model) after z-score normalization.",
     "Separated tokenization": "Voigt fitting and feature assembly happen offline; training only loads HDF5 tokens (like synthetic_cache for spectra)."

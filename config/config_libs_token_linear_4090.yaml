@@ -44,6 +44,7 @@ pretrain:
 finetune:
   batch_size: 4
   epochs: 5
+  warmup_epochs: 1
   learning_rate: 5.0e-5
   weight_decay: 0.01
   freeze_encoder: false

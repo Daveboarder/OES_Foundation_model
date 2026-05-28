@@ -24,7 +24,7 @@ Checkpoints are **not interchangeable** between modes (different sequence length
 
 Offline preprocessing (reusable across training runs):
 
-1. **Line dictionary** (`data/line_dictionary.py`) — theoretical intensities over a Te×Ne grid from `LIBS_data_vacuum.db`; keep lines above `intensity_threshold` → `line_dict_*.h5`
+1. **Line dictionary** (`data/line_dictionary.py`) — theoretical intensities over a Te×Ne grid from `LIBS_data_vacuum.db`; keep top 10% most intense lines per element (or all lines if element has <10) → `line_dict_*.h5`
 2. **Line features** (`data/line_features.py`) — per-spectrum Voigt fit at each line centre → `line_features_*.h5` `[n_spectra, n_lines, 6]`
 3. **Line tokens** (`data/line_tokenization.py`) — merge dictionary + fits into one tensor per line → `line_tokens_*.h5` `[n_spectra, n_lines, 14]` (raw values + `feature_mean`/`feature_std` in attrs)
 
@@ -69,7 +69,7 @@ uv run python train_pretrain.py \
   --libs_data_config config/libs_data.yaml \
   --line_embedding_config config/line_embedding.yaml \
   --experiment_name libs_line_pretrain \
-  --num_workers 4
+  --num_workers 8
 ```
 
 First run builds `line_dict_*.h5` and `line_features_*.h5` (Voigt fits can take hours on full data).
@@ -133,10 +133,10 @@ uv run tensorboard --logdir runs/
 |--------|------|
 | `config/libs_data.yaml` | Full dataset (~2256 types × 50 shots) |
 | `config/libs_data_smoke.yaml` | 3 types × 6 shots |
-| `config/line_embedding.yaml` | Te/Ne grid, `intensity_threshold`, Voigt-fit settings |
+| `config/line_embedding.yaml` | Te/Ne grid, line-selection mode (`top_percent_per_element` default), Voigt-fit settings |
 | `config/line_embedding_smoke.yaml` | `max_lines: 400` for fast tests |
 
-**Line threshold:** `line_dictionary.intensity_threshold` in `line_embedding.yaml` (default `1e-35`; `1e-33` keeps ~2,425 lines vs ~8,119 at `1e-35`).
+**Line selection:** `line_dictionary.selection` in `line_embedding.yaml` defaults to top 10% per element (`min_keep: 10`); legacy threshold mode remains available via `selection.mode: threshold`.
 
 ---
 

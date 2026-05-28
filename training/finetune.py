@@ -388,13 +388,15 @@ class LIBSFinetuneModule(pl.LightningModule):
             betas=(0.9, 0.999),
         )
         
-        # Cosine annealing with warmup
+        # Cosine annealing with warmup (guard when warmup_epochs >= max_epochs)
+        warmup = max(1, min(int(self.warmup_epochs), int(self.max_epochs) - 1))
+        decay_epochs = max(1, int(self.max_epochs) - warmup)
+
         def lr_lambda(epoch):
-            if epoch < self.warmup_epochs:
-                return (epoch + 1) / self.warmup_epochs
-            else:
-                progress = (epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
-                return 0.5 * (1 + math.cos(math.pi * progress))
+            if epoch < warmup:
+                return (epoch + 1) / warmup
+            progress = min(1.0, max(0.0, (epoch - warmup) / decay_epochs))
+            return 0.5 * (1 + math.cos(math.pi * progress))
         
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
