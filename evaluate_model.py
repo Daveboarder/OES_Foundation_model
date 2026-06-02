@@ -42,21 +42,66 @@ from utils.run_manager import RunManager
 import yaml
 
 
+def _infer_embedding_type_from_state_dict(state_dict: dict, fallback: str = "intensity") -> str:
+    """Infer encoder embedding type from checkpoint keys."""
+    if any(k.startswith("embedding.projection.") for k in state_dict.keys()):
+        return "line_token_linear"
+    if any(k.startswith("embedding.quantum_proj.") for k in state_dict.keys()):
+        return "line_token"
+    if any(k.startswith("embedding.intensity_projection.") for k in state_dict.keys()):
+        return "intensity"
+    return fallback
+
+
+def _line_token_meta_from_encoder_state(encoder_state: dict) -> dict:
+    """Build minimal line_token_linear meta from checkpoint buffers."""
+    mean = encoder_state.get("embedding.feature_mean")
+    std = encoder_state.get("embedding.feature_std")
+    wl = encoder_state.get("embedding.central_wavelength")
+    if mean is None or std is None or wl is None:
+        raise ValueError(
+            "line_token_linear checkpoint is missing embedding buffers "
+            "(feature_mean, feature_std, central_wavelength)."
+        )
+    return {
+        "n_features": int(mean.numel()),
+        "feature_mean": mean.cpu().numpy(),
+        "feature_std": std.cpu().numpy(),
+        "central_wavelength": wl.cpu().numpy(),
+        "n_lines": int(wl.numel()),
+    }
+
+
 def load_config(config_path: str) -> dict:
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
 
-def _create_model(config: dict) -> LIBSTransformer:
+def _create_model(
+    config: dict,
+    embedding_type: str | None = None,
+    line_token_meta: dict | None = None,
+) -> LIBSTransformer:
     """Create a LIBSTransformer from config (with dropout=0 for evaluation)."""
+    emb = embedding_type or config['model'].get('embedding_type', 'intensity')
+    n_mip_channels = int(config['model'].get('n_mip_target_channels', 2))
+    n_bins = int(config['data']['n_bins'])
+    n_lines = int(config['data'].get('n_lines', n_bins))
+    if emb == "line_token_linear" and line_token_meta is not None:
+        n_lines = int(line_token_meta["n_lines"])
+        n_bins = n_lines
     return LIBSTransformer(
-        n_bins=config['data']['n_bins'],
+        n_bins=n_bins,
         d_model=config['model']['d_model'],
         n_heads=config['model']['n_heads'],
         n_layers=config['model']['n_layers'],
         d_ff=config['model']['d_ff'],
         dropout=0.0,
         n_classes=config['data']['n_classes'],
+        embedding_type=emb,
+        n_lines=n_lines,
+        line_token_meta=line_token_meta,
+        n_mip_target_channels=n_mip_channels,
     )
 
 
@@ -99,10 +144,6 @@ def load_finetune_model(checkpoint_path: str, config: dict):
         self.regression_head -> RegressionHead
     So keys in the checkpoint are: encoder.*, classification_head.*, regression_head.*
     """
-    model = _create_model(config)
-    d_model = config['model']['d_model']
-    n_classes = config['data']['n_classes']
-
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
     # Recover pool from Lightning hparams so heads are sized correctly.
@@ -110,12 +151,6 @@ def load_finetune_model(checkpoint_path: str, config: dict):
     pool = 'cls'
     if isinstance(checkpoint, dict):
         pool = checkpoint.get('hyper_parameters', {}).get('pool', 'cls')
-    head_in_dim = 2 * d_model if pool == 'cls_mean' else d_model
-    print(f"Finetune pool: {pool} (head input dim={head_in_dim})")
-
-    cls_head = ClassificationHead(d_model=head_in_dim, n_classes=n_classes)
-    reg_head = RegressionHead(d_model=head_in_dim, n_outputs=n_classes)
-
     if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
         epoch = checkpoint.get('epoch', '?')
@@ -130,10 +165,26 @@ def load_finetune_model(checkpoint_path: str, config: dict):
     cls_state = _extract('classification_head.')
     reg_state = _extract('regression_head.')
 
+    emb_fallback = config['model'].get('embedding_type', 'intensity')
+    emb_type = _infer_embedding_type_from_state_dict(encoder_state, fallback=emb_fallback)
+    line_token_meta = _line_token_meta_from_encoder_state(encoder_state) if emb_type == "line_token_linear" else None
+    model = _create_model(config, embedding_type=emb_type, line_token_meta=line_token_meta)
+    d_model = config['model']['d_model']
+    n_classes = config['data']['n_classes']
+    head_in_dim = 2 * d_model if pool == 'cls_mean' else d_model
+    print(f"Finetune pool: {pool} (head input dim={head_in_dim})")
+    print(f"Encoder embedding_type inferred as: {emb_type}")
+
     if encoder_state:
-        model.load_state_dict(encoder_state)
+        # Finetune evaluation does not need pretrain MIP head; skip it to avoid
+        # shape mismatches across embedding variants / target-channel counts.
+        encoder_state = {k: v for k, v in encoder_state.items() if not k.startswith("mip_head.")}
+        model.load_state_dict(encoder_state, strict=False)
     else:
         print("WARNING: no encoder weights found in checkpoint")
+
+    cls_head = ClassificationHead(d_model=head_in_dim, n_classes=n_classes)
+    reg_head = RegressionHead(d_model=head_in_dim, n_outputs=n_classes)
 
     if cls_state:
         cls_head.load_state_dict(cls_state)
@@ -381,6 +432,13 @@ def evaluate_finetune(
     model = model.to(device)
     cls_head = cls_head.to(device)
     reg_head = reg_head.to(device)
+
+    if getattr(model, "embedding_type", "intensity") != "intensity":
+        raise NotImplementedError(
+            "evaluate_model.py finetune path currently evaluates synthetic bin spectra only. "
+            f"Loaded encoder embedding_type='{model.embedding_type}', which requires line-token "
+            "inputs instead of [B, n_bins] spectra."
+        )
 
     print("\nGenerating test data...")
     spectra, labels, concentrations = generate_test_data(config, n_samples=1000)

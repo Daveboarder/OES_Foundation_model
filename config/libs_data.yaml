@@ -23,7 +23,7 @@ generation:
   max_sample_types: null    # Cap total types; null = use all (~2256). Set to small int for smoke tests.
   number_density:    1.0e-4 # N (cm^-3); upstream default
   optical_path:      1.4e-4 # l (cm);    upstream default
-  n_workers:         4      # >1 enables multiprocessing pool (Windows: spawn-safe but slower)
+  n_workers:         60      # >1 enables multiprocessing pool (Windows: spawn-safe but slower)
   seed:              42
   verbose:           true
 

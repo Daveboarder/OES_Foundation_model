@@ -10,6 +10,7 @@ import pytorch_lightning as pl
 from typing import Any, Dict, Optional, Literal
 import math
 import numpy as np
+from scipy.stats import spearmanr
 
 from models.heads import (
     BinnedQuantificationHead,
@@ -78,6 +79,7 @@ class LIBSFinetuneModule(pl.LightningModule):
         max_epochs: int = 50,
         class_weights: Optional[torch.Tensor] = None,
         pool: Literal['cls', 'mean', 'cls_mean'] = 'cls',
+        element_names: Optional[list[str]] = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['encoder', 'class_weights'])
@@ -92,6 +94,17 @@ class LIBSFinetuneModule(pl.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
         self.pool = pool
+        if element_names is None:
+            self.element_names = [f"elem_{i}" for i in range(self.n_elements)]
+        else:
+            self.element_names = list(element_names)
+        if len(self.element_names) != self.n_elements:
+            self.element_names = [f"elem_{i}" for i in range(self.n_elements)]
+
+        # Test-only buffers for per-element diagnostics.
+        self._test_conc_preds: list[torch.Tensor] = []
+        self._test_conc_targets: list[torch.Tensor] = []
+        self.test_per_element_metrics: dict[str, dict[str, float]] = {}
 
         d_model = encoder.d_model
         head_in_dim = 2 * d_model if pool == 'cls_mean' else d_model
@@ -360,8 +373,95 @@ class LIBSFinetuneModule(pl.LightningModule):
         return self._step(batch, 'val')
     
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
-        """Test step (same as validation)."""
-        return self.validation_step(batch, batch_idx)
+        """Test step with dedicated `test/*` logging namespace."""
+        out = self._step(batch, 'test')
+        if self.task == 'quantification_binned':
+            pred = out.get('conc_predictions')
+            targ = out.get('conc_targets')
+            if pred is not None and targ is not None:
+                self._test_conc_preds.append(pred.detach().float().cpu())
+                self._test_conc_targets.append(targ.detach().float().cpu())
+        return out
+
+    def on_test_epoch_start(self) -> None:
+        self._test_conc_preds = []
+        self._test_conc_targets = []
+        self.test_per_element_metrics = {}
+
+    @staticmethod
+    def _safe_pearson(x: np.ndarray, y: np.ndarray) -> float:
+        if x.size < 2 or y.size < 2:
+            return 0.0
+        x_std = x.std()
+        y_std = y.std()
+        if x_std < 1e-12 or y_std < 1e-12:
+            return 0.0
+        return float(np.corrcoef(x, y)[0, 1])
+
+    @staticmethod
+    def _safe_spearman(x: np.ndarray, y: np.ndarray) -> float:
+        if x.size < 2 or y.size < 2:
+            return 0.0
+        corr = spearmanr(x, y).correlation
+        if corr is None or not np.isfinite(corr):
+            return 0.0
+        return float(corr)
+
+    def on_test_epoch_end(self) -> None:
+        if self.task != 'quantification_binned':
+            return
+        if not self._test_conc_preds or not self._test_conc_targets:
+            return
+
+        preds = torch.cat(self._test_conc_preds, dim=0).numpy()
+        targets = torch.cat(self._test_conc_targets, dim=0).numpy()
+        n_samples = int(targets.shape[0])
+        per_elem: dict[str, dict[str, float]] = {}
+        for i in range(self.n_elements):
+            name = self.element_names[i] if i < len(self.element_names) else f"elem_{i}"
+            y_true = targets[:, i]
+            y_pred = preds[:, i]
+            mae = float(np.mean(np.abs(y_pred - y_true)))
+            ss_res = float(np.sum((y_true - y_pred) ** 2))
+            ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
+            r2 = float(1.0 - ss_res / (ss_tot + 1e-8))
+            pearson = self._safe_pearson(y_true, y_pred)
+            spearman = self._safe_spearman(y_true, y_pred)
+            per_elem[name] = {
+                "mae": mae,
+                "r2": r2,
+                "pearson": pearson,
+                "spearman": spearman,
+                "n_samples": float(n_samples),
+            }
+
+        # Persist for final run summary / run_info.yaml serialization.
+        self.test_per_element_metrics = per_elem
+
+        logger_exp = getattr(self.logger, "experiment", None)
+        if logger_exp is None:
+            return
+        add_scalar = getattr(logger_exp, "add_scalar", None)
+        add_hist = getattr(logger_exp, "add_histogram", None)
+        if add_scalar is None or add_hist is None:
+            return
+
+        step = int(self.current_epoch)
+        for i in range(self.n_elements):
+            name = self.element_names[i] if i < len(self.element_names) else f"elem_{i}"
+            y_true = targets[:, i]
+            m = per_elem[name]
+
+            base = f"test/per_element/{name}"
+            add_scalar(f"{base}/mae", m["mae"], step)
+            add_scalar(f"{base}/r2", m["r2"], step)
+            add_scalar(f"{base}/pearson", m["pearson"], step)
+            add_scalar(f"{base}/spearman", m["spearman"], step)
+            add_hist(f"{base}/target_hist", y_true, step)
+
+        # Keep memory bounded across epochs even if test is called repeatedly.
+        self._test_conc_preds = []
+        self._test_conc_targets = []
     
     def configure_optimizers(self):
         """Configure optimizer and scheduler."""

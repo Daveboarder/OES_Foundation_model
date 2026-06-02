@@ -432,6 +432,7 @@ def main(args):
         warmup_epochs=ft_warmup,
         max_epochs=ft_epochs,
         pool=args.pool,
+        element_names=element_names,
     )
 
     needs_concentrations = args.task in ('regression', 'quantification', 'quantification_binned', 'both')
@@ -587,8 +588,13 @@ def main(args):
         n_classes=config['data']['n_classes'],
         n_elements=n_elements,
         n_concentration_bins=n_concentration_bins,
+        element_names=element_names,
     )
     test_results = trainer.test(best_model, dataloaders=test_loader)
+    aggregate_test_results = dict(test_results[0]) if test_results else {}
+    per_element_test = getattr(best_model, "test_per_element_metrics", {}) or {}
+    if per_element_test:
+        aggregate_test_results["per_element"] = per_element_test
 
     # Save final raw encoder weights
     final_path = run_mgr.checkpoint_dir / 'final_encoder.pt'
@@ -616,7 +622,7 @@ def main(args):
         "status": "completed",
         "best_metric": float(checkpoint_callback.best_model_score) if checkpoint_callback.best_model_score else None,
         "final_encoder": str(final_path),
-        "test_results": test_results[0] if test_results else None,
+        "test_results": aggregate_test_results if aggregate_test_results else None,
     })
 
     print("\n" + "="*60)
@@ -625,6 +631,22 @@ def main(args):
     print(f"Run directory: {run_mgr.run_dir}")
     if checkpoint_callback.best_model_score:
         print(f"Best {monitor}: {checkpoint_callback.best_model_score:.4f}")
+    if aggregate_test_results:
+        print("\nTest metrics (aggregate):")
+        for k in ("test/bin_accuracy", "test/decoded_mae", "test/decoded_r2", "test/loss"):
+            if k in aggregate_test_results:
+                print(f"  {k}: {float(aggregate_test_results[k]):.6f}")
+    if per_element_test:
+        print("\nTest metrics (per element):")
+        names = element_names if element_names is not None else sorted(per_element_test.keys())
+        for name in names:
+            if name not in per_element_test:
+                continue
+            m = per_element_test[name]
+            print(
+                f"  {name}: mae={m['mae']:.6f}, r2={m['r2']:.6f}, "
+                f"pearson={m['pearson']:.6f}, spearman={m['spearman']:.6f}"
+            )
     print(f"\nTo evaluate:")
     print(f"  uv run python evaluate_model.py --run_dir {run_mgr.run_dir}")
 

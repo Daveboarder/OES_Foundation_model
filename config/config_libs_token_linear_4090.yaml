@@ -24,8 +24,8 @@ data:
 model:
   embedding_type: line_token_linear
   d_model: 128
-  n_heads: 4
-  n_layers: 4
+  n_heads: 8
+  n_layers: 6
   d_ff: 512
   dropout: 0.1
   max_seq_len: 8192      # placeholder; set to n_lines + 1
@@ -35,7 +35,7 @@ pretrain:
   mask_ratio: 0.15
   batch_size: 4
   accumulate_grad_batches: 8
-  epochs: 5
+  epochs: 20
   learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_epochs: 1
@@ -43,7 +43,7 @@ pretrain:
 
 finetune:
   batch_size: 4
-  epochs: 5
+  epochs: 20
   warmup_epochs: 1
   learning_rate: 5.0e-5
   weight_decay: 0.01

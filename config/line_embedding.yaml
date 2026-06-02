@@ -30,5 +30,5 @@ line_features:
   gamma_init: 0.1
   sigma_init: 0.006
   r2_min: 0.85
-  workers: 4
+  workers: 60
   cache_dir: external_data/cache
