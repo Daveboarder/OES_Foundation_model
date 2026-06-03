@@ -12,11 +12,13 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design detail, [PROJECT_SUMMARY.html]
 
 ## Embedding modes
 
-| Mode | Config | CLI | Sequence | Pre-train target |
-|------|--------|-----|----------|------------------|
-| **Bin (intensity)** | `embedding_type: intensity` (default) | `--libs_data_config` only | ~17,428 bins + CLS | Masked bin intensities (MIP) |
-| **Line-token** | `embedding_type: line_token` | `--libs_data_config` + `--line_embedding_config` | ~2k–8k lines + CLS | Masked Voigt features (max_I, FWHM) |
-| **Line-token-linear** | `embedding_type: line_token_linear` | same CLI (default when `--line_embedding_config` is set) | ~2k–8k lines + CLS | Same MIP targets; reads pre-baked tokens |
+
+| Mode                  | Config                                | CLI                                                      | Sequence           | Pre-train target                         |
+| --------------------- | ------------------------------------- | -------------------------------------------------------- | ------------------ | ---------------------------------------- |
+| **Bin (intensity)**   | `embedding_type: intensity` (default) | `--libs_data_config` only                                | ~17,428 bins + CLS | Masked bin intensities (MIP)             |
+| **Line-token**        | `embedding_type: line_token`          | `--libs_data_config` + `--line_embedding_config`         | ~2k–8k lines + CLS | Masked Voigt features (max_I, FWHM)      |
+| **Line-token-linear** | `embedding_type: line_token_linear`   | same CLI (default when `--line_embedding_config` is set) | ~2k–8k lines + CLS | Same MIP targets; reads pre-baked tokens |
+
 
 Checkpoints are **not interchangeable** between modes (different sequence length and weights).
 
@@ -30,8 +32,8 @@ Offline preprocessing (reusable across training runs):
 
 At training time:
 
-- **`line_token`** — loads `line_features_*.h5`; `LineTokenEmbedding` concatenates quantum scalars + `nn.Embedding` element/ion + fit features at runtime.
-- **`line_token_linear`** — loads only `line_tokens_*.h5`; `LinearLineTokenEmbedding` z-scores the 14 channels and applies `nn.Linear(14, d_model)`.
+- `**line_token`** — loads `line_features_*.h5`; `LineTokenEmbedding` concatenates quantum scalars + `nn.Embedding` element/ion + fit features at runtime.
+- `**line_token_linear**` — loads only `line_tokens_*.h5`; `LinearLineTokenEmbedding` z-scores the 14 channels and applies `nn.Linear(14, d_model)`.
 
 Build tokens once:
 
@@ -117,24 +119,28 @@ uv run tensorboard --logdir runs/
 
 ### Model / training
 
-| Config | Embedding | GPU | Notes |
-|--------|-----------|-----|--------|
-| `config/config_libs_smoke.yaml` | bin | any | Smoke wiring |
-| `config/config_libs_4090.yaml` | bin | RTX 4090 | ~17k bins, 5 pretrain epochs |
-| `config/config_libs_a100.yaml` | bin | A100 | 60/30 epochs |
-| `config/config_libs_token_4090.yaml` | line_token | RTX 4090 | ~8k lines (default threshold) |
-| `config/config_libs_token.yaml` | line_token | any | Small model for smoke |
+
+| Config                                      | Embedding         | GPU      | Notes                          |
+| ------------------------------------------- | ----------------- | -------- | ------------------------------ |
+| `config/config_libs_smoke.yaml`             | bin               | any      | Smoke wiring                   |
+| `config/config_libs_4090.yaml`              | bin               | RTX 4090 | ~17k bins, 5 pretrain epochs   |
+| `config/config_libs_a100.yaml`              | bin               | A100     | 60/30 epochs                   |
+| `config/config_libs_token_4090.yaml`        | line_token        | RTX 4090 | ~8k lines (default threshold)  |
+| `config/config_libs_token.yaml`             | line_token        | any      | Small model for smoke          |
 | `config/config_libs_token_linear_4090.yaml` | line_token_linear | RTX 4090 | Pre-baked tokens + `nn.Linear` |
-| `config/config_libs_token_linear.yaml` | line_token_linear | any | Smoke for token-linear path |
+| `config/config_libs_token_linear.yaml`      | line_token_linear | any      | Smoke for token-linear path    |
+
 
 ### Data and line embedding
 
-| Config | Role |
-|--------|------|
-| `config/libs_data.yaml` | Full dataset (~2256 types × 50 shots) |
-| `config/libs_data_smoke.yaml` | 3 types × 6 shots |
-| `config/line_embedding.yaml` | Te/Ne grid, line-selection mode (`top_percent_per_element` default), Voigt-fit settings |
-| `config/line_embedding_smoke.yaml` | `max_lines: 400` for fast tests |
+
+| Config                             | Role                                                                                    |
+| ---------------------------------- | --------------------------------------------------------------------------------------- |
+| `config/libs_data.yaml`            | Full dataset (~2256 types × 50 shots)                                                   |
+| `config/libs_data_smoke.yaml`      | 3 types × 6 shots                                                                       |
+| `config/line_embedding.yaml`       | Te/Ne grid, line-selection mode (`top_percent_per_element` default), Voigt-fit settings |
+| `config/line_embedding_smoke.yaml` | `max_lines: 400` for fast tests                                                         |
+
 
 **Line selection:** `line_dictionary.selection` in `line_embedding.yaml` defaults to top 10% per element (`min_keep: 10`); legacy threshold mode remains available via `selection.mode: threshold`.
 
@@ -142,13 +148,15 @@ uv run tensorboard --logdir runs/
 
 ## Training CLI (essentials)
 
-| Flag | Description |
-|------|-------------|
-| `--config` | Model size, epochs, batch size |
-| `--libs_data_config` | **Required** for real LIBS data (`libs_data.yaml`) |
+
+| Flag                      | Description                                                                                                   |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `--config`                | Model size, epochs, batch size                                                                                |
+| `--libs_data_config`      | **Required** for real LIBS data (`libs_data.yaml`)                                                            |
 | `--line_embedding_config` | Line-token modes (`line_embedding.yaml`); defaults to `line_token_linear` unless config sets `embedding_type` |
-| `--experiment_name` | Run folder suffix |
-| `--num_workers` | DataLoader workers (default 0) |
+| `--experiment_name`       | Run folder suffix                                                                                             |
+| `--num_workers`           | DataLoader workers (default 0)                                                                                |
+
 
 **Fine-tune:** `--pretrain_run_dir`, `--task` (`quantification_binned`, `classification`, …), `--pool` (`cls`, `mean`, `cls_mean`).
 
