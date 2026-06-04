@@ -188,6 +188,81 @@ class BinnedQuantificationHead(nn.Module):
         return torch.stack(per_element, dim=1)
 
 
+class MaskedBinIntensityHead(nn.Module):
+    """
+    Classification head for masked bin-intensity prediction (MIP).
+
+    Outputs raw logits per bin; use with ``nn.CrossEntropyLoss`` (no Softmax).
+
+    Args:
+        d_model: Transformer hidden size.
+        num_intensity_bins: Number of discrete intensity classes.
+    """
+
+    def __init__(self, d_model: int, num_intensity_bins: int = 256):
+        super().__init__()
+        self.num_intensity_bins = num_intensity_bins
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, num_intensity_bins),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Sequence embeddings ``[B, Seq_Len, d_model]``.
+
+        Returns:
+            Logits ``[B, Seq_Len, num_intensity_bins]``.
+        """
+        return self.head(x)
+
+
+class MaskedLineFeatureHead(nn.Module):
+    """
+    Dual classification heads for Voigt line tokens (max intensity + FWHM).
+
+    Two decoupled stacks on the shared trunk; no terminal Softmax.
+
+    Args:
+        d_model: Transformer hidden size.
+        num_intensity_bins: Classes for max_intensity (log-spaced targets).
+        num_fwhm_bins: Classes for FWHM (uniform-spaced targets).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_intensity_bins: int = 256,
+        num_fwhm_bins: int = 100,
+    ):
+        super().__init__()
+        self.intensity_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, num_intensity_bins),
+        )
+        self.fwhm_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, num_fwhm_bins),
+        )
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: Sequence embeddings ``[B, Seq_Len, d_model]``.
+
+        Returns:
+            ``(intensity_logits, fwhm_logits)`` each ``[B, Seq_Len, num_*_bins]``.
+        """
+        return self.intensity_head(x), self.fwhm_head(x)
+
+
 class MaskedPredictionHead(nn.Module):
     """
     Head for masked intensity prediction.

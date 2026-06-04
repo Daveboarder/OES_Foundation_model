@@ -12,6 +12,7 @@ from typing import Dict, Optional, Tuple, Union
 
 from .positional_encoding import SinusoidalPositionalEncoding
 from .line_token_embedding import LineTokenEmbedding, LinearLineTokenEmbedding
+from .heads import MaskedBinIntensityHead, MaskedLineFeatureHead
 
 
 class SpectralEmbedding(nn.Module):
@@ -224,6 +225,9 @@ class LIBSTransformer(nn.Module):
         n_ion_states: int = 10,
         line_token_meta: Optional[dict] = None,
         n_mip_target_channels: int = 2,
+        mip_loss_type: str = "mse",
+        num_intensity_bins: int = 256,
+        num_fwhm_bins: int = 100,
     ):
         super().__init__()
         
@@ -233,6 +237,9 @@ class LIBSTransformer(nn.Module):
         self.n_layers = n_layers
         self.embedding_type = embedding_type
         self.n_mip_target_channels = int(n_mip_target_channels)
+        self.mip_loss_type = mip_loss_type
+        self.num_intensity_bins = int(num_intensity_bins)
+        self.num_fwhm_bins = int(num_fwhm_bins)
         
         if embedding_type == "line_token":
             self.embedding = LineTokenEmbedding(
@@ -281,8 +288,20 @@ class LIBSTransformer(nn.Module):
         # Final layer normalization
         self.final_norm = nn.LayerNorm(d_model)
         
-        # Masked prediction head (bin intensity or line features)
-        if embedding_type in ("line_token", "line_token_linear"):
+        # Masked prediction head (regression or classification)
+        if mip_loss_type == "classification":
+            if embedding_type in ("line_token", "line_token_linear"):
+                self.mip_head = MaskedLineFeatureHead(
+                    d_model=d_model,
+                    num_intensity_bins=num_intensity_bins,
+                    num_fwhm_bins=num_fwhm_bins,
+                )
+            else:
+                self.mip_head = MaskedBinIntensityHead(
+                    d_model=d_model,
+                    num_intensity_bins=num_intensity_bins,
+                )
+        elif embedding_type in ("line_token", "line_token_linear"):
             out_dim = 2 if embedding_type == "line_token" else self.n_mip_target_channels
             self.mip_head = nn.Sequential(
                 nn.Linear(d_model, d_model),
@@ -365,18 +384,25 @@ class LIBSTransformer(nn.Module):
         cls_embedding = hidden[:, 0, :]
         sequence_embeddings = hidden[:, 1:, :]
         
-        mip_out = self.mip_head(sequence_embeddings)
-        if self.embedding_type in ("line_token", "line_token_linear"):
-            mip_predictions = mip_out  # [B, L, n_target_channels]
-        else:
-            mip_predictions = mip_out.squeeze(-1)  # [B, n_bins]
-        
         result = {
             'cls_embedding': cls_embedding,
             'sequence_output': hidden,
             'sequence_embeddings': sequence_embeddings,
-            'mip_predictions': mip_predictions,
         }
+
+        if self.mip_loss_type == "classification":
+            if self.embedding_type in ("line_token", "line_token_linear"):
+                intensity_logits, fwhm_logits = self.mip_head(sequence_embeddings)
+                result['intensity_logits'] = intensity_logits
+                result['fwhm_logits'] = fwhm_logits
+            else:
+                result['intensity_logits'] = self.mip_head(sequence_embeddings)
+        else:
+            mip_out = self.mip_head(sequence_embeddings)
+            if self.embedding_type in ("line_token", "line_token_linear"):
+                result['mip_predictions'] = mip_out  # [B, L, n_target_channels]
+            else:
+                result['mip_predictions'] = mip_out.squeeze(-1)  # [B, n_bins]
         if key_padding_mask is not None:
             result['key_padding_mask'] = key_padding_mask
         if return_attention:

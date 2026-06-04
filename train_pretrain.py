@@ -32,9 +32,38 @@ from data.line_embedding_pipeline import (
     prepare_line_token_assets,
     prepare_line_tokens_assets,
 )
+from data.discretization import build_discretizer_from_config
 from models.libs_transformer import LIBSTransformer
 from training.pretrain import LIBSPretrainModule, PretrainDataModule
 from utils.run_manager import RunManager
+
+
+def pretrain_loss_type(config: dict) -> str:
+    """``mse`` (default) or ``classification``."""
+    return str(config.get('pretrain', {}).get('loss', 'mse')).lower()
+
+
+def build_pretrain_discretizers(config: dict):
+    """Build intensity (+ FWHM) discretizers when using classification MIP."""
+    if pretrain_loss_type(config) != 'classification':
+        return None, None
+    disc_root = config.get('discretization', {})
+    intensity_cfg = disc_root.get('intensity') or {
+        'num_bins': config['model'].get('num_intensity_bins', 256),
+        'min_val': 1.0e-4,
+        'max_val': 1.0,
+        'strategy': 'log',
+    }
+    fwhm_cfg = disc_root.get('fwhm') or {
+        'num_bins': config['model'].get('num_fwhm_bins', 100),
+        'min_val': 0.005,
+        'max_val': 0.3,
+        'strategy': 'uniform',
+    }
+    return (
+        build_discretizer_from_config(intensity_cfg),
+        build_discretizer_from_config(fwhm_cfg),
+    )
 
 
 class SaveRawModelCallback(Callback):
@@ -151,8 +180,12 @@ def create_model(
         kwargs['n_mip_target_channels'] = int(
             config['model'].get('n_mip_target_channels', 2)
         )
+    kwargs['mip_loss_type'] = pretrain_loss_type(config)
+    kwargs['num_intensity_bins'] = int(config['model'].get('num_intensity_bins', 256))
+    kwargs['num_fwhm_bins'] = int(config['model'].get('num_fwhm_bins', 100))
     model = LIBSTransformer(**kwargs)
-    print(f"Created model ({emb_type}) with {model.num_parameters:,} parameters")
+    loss_label = kwargs['mip_loss_type']
+    print(f"Created model ({emb_type}, MIP={loss_label}) with {model.num_parameters:,} parameters")
     return model
 
 
@@ -277,6 +310,12 @@ def main(args):
 
     model = create_model(config, line_dict_meta=line_dict_meta, line_token_meta=line_token_meta)
 
+    loss_type = pretrain_loss_type(config)
+    intensity_disc, fwhm_disc = build_pretrain_discretizers(config)
+    if loss_type == 'classification':
+        print(f"Pretrain loss: classification (intensity bins={intensity_disc.num_bins}, "
+              f"fwhm bins={fwhm_disc.num_bins})")
+
     pretrain_module = LIBSPretrainModule(
         model=model,
         learning_rate=config['pretrain']['learning_rate'],
@@ -284,6 +323,9 @@ def main(args):
         warmup_epochs=config['pretrain']['warmup_epochs'],
         max_epochs=config['pretrain']['epochs'],
         min_lr=config['pretrain']['min_lr'],
+        loss_type=loss_type,
+        intensity_discretizer=intensity_disc,
+        fwhm_discretizer=fwhm_disc,
     )
 
     # Masking config
@@ -389,9 +431,11 @@ def main(args):
     # Save run info
     n_train = len(train_indices) if train_indices is not None else len(train_spectra)
     n_val = len(val_indices) if val_indices is not None else len(val_spectra)
-    run_mgr.save_run_info({
+    run_info_common = {
         "model_params": model.num_parameters,
         "embedding_type": config['model'].get('embedding_type', 'intensity'),
+        "pretrain_loss": loss_type,
+        "discretization": config.get('discretization'),
         "train_samples": n_train,
         "val_samples": n_val,
         "n_lines": config['data']['n_bins'] if use_line_token else None,
@@ -405,8 +449,8 @@ def main(args):
         "block_sizes": block_sizes,
         "peak_bias_enabled": peak_bias_enabled,
         "seed": args.seed,
-        "status": "running",
-    })
+    }
+    run_mgr.save_run_info({**run_info_common, "status": "running"})
 
     # Train
     print("\nStarting pre-training...")
@@ -424,21 +468,7 @@ def main(args):
     n_train = len(train_indices) if train_indices is not None else len(train_spectra)
     n_val = len(val_indices) if val_indices is not None else len(val_spectra)
     run_mgr.save_run_info({
-        "model_params": model.num_parameters,
-        "embedding_type": config['model'].get('embedding_type', 'intensity'),
-        "train_samples": n_train,
-        "val_samples": n_val,
-        "n_lines": config['data']['n_bins'] if use_line_token else None,
-        "line_features_path": line_features_path,
-        "line_tokens_path": line_tokens_path,
-        "line_embedding_config": args.line_embedding_config,
-        "batch_size": config['pretrain']['batch_size'],
-        "epochs": config['pretrain']['epochs'],
-        "mask_ratio": config['pretrain']['mask_ratio'],
-        "contiguous_masking": contiguous_masking,
-        "block_sizes": block_sizes,
-        "peak_bias_enabled": peak_bias_enabled,
-        "seed": args.seed,
+        **run_info_common,
         "status": "completed",
         "best_val_loss": float(checkpoint_callback.best_model_score) if checkpoint_callback.best_model_score else None,
         "final_model": str(final_path),

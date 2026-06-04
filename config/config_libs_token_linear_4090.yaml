@@ -30,8 +30,23 @@ model:
   dropout: 0.1
   max_seq_len: 8192      # placeholder; set to n_lines + 1
   n_mip_target_channels: 2   # max_intensity + FWHM
+  num_intensity_bins: 256
+  num_fwhm_bins: 100
+
+discretization:
+  intensity:
+    num_bins: 256
+    min_val: 1.0e-4
+    max_val: 1.1
+    strategy: log
+  fwhm:
+    num_bins: 100
+    min_val: 0.01
+    max_val: 1.1
+    strategy: uniform
 
 pretrain:
+  loss: classification               # mse | classification
   mask_ratio: 0.15
   batch_size: 4
   accumulate_grad_batches: 8

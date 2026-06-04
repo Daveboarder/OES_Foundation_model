@@ -2,14 +2,96 @@
 Pre-training module for LIBS Foundation Model.
 
 Implements self-supervised pre-training using masked intensity prediction (MIP).
+Supports regression (MSE) or classification (cross-entropy on discretized targets).
 """
 
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 import math
 import numpy as np
+
+from data.discretization import SpectroscopicDiscretizer
+
+
+def compute_masked_classification_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    discretizer: SpectroscopicDiscretizer,
+    criterion: nn.Module,
+) -> torch.Tensor:
+    """
+    Cross-entropy on masked positions after on-the-fly discretization.
+
+    Args:
+        logits: ``[B, Seq, Num_Bins]`` or broadcastable after reshape.
+        targets: Continuous targets, same leading shape as mask.
+        mask: Boolean ``[B, Seq]`` (or broadcastable).
+    """
+    flat_mask = mask.reshape(-1)
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_targets = targets.reshape(-1)
+    masked_logits = flat_logits[flat_mask]
+    masked_targets = flat_targets[flat_mask]
+    if masked_logits.numel() == 0:
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+    class_targets = discretizer.to_bins(masked_targets)
+    return criterion(masked_logits, class_targets)
+
+
+def compute_masked_line_classification_loss(
+    intensity_logits: torch.Tensor,
+    fwhm_logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    intensity_discretizer: SpectroscopicDiscretizer,
+    fwhm_discretizer: SpectroscopicDiscretizer,
+    criterion: nn.Module,
+) -> torch.Tensor:
+    """CE on max_intensity (ch 0) and FWHM (ch 1) for line-token MIP."""
+    loss_i = compute_masked_classification_loss(
+        intensity_logits,
+        targets[..., 0],
+        mask,
+        intensity_discretizer,
+        criterion,
+    )
+    loss_f = compute_masked_classification_loss(
+        fwhm_logits,
+        targets[..., 1],
+        mask,
+        fwhm_discretizer,
+        criterion,
+    )
+    return loss_i + loss_f
+
+
+def _classification_decode_metrics(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    discretizer: SpectroscopicDiscretizer,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MAE, R², and bin accuracy on masked positions (decoded continuous preds)."""
+    flat_mask = mask.reshape(-1)
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_targets = targets.reshape(-1)
+    masked_logits = flat_logits[flat_mask]
+    masked_targets = flat_targets[flat_mask]
+    if masked_logits.numel() == 0:
+        z = torch.tensor(0.0, device=logits.device)
+        return z, z, z
+    pred_bins = masked_logits.argmax(dim=-1)
+    pred_cont = discretizer.to_continuous(pred_bins)
+    class_targets = discretizer.to_bins(masked_targets)
+    bin_acc = (pred_bins == class_targets).float().mean()
+    mae = torch.abs(pred_cont - masked_targets).mean()
+    ss_res = ((masked_targets - pred_cont) ** 2).sum()
+    ss_tot = ((masked_targets - masked_targets.mean()) ** 2).sum()
+    r2 = 1 - ss_res / (ss_tot + 1e-8)
+    return mae, r2, bin_acc
 
 
 class LIBSPretrainModule(pl.LightningModule):
@@ -35,9 +117,14 @@ class LIBSPretrainModule(pl.LightningModule):
         warmup_epochs: int = 10,
         max_epochs: int = 100,
         min_lr: float = 1e-6,
+        loss_type: str = "mse",
+        intensity_discretizer: Optional[SpectroscopicDiscretizer] = None,
+        fwhm_discretizer: Optional[SpectroscopicDiscretizer] = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['model'])
+        self.save_hyperparameters(
+            ignore=['model', 'intensity_discretizer', 'fwhm_discretizer']
+        )
         
         self.model = model
         self.learning_rate = learning_rate
@@ -45,9 +132,16 @@ class LIBSPretrainModule(pl.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
         self.min_lr = min_lr
+        self.loss_type = loss_type
+        self.intensity_discretizer = intensity_discretizer
+        self.fwhm_discretizer = fwhm_discretizer
         
-        # Loss function
         self.mse_loss = nn.MSELoss()
+        self.ce_loss = (
+            nn.CrossEntropyLoss(reduction='mean')
+            if loss_type == "classification"
+            else None
+        )
     
     def forward(
         self,
@@ -87,6 +181,50 @@ class LIBSPretrainModule(pl.LightningModule):
             return torch.tensor(0.0, device=predictions.device, requires_grad=True)
         
         return self.mse_loss(masked_preds, masked_targets)
+
+    def _forward_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if 'tokens' in batch:
+            return self.model({'tokens': batch['tokens'], 'fit_valid': batch.get('fit_valid')})
+        if 'line_features' in batch:
+            return self.model({'line_features': batch['line_features']})
+        embedding_mask = (batch['mask_type'] == 1)
+        return self.model(batch['input'], mask=embedding_mask)
+
+    def _is_line_batch(self, batch: Dict[str, torch.Tensor]) -> bool:
+        return 'tokens' in batch or 'line_features' in batch
+
+    def _compute_batch_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if self.loss_type == "classification":
+            line_mask = batch['mask']
+            targets = batch['target']
+            if 'fwhm_logits' in outputs:
+                return compute_masked_line_classification_loss(
+                    outputs['intensity_logits'],
+                    outputs['fwhm_logits'],
+                    targets,
+                    line_mask,
+                    self.intensity_discretizer,
+                    self.fwhm_discretizer,
+                    self.ce_loss,
+                )
+            return compute_masked_classification_loss(
+                outputs['intensity_logits'],
+                targets,
+                line_mask if self._is_line_batch(batch) else batch['mask'],
+                self.intensity_discretizer,
+                self.ce_loss,
+            )
+        if self._is_line_batch(batch):
+            return self.model.compute_mip_loss(
+                outputs['mip_predictions'], batch['target'], batch['mask'],
+            )
+        return self.compute_loss(
+            outputs['mip_predictions'], batch['target'], batch['mask'],
+        )
     
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """
@@ -99,26 +237,8 @@ class LIBSPretrainModule(pl.LightningModule):
         Returns:
             Loss value
         """
-        if 'tokens' in batch:
-            outputs = self.model({'tokens': batch['tokens'], 'fit_valid': batch.get('fit_valid')})
-            preds = outputs['mip_predictions']
-            targets = batch['target']
-            line_mask = batch['mask']
-            loss = self.model.compute_mip_loss(preds, targets, line_mask)
-        elif 'line_features' in batch:
-            outputs = self.model({'line_features': batch['line_features']})
-            preds = outputs['mip_predictions']
-            targets = batch['target']
-            line_mask = batch['mask']
-            loss = self.model.compute_mip_loss(preds, targets, line_mask)
-        else:
-            embedding_mask = (batch['mask_type'] == 1)
-            outputs = self.model(batch['input'], mask=embedding_mask)
-            loss = self.compute_loss(
-                predictions=outputs['mip_predictions'],
-                targets=batch['target'],
-                mask=batch['mask'],
-            )
+        outputs = self._forward_batch(batch)
+        loss = self._compute_batch_loss(outputs, batch)
         
         # Log metrics
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -137,59 +257,70 @@ class LIBSPretrainModule(pl.LightningModule):
         Returns:
             Dictionary with loss and predictions
         """
-        if 'tokens' in batch:
-            outputs = self.model({'tokens': batch['tokens'], 'fit_valid': batch.get('fit_valid')})
-            preds = outputs['mip_predictions']
-            targets = batch['target']
-            line_mask = batch['mask']
-            loss = self.model.compute_mip_loss(preds, targets, line_mask)
-            with torch.no_grad():
-                m = line_mask.unsqueeze(-1).expand_as(preds)
-                masked_preds = preds[m]
-                masked_targets = targets[m]
-        elif 'line_features' in batch:
-            outputs = self.model({'line_features': batch['line_features']})
-            preds = outputs['mip_predictions']
-            targets = batch['target']
-            line_mask = batch['mask']
-            loss = self.model.compute_mip_loss(preds, targets, line_mask)
-            with torch.no_grad():
-                m = line_mask.unsqueeze(-1).expand_as(preds)
-                masked_preds = preds[m]
-                masked_targets = targets[m]
-        else:
-            embedding_mask = (batch['mask_type'] == 1)
-            outputs = self.model(batch['input'], mask=embedding_mask)
-            loss = self.compute_loss(
-                predictions=outputs['mip_predictions'],
-                targets=batch['target'],
-                mask=batch['mask'],
-            )
-            with torch.no_grad():
-                masked_preds = outputs['mip_predictions'][batch['mask']]
-                masked_targets = batch['target'][batch['mask']]
-        
-        # Compute additional metrics
+        outputs = self._forward_batch(batch)
+        loss = self._compute_batch_loss(outputs, batch)
+        line_mask = batch['mask']
+        targets = batch['target']
+
         with torch.no_grad():
-            if 'line_features' not in batch and 'tokens' not in batch:
-                pass  # masked_preds set above
-            
-            if masked_preds.numel() > 0:
-                mae = torch.abs(masked_preds - masked_targets).mean()
-                # R-squared (coefficient of determination)
-                ss_res = ((masked_targets - masked_preds) ** 2).sum()
-                ss_tot = ((masked_targets - masked_targets.mean()) ** 2).sum()
-                r2 = 1 - ss_res / (ss_tot + 1e-8)
+            if self.loss_type == "classification":
+                if 'fwhm_logits' in outputs:
+                    mae_i, r2_i, acc_i = _classification_decode_metrics(
+                        outputs['intensity_logits'],
+                        targets[..., 0],
+                        line_mask,
+                        self.intensity_discretizer,
+                    )
+                    mae_f, r2_f, acc_f = _classification_decode_metrics(
+                        outputs['fwhm_logits'],
+                        targets[..., 1],
+                        line_mask,
+                        self.fwhm_discretizer,
+                    )
+                    mae = (mae_i + mae_f) * 0.5
+                    r2 = (r2_i + r2_f) * 0.5
+                    bin_acc = (acc_i + acc_f) * 0.5
+                else:
+                    mae, r2, bin_acc = _classification_decode_metrics(
+                        outputs['intensity_logits'],
+                        targets,
+                        line_mask if self._is_line_batch(batch) else batch['mask'],
+                        self.intensity_discretizer,
+                    )
             else:
-                mae = torch.tensor(0.0)
-                r2 = torch.tensor(0.0)
+                bin_acc = torch.tensor(0.0, device=loss.device)
+                if self._is_line_batch(batch):
+                    preds = outputs['mip_predictions']
+                    m = line_mask.unsqueeze(-1).expand_as(preds)
+                    masked_preds = preds[m]
+                    masked_targets = targets[m]
+                else:
+                    masked_preds = outputs['mip_predictions'][batch['mask']]
+                    masked_targets = targets[batch['mask']]
+                if masked_preds.numel() > 0:
+                    mae = torch.abs(masked_preds - masked_targets).mean()
+                    ss_res = ((masked_targets - masked_preds) ** 2).sum()
+                    ss_tot = ((masked_targets - masked_targets.mean()) ** 2).sum()
+                    r2 = 1 - ss_res / (ss_tot + 1e-8)
+                else:
+                    mae = torch.tensor(0.0, device=loss.device)
+                    r2 = torch.tensor(0.0, device=loss.device)
         
         # Log metrics
         self.log('val/loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val/mae', mae, on_epoch=True, sync_dist=True)
         self.log('val/r2', r2, on_epoch=True, sync_dist=True)
+        if self.loss_type == "classification":
+            self.log('val/bin_accuracy', bin_acc, on_epoch=True, sync_dist=True)
+            if 'fwhm_logits' in outputs:
+                self.log('val/mae_intensity', mae_i, on_epoch=True, sync_dist=True)
+                self.log('val/mae_fwhm', mae_f, on_epoch=True, sync_dist=True)
         
-        return {'loss': loss, 'predictions': outputs['mip_predictions']}
+        pred_key = (
+            'intensity_logits' if self.loss_type == "classification"
+            else 'mip_predictions'
+        )
+        return {'loss': loss, 'predictions': outputs.get(pred_key)}
     
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler."""

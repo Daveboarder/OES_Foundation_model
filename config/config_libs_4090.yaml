@@ -25,8 +25,24 @@ model:
   d_ff: 512
   dropout: 0.1
   max_seq_len: 2049       # placeholder; libs pipeline overrides to 17429
+  num_intensity_bins: 256
+  num_fwhm_bins: 100
+
+# Classification MIP (optional): set pretrain.loss to classification
+discretization:
+  intensity:
+    num_bins: 256
+    min_val: 1.0e-4
+    max_val: 1.0
+    strategy: log
+  fwhm:
+    num_bins: 100
+    min_val: 0.005
+    max_val: 0.3
+    strategy: uniform
 
 pretrain:
+  loss: mse               # mse | classification
   mask_ratio: 0.15
   mask_token_prob: 0.8
   random_token_prob: 0.1

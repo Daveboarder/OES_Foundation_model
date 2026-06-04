@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from data.synthetic_generator import SyntheticLIBSGenerator, MATERIAL_CLASSES
 from data.dataset import MaskedLIBSDataset, LabeledLIBSDataset
+from data.discretization import build_discretizer_from_config
 from models.libs_transformer import LIBSTransformer
 from models.heads import ClassificationHead, RegressionHead
 from utils.metrics import (
@@ -90,6 +91,7 @@ def _create_model(
     if emb == "line_token_linear" and line_token_meta is not None:
         n_lines = int(line_token_meta["n_lines"])
         n_bins = n_lines
+    loss_type = str(config.get('pretrain', {}).get('loss', 'mse')).lower()
     return LIBSTransformer(
         n_bins=n_bins,
         d_model=config['model']['d_model'],
@@ -102,6 +104,9 @@ def _create_model(
         n_lines=n_lines,
         line_token_meta=line_token_meta,
         n_mip_target_channels=n_mip_channels,
+        mip_loss_type=loss_type,
+        num_intensity_bins=int(config['model'].get('num_intensity_bins', 256)),
+        num_fwhm_bins=int(config['model'].get('num_fwhm_bins', 100)),
     )
 
 
@@ -251,6 +256,19 @@ def evaluate_pretrain(
 
     model = model.to(device)
 
+    # Build the discretizer once (classification MIP only) — hoisted out of the
+    # batch loop so logspace boundaries are not recomputed per step.
+    loss_type = str(config.get('pretrain', {}).get('loss', 'mse')).lower()
+    discretizer = None
+    if loss_type == 'classification':
+        disc_cfg = config.get('discretization', {}).get('intensity') or {
+            'num_bins': config['model'].get('num_intensity_bins', 256),
+            'min_val': 1.0e-4,
+            'max_val': 1.0,
+            'strategy': 'log',
+        }
+        discretizer = build_discretizer_from_config(disc_cfg).to(device)
+
     print("Running inference...")
     all_preds = []
     all_targets = []
@@ -270,7 +288,11 @@ def evaluate_pretrain(
             # Match training: only mask-token positions (type 1) get mask embedding
             embedding_mask = (mask_types == 1).to(device)
             output = model(inputs, mask=embedding_mask)
-            predictions = output['mip_predictions'].cpu()
+            if discretizer is not None:
+                pred_bins = output['intensity_logits'].argmax(dim=-1)
+                predictions = discretizer.to_continuous(pred_bins).cpu()
+            else:
+                predictions = output['mip_predictions'].cpu()
 
             all_preds.append(predictions.numpy())
             all_targets.append(targets.numpy())

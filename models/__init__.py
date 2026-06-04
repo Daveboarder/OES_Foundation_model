@@ -2,7 +2,13 @@
 
 from .libs_transformer import LIBSTransformer
 from .positional_encoding import SinusoidalPositionalEncoding
-from .heads import ClassificationHead, RegressionHead, MaskedPredictionHead
+from .heads import (
+    ClassificationHead,
+    RegressionHead,
+    MaskedPredictionHead,
+    MaskedBinIntensityHead,
+    MaskedLineFeatureHead,
+)
 
 __all__ = [
     "LIBSTransformer",
@@ -10,4 +16,6 @@ __all__ = [
     "ClassificationHead",
     "RegressionHead",
     "MaskedPredictionHead",
+    "MaskedBinIntensityHead",
+    "MaskedLineFeatureHead",
 ]
