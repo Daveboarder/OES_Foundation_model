@@ -461,6 +461,37 @@ def generate_synthetic_spectra(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HDF5 cache helpers (shared by synthetic and measured datasets)
+# ─────────────────────────────────────────────────────────────────────────────
+def save_spectra_cache(table: pd.DataFrame, spectra: np.ndarray, path: str) -> None:
+    with h5py.File(path, "w") as f:
+        f.create_dataset("spectra", data=spectra, compression="gzip")
+        grp = f.create_group("sample_table")
+        grp.attrs["columns"] = json.dumps(list(table.columns))
+        str_dt = h5py.string_dtype()
+        for col in table.columns:
+            vals = table[col].values
+            if vals.dtype.kind in ("U", "O"):
+                grp.create_dataset(col, data=list(vals), dtype=str_dt)
+            else:
+                grp.create_dataset(col, data=vals)
+
+
+def load_spectra_cache(path: str) -> tuple[pd.DataFrame, np.ndarray]:
+    with h5py.File(path, "r") as f:
+        spectra = f["spectra"][:]
+        grp = f["sample_table"]
+        cols = json.loads(grp.attrs["columns"])
+        data = {}
+        for c in cols:
+            v = grp[c][:]
+            if v.dtype.kind in ("S", "O"):
+                v = [s.decode("utf-8") if isinstance(s, bytes) else s for s in v]
+            data[c] = v
+    return pd.DataFrame(data), spectra
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Dataset wrapper + HDF5 cache
 # ─────────────────────────────────────────────────────────────────────────────
 class SyntheticLIBSDataset(Dataset):
@@ -518,30 +549,10 @@ class SyntheticLIBSDataset(Dataset):
         return os.path.join(self.cache_dir, f"synthetic_cache_{self.cache_key}.h5")
 
     def _save_cache(self, table: pd.DataFrame, spectra: np.ndarray, path: str):
-        with h5py.File(path, "w") as f:
-            f.create_dataset("spectra", data=spectra, compression="gzip")
-            grp = f.create_group("sample_table")
-            grp.attrs["columns"] = json.dumps(list(table.columns))
-            str_dt = h5py.string_dtype()
-            for col in table.columns:
-                vals = table[col].values
-                if vals.dtype.kind in ("U", "O"):
-                    grp.create_dataset(col, data=list(vals), dtype=str_dt)
-                else:
-                    grp.create_dataset(col, data=vals)
+        save_spectra_cache(table, spectra, path)
 
     def _load_cache(self, path: str) -> tuple[pd.DataFrame, np.ndarray]:
-        with h5py.File(path, "r") as f:
-            spectra = f["spectra"][:]
-            grp = f["sample_table"]
-            cols = json.loads(grp.attrs["columns"])
-            data = {}
-            for c in cols:
-                v = grp[c][:]
-                if v.dtype.kind in ("S", "O"):
-                    v = [s.decode("utf-8") if isinstance(s, bytes) else s for s in v]
-                data[c] = v
-        return pd.DataFrame(data), spectra
+        return load_spectra_cache(path)
 
     def _build(self) -> tuple[pd.DataFrame, np.ndarray]:
         cache = self._cache_path()
@@ -717,9 +728,13 @@ def cluster_compositions(
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience: build a dataset from a YAML config (paths + ranges)
 # ─────────────────────────────────────────────────────────────────────────────
-def build_dataset_from_config(cfg: dict) -> SyntheticLIBSDataset:
+def build_dataset_from_config(cfg: dict) -> Dataset:
     """Top-level entry point used by training scripts. `cfg` mirrors
-    config/libs_data.yaml."""
+    config/libs_data.yaml or config/libs_data_measured.yaml."""
+    if cfg.get("source") == "measured":
+        from data.measured_pipeline import build_measured_dataset_from_config
+        return build_measured_dataset_from_config(cfg)
+
     paths = cfg["paths"]
     ranges = cfg["ranges"]
     gen = cfg.get("generation", {})

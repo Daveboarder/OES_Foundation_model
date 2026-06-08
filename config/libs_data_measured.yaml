@@ -1,0 +1,34 @@
+# =============================================================================
+# LIBS Measured Data Pipeline — Chameleon OptiCal JSON + sample matrix
+# =============================================================================
+# Used by `data.measured_pipeline.build_measured_dataset_from_config(cfg)` via
+# `data.libs_pipeline.build_dataset_from_config(cfg)` when source=measured.
+# =============================================================================
+
+source: measured
+
+paths:
+  db:                "external_data/Source/LIBS_data_vacuum.db"
+  sample_matrix:     "external_data/Source/Samples_Fe_matrix.xlsx"
+  wavelength_json:   "external_data/Data/VASKUT K8.json"
+  measured_json_root: "/home/LIBS/prochazka/data/Running_projects/24_0011_CF_spark/CF SPARK/Data/Chameleon_OptiCal_DB_Calibration_Data_Fe_20211126"
+  cache_dir:         "external_data/cache"
+
+measured:
+  integration_phase: 1
+  ccd_ranges: [1, 2]
+  run_policy: first_valid   # first run with type==2 (IncInAverage)
+  normalize: unit_norm
+  max_files: null           # null = all matched JSON files (~3346)
+  seed: 42
+  verbose: true
+
+# Downstream / fine-tune settings (used by train_finetune.py).
+downstream:
+  elements_to_predict: null
+  n_clusters: 10
+  n_concentration_bins: 1000
+  splits:
+    val_fraction: 0.15
+    test_fraction: 0.15
+    seed: 42
