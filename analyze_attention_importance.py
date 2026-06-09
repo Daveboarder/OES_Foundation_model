@@ -1,0 +1,574 @@
+"""
+Attention-based input-importance for fine-tuned LIBS models.
+
+Loads a fine-tuned run (primarily `quantification_binned` with the
+`line_token_linear` embedding), runs the test spectra through the encoder while
+collecting CLS-token attention, and reports:
+
+  1. Per-line / per-bin importance  — how much the CLS token attends to each
+     spectral line (or wavelength bin), aggregated over heads, layers and a
+     sample of test spectra. Optionally grouped by element (atomic number).
+
+  2. Per-channel importance for the 14 named token features — attention cannot
+     decompose channels by itself (they are fused by the embedding's
+     `nn.Linear(14, d_model)` before attention), so channel importance is
+     attention-informed: it combines the CLS attention placed on each line with
+     the z-scored feature magnitude and the projection column norm.
+
+Scope / caveats (also written to the summary file):
+  - Attention reflects the *shared* CLS representation. The binned head's
+    per-element branches all read the same pooled vector, so attention is not a
+    per-output-element attribution; that would need a gradient-based method.
+  - The per-channel breakdown relies on the linear embedding and is only
+    produced for `line_token_linear` runs. `intensity` (bin) runs get per-bin
+    importance only.
+
+Usage:
+    uv run python analyze_attention_importance.py \
+        --run_dir runs/finetune_2026-06-04_21-03-15_libs_binned_ft
+
+    # Lightweight path: sample spectra straight from the token cache instead of
+    # rebuilding the full labeled dataset / split.
+    uv run python analyze_attention_importance.py \
+        --run_dir runs/finetune_... --tokens_path external_data/cache/line_tokens_<hash>.h5
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import yaml
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from data.line_tokenization import F_Z, FEATURE_NAMES
+from models.libs_transformer import LIBSTransformer
+from utils.run_manager import RunManager
+
+# Reuse loading / data helpers so the analyzed split matches training exactly.
+from train_finetune import (
+    _load_weights_shape_safe,
+    generate_labeled_data,
+)
+from data.line_embedding_pipeline import prepare_line_tokens_assets
+
+
+# Atomic-number -> element symbol (enough to cover the LIBS line dictionary).
+_ELEMENT_SYMBOLS = [
+    "n", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg",
+    "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn",
+    "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb",
+    "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In",
+    "Sn", "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm",
+    "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf", "Ta",
+    "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Po", "At",
+    "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U",
+]
+
+
+def _z_to_symbol(z: int) -> str:
+    if 0 <= z < len(_ELEMENT_SYMBOLS):
+        return _ELEMENT_SYMBOLS[z]
+    return f"Z{z}"
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Model + data loading
+# ────────────────────────────────────────────────────────────────────────────
+
+def _checkpoint_encoder_state(checkpoint_path: str) -> dict:
+    """Extract the `encoder.*` sub-state-dict from a finetune Lightning ckpt."""
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+    encoder_state = {
+        k[len("encoder."):]: v for k, v in state_dict.items() if k.startswith("encoder.")
+    }
+    if not encoder_state:
+        # Fall back to a raw encoder state dict (final_encoder.pt / encoder_latest.pt).
+        encoder_state = dict(state_dict)
+    # Pretrain MIP head is unused here and may mismatch; drop it.
+    encoder_state = {k: v for k, v in encoder_state.items() if not k.startswith("mip_head.")}
+    return encoder_state
+
+
+def build_encoder(config: dict, run_info: dict, token_meta: dict) -> LIBSTransformer:
+    """Build a LIBSTransformer matching the fine-tuned encoder (no task heads)."""
+    emb_type = run_info.get("embedding_type") or config["model"].get("embedding_type", "intensity")
+    kwargs = dict(
+        n_bins=config["data"]["n_bins"],
+        d_model=config["model"]["d_model"],
+        n_heads=config["model"]["n_heads"],
+        n_layers=config["model"]["n_layers"],
+        d_ff=config["model"]["d_ff"],
+        dropout=0.0,
+        n_classes=config["data"]["n_classes"],
+        embedding_type=emb_type,
+    )
+    if emb_type == "line_token_linear":
+        if token_meta is None:
+            raise ValueError("line_token_linear encoder requires token_meta")
+        kwargs["n_lines"] = token_meta["n_lines"]
+        kwargs["line_token_meta"] = token_meta
+        kwargs["n_mip_target_channels"] = int(config["model"].get("n_mip_target_channels", 2))
+    elif emb_type == "line_token":
+        raise NotImplementedError(
+            "line_token (runtime embedding) is not supported by this analyzer; "
+            "use a line_token_linear run, or extend build_encoder with line_dict_meta."
+        )
+    return LIBSTransformer(**kwargs)
+
+
+def prepare_data(config: dict, run_info: dict, args):
+    """Return (dataset, token_meta, source_description).
+
+    Two paths:
+      * tokens cache directly (lightweight, label-free) when --tokens_path is
+        given or --use_token_cache is set with a path available from run_info;
+      * full pipeline reconstruction (faithful test split) otherwise.
+    """
+    from data.dataset import LineTokensLabeledDataset, LineTokensDataset
+
+    line_embedding_config = run_info.get("line_embedding_config")
+    libs_data_config = run_info.get("libs_data_config")
+    seed = int(run_info.get("seed", 42))
+
+    tokens_path = args.tokens_path or (
+        run_info.get("line_tokens_path") if args.use_token_cache else None
+    )
+
+    if tokens_path:
+        tp = Path(tokens_path)
+        if not tp.is_file():
+            raise FileNotFoundError(
+                f"tokens cache not found: {tokens_path}. Drop --tokens_path/"
+                "--use_token_cache to rebuild from the pipeline instead."
+            )
+        import h5py
+        with h5py.File(tp, "r") as f:
+            n_spectra = int(f.attrs.get("n_spectra", f["tokens"].shape[0]))
+            feature_mean = np.asarray(f.attrs["feature_mean"], dtype=np.float32)
+            feature_std = np.asarray(f.attrs["feature_std"], dtype=np.float32)
+            central_wavelength = f["central_wavelength"][:].astype(np.float32)
+            n_lines = int(f.attrs["n_lines"])
+            n_features = int(f.attrs["n_features"])
+        rng = np.random.default_rng(seed)
+        n_take = min(args.max_samples, n_spectra)
+        indices = np.sort(rng.choice(n_spectra, size=n_take, replace=False))
+        dataset = LineTokensDataset(str(tp), indices=indices)
+        token_meta = {
+            "n_lines": n_lines,
+            "n_features": n_features,
+            "feature_names": FEATURE_NAMES,
+            "feature_mean": feature_mean,
+            "feature_std": feature_std,
+            "central_wavelength": central_wavelength,
+        }
+        return dataset, token_meta, f"token cache {tp.name} ({n_take} spectra)"
+
+    # ── Faithful reconstruction of the trained test split ──
+    if not (line_embedding_config and libs_data_config):
+        raise ValueError(
+            "run_info is missing line_embedding_config / libs_data_config; "
+            "pass --tokens_path to analyze a token cache directly instead."
+        )
+    data = generate_labeled_data(config, seed=seed, libs_config_path=libs_data_config)
+    ds = data["libs_dataset"]
+    token_meta = prepare_line_tokens_assets(
+        ds.spectra.astype(np.float32),
+        ds.wavelength,
+        line_embedding_config,
+        spectra_cache_key=ds.cache_key,
+        verbose=True,
+    )
+    tokens_path = token_meta["line_tokens_path"]
+    config["data"]["n_bins"] = token_meta["n_lines"]
+    config["model"]["max_seq_len"] = token_meta["n_lines"] + 1
+
+    test_indices = np.asarray(data["splits"]["test"], dtype=np.int64)
+    _, test_labels, test_conc = data["test"]
+    rng = np.random.default_rng(seed)
+    if args.max_samples < len(test_indices):
+        pick = np.sort(rng.choice(len(test_indices), size=args.max_samples, replace=False))
+        test_indices = test_indices[pick]
+        test_labels = test_labels[pick]
+        test_conc = test_conc[pick]
+
+    dataset = LineTokensLabeledDataset(
+        tokens_path, test_labels, concentrations=test_conc, indices=test_indices,
+    )
+    return dataset, token_meta, f"reconstructed test split ({len(test_indices)} spectra)"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Attention extraction (bounded memory)
+# ────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def cls_attention_per_layer(encoder: LIBSTransformer, inputs: dict):
+    """Run the encoder block loop manually, keeping only the CLS attention row.
+
+    Returns:
+        cls_rows: list of [B, S] head-averaged CLS->position attention per layer
+        kpm: [B, S] key_padding_mask (True = ignore) or None
+    """
+    emb_type = encoder.embedding_type
+    if emb_type == "line_token_linear":
+        hidden, kpm = encoder.embedding(inputs["tokens"], fit_valid=inputs.get("fit_valid"))
+    elif emb_type == "line_token":
+        hidden, kpm = encoder.embedding(inputs["line_features"])
+    else:
+        hidden = encoder.embedding(inputs["spectrum"], mask=None)
+        kpm = None
+
+    cls_rows = []
+    for block in encoder.encoder_blocks:
+        hidden, attn = block(hidden, key_padding_mask=kpm, need_weights=True)
+        # attn: [B, n_heads, S, S]; take CLS query row (index 0), average heads.
+        cls_rows.append(attn[:, :, 0, :].mean(dim=1).detach())
+        del attn
+    return cls_rows, kpm
+
+
+def _normalize_line_attention(cls_rows, kpm):
+    """Aggregate per-layer CLS rows to per-line attention.
+
+    Returns dict of [B, n_lines] tensors for 'layer_mean' and 'last_layer',
+    each masked to valid lines and renormalized to sum to 1 per spectrum.
+    """
+    stack = torch.stack(cls_rows, dim=0)        # [L, B, S]
+    layer_mean = stack.mean(dim=0)              # [B, S]
+    last_layer = cls_rows[-1]                   # [B, S]
+
+    def _lines(a):
+        lines = a[:, 1:]                        # drop CLS column -> [B, n_lines]
+        if kpm is not None:
+            valid = (~kpm[:, 1:]).to(lines.dtype)
+            lines = lines * valid
+        denom = lines.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        return lines / denom
+
+    return {"layer_mean": _lines(layer_mean), "last_layer": _lines(last_layer)}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Main analysis
+# ────────────────────────────────────────────────────────────────────────────
+
+def run_analysis(encoder, dataset, token_meta, config, run_info, args, output_dir: Path):
+    device = args.device
+    encoder = encoder.to(device).eval()
+    emb_type = encoder.embedding_type
+
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
+    )
+
+    n_lines = int(token_meta["n_lines"])
+    central_wavelength = np.asarray(token_meta["central_wavelength"], dtype=np.float32)
+
+    # Per-channel pieces (line_token_linear only).
+    do_channels = emb_type == "line_token_linear"
+    if do_channels:
+        feature_mean = encoder.embedding.feature_mean.to(device)
+        feature_std = encoder.embedding.feature_std.to(device)
+        W = encoder.embedding.projection.weight.detach()      # [d_model, n_features]
+        col_norm = W.norm(dim=0).cpu().numpy()                # [n_features]
+        n_features = W.shape[1]
+        chan_importance = np.zeros(n_features, dtype=np.float64)
+        chan_absz_sum = np.zeros(n_features, dtype=np.float64)
+        chan_valid_count = 0.0
+
+    line_importance = np.zeros(n_lines, dtype=np.float64)
+    line_importance_last = np.zeros(n_lines, dtype=np.float64)
+    atomic_numbers = None
+    n_seen = 0
+
+    print(f"\nRunning attention pass on {len(dataset)} spectra "
+          f"(batch_size={args.batch_size}, device={device})...")
+    for bi, batch in enumerate(loader):
+        inputs = {}
+        if emb_type == "line_token_linear":
+            inputs["tokens"] = batch["tokens"].to(device)
+            if "fit_valid" in batch:
+                inputs["fit_valid"] = batch["fit_valid"].to(device)
+        elif emb_type == "line_token":
+            inputs["line_features"] = batch["line_features"].to(device)
+        else:
+            inputs["spectrum"] = batch["spectrum"].to(device)
+
+        cls_rows, kpm = cls_attention_per_layer(encoder, inputs)
+        agg = _normalize_line_attention(cls_rows, kpm)
+        a_mean = agg["layer_mean"]              # [B, n_lines]
+        a_last = agg["last_layer"]
+
+        line_importance += a_mean.sum(dim=0).cpu().numpy()
+        line_importance_last += a_last.sum(dim=0).cpu().numpy()
+
+        if do_channels:
+            tokens = inputs["tokens"]
+            z = (tokens - feature_mean) / feature_std        # [B, n_lines, F]
+            absz = z.abs()
+            # I_c contribution = sum_lines a_i * |z_i,c|, weighted by col_norm later.
+            contrib = torch.einsum("bn,bnc->bc", a_mean, absz)   # [B, F]
+            chan_importance += contrib.sum(dim=0).cpu().numpy()
+            # mean|z| diagnostic over valid lines only.
+            if kpm is not None:
+                valid = (~kpm[:, 1:]).unsqueeze(-1).to(absz.dtype)
+                chan_absz_sum += (absz * valid).sum(dim=(0, 1)).cpu().numpy()
+                chan_valid_count += float(valid.sum().item())
+            else:
+                chan_absz_sum += absz.sum(dim=(0, 1)).cpu().numpy()
+                chan_valid_count += float(absz.shape[0] * absz.shape[1])
+
+        if atomic_numbers is None:
+            # Atomic number is a static per-line dictionary value (channel F_Z).
+            tok0 = batch["tokens"] if "tokens" in batch else None
+            if tok0 is not None:
+                atomic_numbers = np.rint(tok0[0, :, F_Z].cpu().numpy()).astype(int)
+
+        n_seen += a_mean.shape[0]
+        if (bi + 1) % 20 == 0:
+            print(f"  processed {n_seen}/{len(dataset)} spectra")
+
+    line_importance /= max(n_seen, 1)
+    line_importance_last /= max(n_seen, 1)
+    if do_channels:
+        chan_importance = (chan_importance / max(n_seen, 1)) * col_norm
+        mean_absz = chan_absz_sum / max(chan_valid_count, 1.0)
+
+    # ── Per-line CSV ──
+    order = np.argsort(line_importance)[::-1]
+    per_line_csv = output_dir / "per_line_importance.csv"
+    with open(per_line_csv, "w") as f:
+        f.write("rank,line_index,central_wavelength_nm,atomic_number,element,"
+                "importance_layer_mean,importance_last_layer\n")
+        for rank, idx in enumerate(order):
+            z = int(atomic_numbers[idx]) if atomic_numbers is not None else -1
+            sym = _z_to_symbol(z) if z >= 0 else "?"
+            wl = float(central_wavelength[idx]) if idx < len(central_wavelength) else float("nan")
+            f.write(f"{rank},{idx},{wl:.4f},{z},{sym},"
+                    f"{line_importance[idx]:.8e},{line_importance_last[idx]:.8e}\n")
+    print(f"Saved: {per_line_csv}")
+
+    # ── Per-element grouping ──
+    element_importance = {}
+    if atomic_numbers is not None:
+        for idx in range(n_lines):
+            sym = _z_to_symbol(int(atomic_numbers[idx]))
+            element_importance[sym] = element_importance.get(sym, 0.0) + float(line_importance[idx])
+        elem_sorted = sorted(element_importance.items(), key=lambda kv: kv[1], reverse=True)
+        per_elem_csv = output_dir / "per_element_importance.csv"
+        with open(per_elem_csv, "w") as f:
+            f.write("element,summed_importance,n_lines\n")
+            counts = {}
+            for idx in range(n_lines):
+                sym = _z_to_symbol(int(atomic_numbers[idx]))
+                counts[sym] = counts.get(sym, 0) + 1
+            for sym, val in elem_sorted:
+                f.write(f"{sym},{val:.8e},{counts.get(sym, 0)}\n")
+        print(f"Saved: {per_elem_csv}")
+    else:
+        elem_sorted = []
+
+    # ── Per-channel CSV ──
+    if do_channels:
+        feature_names = list(token_meta.get("feature_names", FEATURE_NAMES))
+        chan_norm = chan_importance / max(chan_importance.sum(), 1e-12)
+        chan_order = np.argsort(chan_importance)[::-1]
+        per_chan_csv = output_dir / "per_channel_importance.csv"
+        with open(per_chan_csv, "w") as f:
+            f.write("rank,channel_index,channel_name,importance,importance_fraction,"
+                    "projection_col_norm,mean_abs_zscore\n")
+            for rank, c in enumerate(chan_order):
+                name = feature_names[c] if c < len(feature_names) else f"feat_{c}"
+                f.write(f"{rank},{c},{name},{chan_importance[c]:.8e},{chan_norm[c]:.6f},"
+                        f"{col_norm[c]:.6f},{mean_absz[c]:.6f}\n")
+        print(f"Saved: {per_chan_csv}")
+
+    # ── Plots ──
+    _plot_line_vs_wavelength(central_wavelength, line_importance, atomic_numbers, output_dir)
+    if elem_sorted:
+        _plot_per_element(elem_sorted, output_dir)
+    if do_channels:
+        _plot_per_channel(
+            [token_meta.get("feature_names", FEATURE_NAMES)[c] for c in chan_order],
+            chan_importance[chan_order], output_dir,
+        )
+
+    # ── Summary ──
+    _write_summary(
+        output_dir, run_info, config, args, n_seen, order, line_importance,
+        central_wavelength, atomic_numbers, elem_sorted,
+        chan_order if do_channels else None,
+        chan_importance if do_channels else None,
+        token_meta.get("feature_names", FEATURE_NAMES) if do_channels else None,
+        emb_type,
+    )
+
+
+def _plot_line_vs_wavelength(wavelength, importance, atomic_numbers, output_dir, top_k=15):
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(wavelength, importance, lw=0.6, color="steelblue", alpha=0.8)
+    top = np.argsort(importance)[::-1][:top_k]
+    ax.scatter(wavelength[top], importance[top], color="crimson", s=20, zorder=5)
+    for idx in top:
+        sym = _z_to_symbol(int(atomic_numbers[idx])) if atomic_numbers is not None else ""
+        ax.annotate(f"{sym} {wavelength[idx]:.1f}", (wavelength[idx], importance[idx]),
+                    textcoords="offset points", xytext=(0, 6), fontsize=7, rotation=45,
+                    ha="left")
+    ax.set_xlabel("Central wavelength (nm)")
+    ax.set_ylabel("Mean CLS attention importance")
+    ax.set_title("Per-line attention importance vs wavelength (top lines annotated)")
+    fig.tight_layout()
+    fig.savefig(output_dir / "per_line_importance_vs_wavelength.png", dpi=150)
+    plt.close(fig)
+    print("Saved: per_line_importance_vs_wavelength.png")
+
+
+def _plot_per_element(elem_sorted, output_dir, top_k=25):
+    items = elem_sorted[:top_k]
+    names = [k for k, _ in items]
+    vals = [v for _, v in items]
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(range(len(names)), vals, color="seagreen", edgecolor="black")
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=45, ha="right")
+    ax.set_ylabel("Summed attention importance")
+    ax.set_title(f"Attention importance grouped by element (top {len(names)})")
+    fig.tight_layout()
+    fig.savefig(output_dir / "per_element_importance.png", dpi=150)
+    plt.close(fig)
+    print("Saved: per_element_importance.png")
+
+
+def _plot_per_channel(names, vals, output_dir):
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.bar(range(len(names)), vals, color="indigo", edgecolor="black")
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=45, ha="right")
+    ax.set_ylabel("Attention-weighted importance")
+    ax.set_title("Per-channel (token feature) importance")
+    fig.tight_layout()
+    fig.savefig(output_dir / "per_channel_importance.png", dpi=150)
+    plt.close(fig)
+    print("Saved: per_channel_importance.png")
+
+
+def _write_summary(output_dir, run_info, config, args, n_seen, order, line_importance,
+                   wavelength, atomic_numbers, elem_sorted, chan_order, chan_importance,
+                   feature_names, emb_type):
+    path = output_dir / "importance_summary.txt"
+    with open(path, "w") as f:
+        f.write("Attention-based input importance\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Run: {run_info.get('run_name', '?')}\n")
+        f.write(f"Task: {run_info.get('task', '?')}    Pool: {run_info.get('pool', '?')}\n")
+        f.write(f"Embedding: {emb_type}\n")
+        f.write(f"Spectra analyzed: {n_seen}\n\n")
+
+        f.write("Top 20 lines (by mean CLS attention):\n")
+        f.write("-" * 50 + "\n")
+        for rank, idx in enumerate(order[:20]):
+            z = int(atomic_numbers[idx]) if atomic_numbers is not None else -1
+            sym = _z_to_symbol(z) if z >= 0 else "?"
+            wl = float(wavelength[idx]) if idx < len(wavelength) else float("nan")
+            f.write(f"  {rank + 1:2d}. {sym:>3s} {wl:8.2f} nm   "
+                    f"importance={line_importance[idx]:.4e}\n")
+
+        if elem_sorted:
+            f.write("\nTop 15 elements (summed line importance):\n")
+            f.write("-" * 50 + "\n")
+            for sym, val in elem_sorted[:15]:
+                f.write(f"  {sym:>3s}   {val:.4e}\n")
+
+        if chan_order is not None:
+            f.write("\nPer-channel importance (all 14 token features):\n")
+            f.write("-" * 50 + "\n")
+            total = max(chan_importance.sum(), 1e-12)
+            for c in chan_order:
+                name = feature_names[c] if c < len(feature_names) else f"feat_{c}"
+                f.write(f"  {name:>28s}   {chan_importance[c]:.4e}   "
+                        f"({100 * chan_importance[c] / total:5.1f}%)\n")
+
+        f.write("\n" + "=" * 50 + "\n")
+        f.write("Caveats:\n")
+        f.write("- Attention reflects the SHARED CLS representation, not a\n")
+        f.write("  per-output-element attribution (the binned head's per-element\n")
+        f.write("  branches all read the same pooled vector). Per-target-element\n")
+        f.write("  attribution would require a gradient-based method.\n")
+        f.write("- Per-channel importance is attention-informed but relies on the\n")
+        f.write("  linear embedding projection; it is only produced for\n")
+        f.write("  line_token_linear runs. intensity (bin) runs get per-bin only.\n")
+    print(f"Saved: {path}")
+
+
+def main(args):
+    run_mgr = RunManager.from_existing_run(args.run_dir)
+    config_path = run_mgr.run_dir / "config.yaml"
+    run_info_path = run_mgr.run_dir / "run_info.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"config.yaml not found in {run_mgr.run_dir}")
+    config = load_config(str(config_path))
+    run_info = load_config(str(run_info_path)) if run_info_path.is_file() else {}
+
+    checkpoint_path = run_mgr.get_checkpoint_for_mode("finetune")
+    if checkpoint_path is None:
+        raise ValueError(f"No checkpoint found in {run_mgr.checkpoint_dir}")
+    print(f"Run: {run_mgr.run_name}")
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"Embedding: {run_info.get('embedding_type', config['model'].get('embedding_type'))}")
+
+    dataset, token_meta, source = prepare_data(config, run_info, args)
+    print(f"Data source: {source}")
+
+    encoder = build_encoder(config, run_info, token_meta)
+    encoder_state = _checkpoint_encoder_state(str(checkpoint_path))
+    _load_weights_shape_safe(encoder, encoder_state)
+
+    ts = datetime.now().strftime("attention_importance_%Y-%m-%d_%H-%M-%S")
+    output_dir = run_mgr.get_evaluation_dir(ts)
+    print(f"Output: {output_dir}")
+
+    run_analysis(encoder, dataset, token_meta, config, run_info, args, output_dir)
+
+    print("\n" + "=" * 60)
+    print(f"Attention importance analysis complete: {output_dir}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Attention-based input importance for fine-tuned LIBS models",
+    )
+    parser.add_argument("--run_dir", type=str, required=True,
+                        help="Fine-tuned run directory (contains checkpoints/, config.yaml)")
+    parser.add_argument("--tokens_path", type=str, default=None,
+                        help="Analyze spectra straight from this line_tokens_*.h5 cache "
+                             "(lightweight; skips dataset rebuild and the test split).")
+    parser.add_argument("--use_token_cache", action="store_true",
+                        help="Use run_info.line_tokens_path directly instead of rebuilding "
+                             "the labeled dataset / test split.")
+    parser.add_argument("--max_samples", type=int, default=256,
+                        help="Number of test spectra to aggregate attention over.")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size for the attention pass (keep small; attention "
+                             "matrices are O(seq_len^2)).")
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
+
+    args = parser.parse_args()
+    main(args)
