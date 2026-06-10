@@ -15,6 +15,19 @@ collecting CLS-token attention, and reports:
      attention-informed: it combines the CLS attention placed on each line with
      the z-scored feature magnitude and the projection column norm.
 
+  3. Mutual line-line relationships from token self-attention — which lines
+     exchange information with which other lines. Two views:
+       a) top-K x top-K line-pair attention matrix (top lines by CLS
+          importance), head- and layer-averaged, plus the same matrix for
+          each attention head separately (layer-averaged);
+       b) element-to-element attention matrix: average attention a line of
+          element A pays to the lines of element B, aggregated over all lines.
+     High off-diagonal weight between lines of the SAME element suggests the
+     model cross-references multiple lines of one species (consistency /
+     robustness to single-line distortion); weight between DIFFERENT elements
+     points to learned co-occurrence in the sample matrix or to spectral
+     proximity / interference between those lines.
+
 Scope / caveats (also written to the summary file):
   - Attention reflects the *shared* CLS representation. The binned head's
     per-element branches all read the same pooled vector, so attention is not a
@@ -263,6 +276,143 @@ def _normalize_line_attention(cls_rows, kpm):
     return {"layer_mean": _lines(layer_mean), "last_layer": _lines(last_layer)}
 
 
+def _drop_zero_valid_spectra(batch):
+    """Drop spectra whose Voigt fits all failed (fit_valid all zero).
+
+    For such spectra the embedding masks every attention key (the CLS key is
+    masked unconditionally by `LinearLineTokenEmbedding`), so the softmax over
+    an all-masked row returns NaN and would poison the running importance sums.
+
+    Returns (filtered_batch_or_None, n_dropped).
+    """
+    if "fit_valid" not in batch:
+        return batch, 0
+    keep = batch["fit_valid"].sum(dim=1) > 0
+    n_dropped = int((~keep).sum().item())
+    if n_dropped == 0:
+        return batch, 0
+    if not keep.any():
+        return None, n_dropped
+    return {k: v[keep] for k, v in batch.items()}, n_dropped
+
+
+def _build_inputs(batch, emb_type, device):
+    inputs = {}
+    if emb_type == "line_token_linear":
+        inputs["tokens"] = batch["tokens"].to(device)
+        if "fit_valid" in batch:
+            inputs["fit_valid"] = batch["fit_valid"].to(device)
+    elif emb_type == "line_token":
+        inputs["line_features"] = batch["line_features"].to(device)
+    else:
+        inputs["spectrum"] = batch["spectrum"].to(device)
+    return inputs
+
+
+@torch.no_grad()
+def mutual_attention_pass(encoder, loader, top_idx, atomic_numbers, args):
+    """Second pass: line-to-line self-attention relationships.
+
+    Collects, layer-averaged over `args.pair_samples` spectra:
+      * pair_heads [H, K, K]: attention among the top-K lines per attention
+        head (queries = rows, keys = columns). Values are raw attention
+        weights (each full row over all sequence positions sums to 1, so
+        sub-matrix rows do not).
+      * pair_mean  [K, K]: the same matrix averaged over heads.
+      * elem_mean  [E, E]: mean attention a *valid* line of element A (query)
+        pays to all lines of element B (keys), aggregated over every line
+        (head-averaged).
+
+    Returns (pair_mean [K,K] np, pair_heads [H,K,K] np, elem_symbols list,
+    elem_mean [E,E] np).
+    """
+    device = args.device
+    emb_type = encoder.embedding_type
+    n_layers = len(encoder.encoder_blocks)
+    n_heads = encoder.encoder_blocks[0].self_attn.num_heads
+    top_idx_t = torch.as_tensor(np.ascontiguousarray(top_idx), dtype=torch.long, device=device)
+    K = len(top_idx)
+
+    pair_sum_heads = torch.zeros(n_heads, K, K, dtype=torch.float64)
+
+    # Element grouping (one-hot over atomic numbers present in the dictionary).
+    if atomic_numbers is not None:
+        uniq_z = np.unique(atomic_numbers)
+        z_to_col = {int(z): i for i, z in enumerate(uniq_z)}
+        n_elem = len(uniq_z)
+        G = torch.zeros(len(atomic_numbers), n_elem, device=device)
+        for i, z in enumerate(atomic_numbers):
+            G[i, z_to_col[int(z)]] = 1.0
+        elem_sum = torch.zeros(n_elem, n_elem, dtype=torch.float64)
+        elem_symbols = [_z_to_symbol(int(z)) for z in uniq_z]
+    else:
+        G = None
+        elem_sum = None
+        elem_symbols = []
+
+    n_seen = 0
+    n_skipped = 0
+    print(f"\nRunning mutual (line-line) attention pass on up to "
+          f"{args.pair_samples} spectra...")
+    for batch in loader:
+        if n_seen >= args.pair_samples:
+            break
+        batch, dropped = _drop_zero_valid_spectra(batch)
+        n_skipped += dropped
+        if batch is None:
+            continue
+        inputs = _build_inputs(batch, emb_type, device)
+
+        if emb_type == "line_token_linear":
+            hidden, kpm = encoder.embedding(inputs["tokens"], fit_valid=inputs.get("fit_valid"))
+        elif emb_type == "line_token":
+            hidden, kpm = encoder.embedding(inputs["line_features"])
+        else:
+            hidden = encoder.embedding(inputs["spectrum"], mask=None)
+            kpm = None
+
+        B = hidden.shape[0]
+        if kpm is not None:
+            valid = (~kpm[:, 1:]).float()                     # [B, L]
+        else:
+            valid = torch.ones(B, hidden.shape[1] - 1, device=device)
+
+        for block in encoder.encoder_blocks:
+            hidden, attn = block(hidden, key_padding_mask=kpm, need_weights=True)
+
+            # Per-head top-K submatrix (CLS at index 0 -> shift line indices).
+            sub = attn.index_select(2, top_idx_t + 1).index_select(3, top_idx_t + 1)
+            # Zero rows of invalid (padded) query lines; invalid keys are
+            # already ~0 from the softmax key_padding_mask.
+            valid_top = valid.index_select(1, top_idx_t)          # [B, K]
+            sub = sub * valid_top.unsqueeze(1).unsqueeze(-1)      # [B, H, K, K]
+            pair_sum_heads += sub.sum(dim=0).double().cpu()
+
+            # [B, H, S, S] -> head mean, drop CLS row/col -> [B, L, L]
+            A = attn.mean(dim=1)[:, 1:, 1:]
+            del attn
+            A = A * valid.unsqueeze(-1)
+
+            if G is not None:
+                T = torch.matmul(A, G)                        # [B, L, E] sum over keys in B
+                M = torch.einsum("la,ble->bae", G, T)         # [B, E, E] sum over queries in A
+                q_count = valid @ G                           # [B, E] valid queries per element
+                M = M / q_count.clamp(min=1.0).unsqueeze(-1)
+                elem_sum += M.sum(dim=0).double().cpu()
+            del A
+
+        n_seen += B
+
+    denom = max(n_seen, 1) * n_layers
+    pair_heads = (pair_sum_heads / denom).numpy()
+    pair_mean = pair_heads.mean(axis=0)
+    elem_mean = (elem_sum / denom).numpy() if elem_sum is not None else None
+    if n_skipped:
+        print(f"  skipped {n_skipped} spectra with zero valid lines")
+    print(f"  aggregated over {n_seen} spectra x {n_layers} layers x {n_heads} heads")
+    return pair_mean, pair_heads, elem_symbols, elem_mean
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Main analysis
 # ────────────────────────────────────────────────────────────────────────────
@@ -295,20 +445,23 @@ def run_analysis(encoder, dataset, token_meta, config, run_info, args, output_di
     line_importance_last = np.zeros(n_lines, dtype=np.float64)
     atomic_numbers = None
     n_seen = 0
+    n_skipped = 0
 
     print(f"\nRunning attention pass on {len(dataset)} spectra "
           f"(batch_size={args.batch_size}, device={device})...")
     for bi, batch in enumerate(loader):
-        inputs = {}
-        if emb_type == "line_token_linear":
-            inputs["tokens"] = batch["tokens"].to(device)
-            if "fit_valid" in batch:
-                inputs["fit_valid"] = batch["fit_valid"].to(device)
-        elif emb_type == "line_token":
-            inputs["line_features"] = batch["line_features"].to(device)
-        else:
-            inputs["spectrum"] = batch["spectrum"].to(device)
+        if atomic_numbers is None and "tokens" in batch:
+            # Atomic number is a static per-line dictionary value (channel F_Z);
+            # grab it before any filtering so it is set even if the first batch
+            # is dropped entirely.
+            atomic_numbers = np.rint(batch["tokens"][0, :, F_Z].cpu().numpy()).astype(int)
 
+        batch, dropped = _drop_zero_valid_spectra(batch)
+        n_skipped += dropped
+        if batch is None:
+            continue
+
+        inputs = _build_inputs(batch, emb_type, device)
         cls_rows, kpm = cls_attention_per_layer(encoder, inputs)
         agg = _normalize_line_attention(cls_rows, kpm)
         a_mean = agg["layer_mean"]              # [B, n_lines]
@@ -333,16 +486,13 @@ def run_analysis(encoder, dataset, token_meta, config, run_info, args, output_di
                 chan_absz_sum += absz.sum(dim=(0, 1)).cpu().numpy()
                 chan_valid_count += float(absz.shape[0] * absz.shape[1])
 
-        if atomic_numbers is None:
-            # Atomic number is a static per-line dictionary value (channel F_Z).
-            tok0 = batch["tokens"] if "tokens" in batch else None
-            if tok0 is not None:
-                atomic_numbers = np.rint(tok0[0, :, F_Z].cpu().numpy()).astype(int)
-
         n_seen += a_mean.shape[0]
         if (bi + 1) % 20 == 0:
             print(f"  processed {n_seen}/{len(dataset)} spectra")
 
+    if n_skipped:
+        print(f"  skipped {n_skipped} spectra with zero valid lines "
+              f"(all Voigt fits failed; attention would be NaN)")
     line_importance /= max(n_seen, 1)
     line_importance_last /= max(n_seen, 1)
     if do_channels:
@@ -398,6 +548,78 @@ def run_analysis(encoder, dataset, token_meta, config, run_info, args, output_di
                         f"{col_norm[c]:.6f},{mean_absz[c]:.6f}\n")
         print(f"Saved: {per_chan_csv}")
 
+    # ── Mutual line-line attention (second pass over the same loader) ──
+    pair_data = None
+    if not args.skip_pairs:
+        top_idx = order[: min(args.pair_top_k, n_lines)].copy()
+        pair_mean, pair_heads, elem_symbols, elem_mean = mutual_attention_pass(
+            encoder, loader, top_idx, atomic_numbers, args,
+        )
+        pair_labels = []
+        for idx in top_idx:
+            sym = _z_to_symbol(int(atomic_numbers[idx])) if atomic_numbers is not None else "?"
+            pair_labels.append(f"{sym} {float(central_wavelength[idx]):.1f}")
+        pair_data = {
+            "top_idx": top_idx,
+            "pair_mean": pair_mean,
+            "pair_heads": pair_heads,
+            "pair_labels": pair_labels,
+            "elem_symbols": elem_symbols,
+            "elem_mean": elem_mean,
+        }
+
+        # line-pair CSV (directional, self-attention diagonal excluded)
+        pair_csv = output_dir / "line_pair_attention.csv"
+        K = len(top_idx)
+        pairs = [
+            (pair_mean[i, j], i, j)
+            for i in range(K) for j in range(K) if i != j
+        ]
+        pairs.sort(reverse=True)
+        with open(pair_csv, "w") as f:
+            f.write("rank,query_line_index,query_element,query_wavelength_nm,"
+                    "key_line_index,key_element,key_wavelength_nm,attention\n")
+            for rank, (val, i, j) in enumerate(pairs):
+                qi, kj = int(top_idx[i]), int(top_idx[j])
+                qz = int(atomic_numbers[qi]) if atomic_numbers is not None else -1
+                kz = int(atomic_numbers[kj]) if atomic_numbers is not None else -1
+                f.write(f"{rank},{qi},{_z_to_symbol(qz) if qz >= 0 else '?'},"
+                        f"{float(central_wavelength[qi]):.4f},"
+                        f"{kj},{_z_to_symbol(kz) if kz >= 0 else '?'},"
+                        f"{float(central_wavelength[kj]):.4f},{val:.8e}\n")
+        print(f"Saved: {pair_csv}")
+
+        # per-head line-pair CSV (directional, self-attention diagonal excluded)
+        pair_heads_csv = output_dir / "line_pair_attention_per_head.csv"
+        with open(pair_heads_csv, "w") as f:
+            f.write("head,rank,query_line_index,query_element,query_wavelength_nm,"
+                    "key_line_index,key_element,key_wavelength_nm,attention\n")
+            for h in range(pair_heads.shape[0]):
+                h_pairs = [
+                    (pair_heads[h, i, j], i, j)
+                    for i in range(K) for j in range(K) if i != j
+                ]
+                h_pairs.sort(reverse=True)
+                for rank, (val, i, j) in enumerate(h_pairs):
+                    qi, kj = int(top_idx[i]), int(top_idx[j])
+                    qz = int(atomic_numbers[qi]) if atomic_numbers is not None else -1
+                    kz = int(atomic_numbers[kj]) if atomic_numbers is not None else -1
+                    f.write(f"{h},{rank},{qi},{_z_to_symbol(qz) if qz >= 0 else '?'},"
+                            f"{float(central_wavelength[qi]):.4f},"
+                            f"{kj},{_z_to_symbol(kz) if kz >= 0 else '?'},"
+                            f"{float(central_wavelength[kj]):.4f},{val:.8e}\n")
+        print(f"Saved: {pair_heads_csv}")
+
+        # element-element matrix CSV
+        if elem_mean is not None:
+            elem_csv = output_dir / "element_attention_matrix.csv"
+            with open(elem_csv, "w") as f:
+                f.write("query_element," + ",".join(elem_symbols) + "\n")
+                for a, sym in enumerate(elem_symbols):
+                    f.write(sym + "," + ",".join(f"{elem_mean[a, b]:.8e}"
+                                                 for b in range(len(elem_symbols))) + "\n")
+            print(f"Saved: {elem_csv}")
+
     # ── Plots ──
     _plot_line_vs_wavelength(central_wavelength, line_importance, atomic_numbers, output_dir)
     if elem_sorted:
@@ -407,6 +629,12 @@ def run_analysis(encoder, dataset, token_meta, config, run_info, args, output_di
             [token_meta.get("feature_names", FEATURE_NAMES)[c] for c in chan_order],
             chan_importance[chan_order], output_dir,
         )
+    if pair_data is not None:
+        _plot_pair_heatmap(pair_data["pair_labels"], pair_data["pair_mean"], output_dir)
+        _plot_pair_heads(pair_data["pair_labels"], pair_data["pair_heads"], output_dir)
+        if pair_data["elem_mean"] is not None:
+            _plot_element_attention(pair_data["elem_symbols"], pair_data["elem_mean"],
+                                    output_dir)
 
     # ── Summary ──
     _write_summary(
@@ -416,6 +644,7 @@ def run_analysis(encoder, dataset, token_meta, config, run_info, args, output_di
         chan_importance if do_channels else None,
         token_meta.get("feature_names", FEATURE_NAMES) if do_channels else None,
         emb_type,
+        pair_data=pair_data,
     )
 
 
@@ -467,9 +696,89 @@ def _plot_per_channel(names, vals, output_dir):
     print("Saved: per_channel_importance.png")
 
 
+def _plot_pair_heatmap(labels, matrix, output_dir):
+    K = len(labels)
+    fig, ax = plt.subplots(figsize=(max(8, 0.28 * K + 3), max(7, 0.28 * K + 2)))
+    im = ax.imshow(matrix, cmap="viridis", aspect="equal")
+    ax.set_xticks(range(K))
+    ax.set_xticklabels(labels, rotation=90, fontsize=6)
+    ax.set_yticks(range(K))
+    ax.set_yticklabels(labels, fontsize=6)
+    ax.set_xlabel("Key line (attended to)")
+    ax.set_ylabel("Query line (attending)")
+    ax.set_title("Line-line self-attention among top lines\n"
+                 "(head- and layer-averaged; rows = queries)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="attention weight")
+    fig.tight_layout()
+    fig.savefig(output_dir / "line_pair_attention_heatmap.png", dpi=150)
+    plt.close(fig)
+    print("Saved: line_pair_attention_heatmap.png")
+
+
+def _plot_pair_heads(labels, pair_heads, output_dir):
+    """Grid of per-head line-line attention heatmaps (shared color scale)."""
+    H, K, _ = pair_heads.shape
+    ncols = min(4, H)
+    nrows = (H + ncols - 1) // ncols
+    panel = max(3.2, 0.11 * K + 1.5)
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(panel * ncols + 1.5, panel * nrows + 1),
+                             squeeze=False)
+    vmin = float(pair_heads.min())
+    vmax = float(pair_heads.max())
+    im = None
+    for h in range(nrows * ncols):
+        ax = axes[h // ncols][h % ncols]
+        if h >= H:
+            ax.axis("off")
+            continue
+        im = ax.imshow(pair_heads[h], cmap="viridis", aspect="equal",
+                       vmin=vmin, vmax=vmax)
+        ax.set_title(f"head {h}", fontsize=9)
+        ax.set_xticks(range(K))
+        ax.set_yticks(range(K))
+        if h % ncols == 0:
+            ax.set_yticklabels(labels, fontsize=4)
+        else:
+            ax.set_yticklabels([])
+        if h // ncols == nrows - 1 or h + ncols >= H:
+            ax.set_xticklabels(labels, rotation=90, fontsize=4)
+        else:
+            ax.set_xticklabels([])
+    fig.suptitle("Line-line self-attention per head\n"
+                 "(layer-averaged; rows = queries, columns = keys; shared color scale)",
+                 fontsize=11)
+    fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02, label="attention weight")
+    fig.savefig(output_dir / "line_pair_attention_per_head.png", dpi=150,
+                bbox_inches="tight")
+    plt.close(fig)
+    print("Saved: line_pair_attention_per_head.png")
+
+
+def _plot_element_attention(elem_symbols, matrix, output_dir):
+    E = len(elem_symbols)
+    fig, ax = plt.subplots(figsize=(max(9, 0.25 * E + 3), max(8, 0.25 * E + 2)))
+    # Log color scale: element-pair attention spans orders of magnitude.
+    vals = np.maximum(matrix, 1e-12)
+    im = ax.imshow(np.log10(vals), cmap="magma", aspect="equal")
+    ax.set_xticks(range(E))
+    ax.set_xticklabels(elem_symbols, rotation=90, fontsize=7)
+    ax.set_yticks(range(E))
+    ax.set_yticklabels(elem_symbols, fontsize=7)
+    ax.set_xlabel("Key element (lines attended to)")
+    ax.set_ylabel("Query element (lines attending)")
+    ax.set_title("Element-to-element self-attention\n"
+                 "(mean attention per query line, log10 scale)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="log10(mean attention)")
+    fig.tight_layout()
+    fig.savefig(output_dir / "element_attention_heatmap.png", dpi=150)
+    plt.close(fig)
+    print("Saved: element_attention_heatmap.png")
+
+
 def _write_summary(output_dir, run_info, config, args, n_seen, order, line_importance,
                    wavelength, atomic_numbers, elem_sorted, chan_order, chan_importance,
-                   feature_names, emb_type):
+                   feature_names, emb_type, pair_data=None):
     path = output_dir / "importance_summary.txt"
     with open(path, "w") as f:
         f.write("Attention-based input importance\n")
@@ -502,6 +811,93 @@ def _write_summary(output_dir, run_info, config, args, n_seen, order, line_impor
                 name = feature_names[c] if c < len(feature_names) else f"feat_{c}"
                 f.write(f"  {name:>28s}   {chan_importance[c]:.4e}   "
                         f"({100 * chan_importance[c] / total:5.1f}%)\n")
+
+        if pair_data is not None:
+            pair_mean = pair_data["pair_mean"]
+            top_idx = pair_data["top_idx"]
+            K = len(top_idx)
+
+            f.write("\nMutual line-line relationships (token self-attention):\n")
+            f.write("-" * 50 + "\n")
+            f.write("Attention weight q->k measures how strongly the representation\n")
+            f.write("of line q pulls information from line k when the encoder builds\n")
+            f.write("its contextual embedding (head- and layer-averaged, directional).\n\n")
+
+            pairs = [
+                (float(pair_mean[i, j]), i, j)
+                for i in range(K) for j in range(K) if i != j
+            ]
+            pairs.sort(reverse=True)
+            f.write(f"Top 15 line pairs among the {K} most important lines:\n")
+            for rank, (val, i, j) in enumerate(pairs[:15]):
+                qi, kj = int(top_idx[i]), int(top_idx[j])
+                qz = int(atomic_numbers[qi]) if atomic_numbers is not None else -1
+                kz = int(atomic_numbers[kj]) if atomic_numbers is not None else -1
+                qs = _z_to_symbol(qz) if qz >= 0 else "?"
+                ks = _z_to_symbol(kz) if kz >= 0 else "?"
+                same = "same element" if (qz == kz and qz >= 0) else "cross-element"
+                f.write(f"  {rank + 1:2d}. {qs:>3s} {float(wavelength[qi]):8.2f} nm "
+                        f"-> {ks:>3s} {float(wavelength[kj]):8.2f} nm   "
+                        f"attn={val:.4e}   ({same})\n")
+
+            pair_heads = pair_data.get("pair_heads")
+            if pair_heads is not None:
+                f.write("\nPer-head specialization (top 3 line pairs per head, "
+                        "layer-averaged):\n")
+                for h in range(pair_heads.shape[0]):
+                    h_pairs = [
+                        (float(pair_heads[h, i, j]), i, j)
+                        for i in range(K) for j in range(K) if i != j
+                    ]
+                    h_pairs.sort(reverse=True)
+                    f.write(f"  head {h}:\n")
+                    for val, i, j in h_pairs[:3]:
+                        qi, kj = int(top_idx[i]), int(top_idx[j])
+                        qz = int(atomic_numbers[qi]) if atomic_numbers is not None else -1
+                        kz = int(atomic_numbers[kj]) if atomic_numbers is not None else -1
+                        qs = _z_to_symbol(qz) if qz >= 0 else "?"
+                        ks = _z_to_symbol(kz) if kz >= 0 else "?"
+                        f.write(f"    {qs:>3s} {float(wavelength[qi]):8.2f} nm -> "
+                                f"{ks:>3s} {float(wavelength[kj]):8.2f} nm   "
+                                f"attn={val:.4e}\n")
+
+            elem_mean = pair_data.get("elem_mean")
+            elem_symbols = pair_data.get("elem_symbols", [])
+            if elem_mean is not None and len(elem_symbols) > 0:
+                E = len(elem_symbols)
+                # Strongest off-diagonal element couplings.
+                elem_pairs = [
+                    (float(elem_mean[a, b]), a, b)
+                    for a in range(E) for b in range(E) if a != b
+                ]
+                elem_pairs.sort(reverse=True)
+                f.write("\nTop 10 element-to-element couplings "
+                        "(mean attention per query line, off-diagonal):\n")
+                for rank, (val, a, b) in enumerate(elem_pairs[:10]):
+                    f.write(f"  {rank + 1:2d}. {elem_symbols[a]:>3s} -> "
+                            f"{elem_symbols[b]:>3s}   attn={val:.4e}\n")
+                diag = np.array([elem_mean[a, a] for a in range(E)])
+                top_self = np.argsort(diag)[::-1][:5]
+                f.write("\nStrongest within-element attention (diagonal):\n")
+                for a in top_self:
+                    f.write(f"  {elem_symbols[a]:>3s} -> {elem_symbols[a]:>3s}   "
+                            f"attn={diag[a]:.4e}\n")
+
+            f.write("\nHow to read these relationships:\n")
+            f.write("- SAME-element pairs / large diagonal entries: the model\n")
+            f.write("  cross-references several emission lines of one species. This is\n")
+            f.write("  the expected physics-consistent behaviour (multiple lines of an\n")
+            f.write("  element carry redundant concentration information, making the\n")
+            f.write("  representation robust to noise or distortion of a single line,\n")
+            f.write("  e.g. self-absorption of strong resonance lines).\n")
+            f.write("- CROSS-element pairs: either (a) learned composition correlations\n")
+            f.write("  in the sample matrix (elements that co-occur, e.g. alloying\n")
+            f.write("  partners), or (b) spectral proximity / interference - check the\n")
+            f.write("  wavelengths: pairs within a few nm likely disambiguate\n")
+            f.write("  overlapping lines rather than encode chemistry.\n")
+            f.write("- Values are raw softmax weights: each query row sums to 1 over\n")
+            f.write("  ALL sequence positions, so sub-matrix rows do not sum to 1 and\n")
+            f.write("  magnitudes shrink as the number of lines grows.\n")
 
         f.write("\n" + "=" * 50 + "\n")
         f.write("Caveats:\n")
@@ -569,6 +965,14 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--pair_top_k", type=int, default=40,
+                        help="Number of top lines (by CLS importance) for the "
+                             "line-line mutual attention matrix.")
+    parser.add_argument("--pair_samples", type=int, default=64,
+                        help="Number of spectra to aggregate for the mutual "
+                             "(line-line) attention pass.")
+    parser.add_argument("--skip_pairs", action="store_true",
+                        help="Skip the mutual line-line attention analysis.")
 
     args = parser.parse_args()
     main(args)
