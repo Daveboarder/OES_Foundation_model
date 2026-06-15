@@ -48,6 +48,9 @@ Thumbs.db
 # Experiment runs
 runs/
 
+# Graphical outputs
+Outputs/
+
 # External repos
 LIBSSS/
 

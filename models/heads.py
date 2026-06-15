@@ -188,6 +188,67 @@ class BinnedQuantificationHead(nn.Module):
         return torch.stack(per_element, dim=1)
 
 
+def concentration_to_presence(concentration, lod):
+    """Binarize concentrations against per-element limits of detection.
+
+    Args:
+        concentration: [..., n_elements] mass fractions in [0, 1].
+        lod: [n_elements] per-element limit-of-detection thresholds.
+
+    Returns:
+        Float {0, 1} presence labels of the same type/shape as the input:
+        1 where concentration >= lod (present), 0 otherwise (absent).
+    """
+    if isinstance(concentration, torch.Tensor):
+        lod_t = lod if isinstance(lod, torch.Tensor) else torch.as_tensor(
+            lod, dtype=concentration.dtype, device=concentration.device)
+        return (concentration >= lod_t).to(concentration.dtype)
+    arr = np.asarray(concentration, dtype=np.float64)
+    return (arr >= np.asarray(lod, dtype=np.float64)).astype(np.float32)
+
+
+class DetectionHead(nn.Module):
+    """Multi-label presence/absence head for element detection.
+
+    Produces one logit per element; train with ``BCEWithLogitsLoss`` (no
+    terminal Sigmoid). Each element is an independent binary decision
+    (present vs. absent), unlike ``ClassificationHead`` which is mutually
+    exclusive across classes.
+
+    Args:
+        d_model: encoder representation dim
+        n_elements: number of elements to score for presence
+        hidden_dim: hidden layer width (defaults to d_model)
+        dropout: dropout rate
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_elements: int,
+        hidden_dim: Optional[int] = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        hidden_dim = hidden_dim or d_model
+        self.n_elements = n_elements
+        self.detector = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_elements),
+        )
+
+    def forward(self, representation: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            representation: [B, d_model] pooled encoder output
+        Returns:
+            Presence logits [B, n_elements] (raw; apply sigmoid for probs).
+        """
+        return self.detector(representation)
+
+
 class MaskedBinIntensityHead(nn.Module):
     """
     Classification head for masked bin-intensity prediction (MIP).

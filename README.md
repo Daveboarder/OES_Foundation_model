@@ -5,7 +5,7 @@ A self-supervised foundation model for Laser Induced Breakdown Spectroscopy (LIB
 ## Overview
 
 1. **Pre-trains** on unlabeled spectra (Masked Intensity Prediction on bins, or masked line-feature prediction on spectral lines)
-2. **Fine-tunes** for classification, regression, and **binned quantification** (`quantification_binned` with decoded R²)
+2. **Fine-tunes** for classification, regression, **binned quantification** (`quantification_binned` with decoded R²), and **element detection** (`detection` — multi-label presence/absence vs per-element limits of detection)
 3. **Data** — `config/libs_data.yaml` (~112k shots from the sample matrix) or `config/libs_data_smoke.yaml` for quick tests
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design detail, [PROJECT_SUMMARY.html](PROJECT_SUMMARY.html) / [PROJECT_SUMMARY.json](PROJECT_SUMMARY.json) for full CLI and layout reference.
@@ -108,10 +108,68 @@ uv run python train_finetune.py \
 
 Use the **same** `--config`, `--libs_data_config`, and (for line-token) `--line_embedding_config` as pre-training.
 
+### Fine-tune (element detection)
+
+Multi-label **presence/absence** per element: concentration ≥ LOD → present (1), else absent (0). LODs are defined in `config/element_lod.yaml` (mass fraction, per element + `default_lod`).
+
+```bash
+uv run python train_finetune.py \
+  --config config/config_libs_token_linear_4090.yaml \
+  --pretrain_run_dir runs/pretrain_<your_run> \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding.yaml \
+  --task detection \
+  --pool cls_mean \
+  --element_lod_config config/element_lod.yaml \
+  --experiment_name libs_detection
+```
+
+Monitored metric: `val/det_f1`. Test results include micro/macro F1 and per-element precision, recall, F1, and support in `run_info.yaml`.
+
 ```bash
 uv run python list_runs.py --latest
 uv run tensorboard --logdir runs/
 ```
+
+If training fails with **CUDA GPU is busy**, another process is holding the device (exclusive mode). Check `nvidia-smi`, stop the blocking PID, then re-run.
+
+---
+
+## Analysis & publication figures
+
+### Attention importance
+
+CLS-token attention over spectral lines (shared encoder representation; not per-output attribution):
+
+```bash
+uv run python analyze_attention_importance.py \
+  --run_dir runs/finetune_<your_run> \
+  --use_token_cache
+```
+
+Writes `evaluation/attention_importance_<timestamp>/` (CSVs + PNG heatmaps).
+
+### Publication figure set
+
+PowerPoint-ready figures (300 dpi PNG + editable SVG, white background). **Requires** an `attention_importance_*` folder from the step above.
+
+```bash
+uv run python make_publication_figures.py \
+  --run_dir runs/finetune_<your_run>
+
+# selected figures only
+uv run python make_publication_figures.py --run_dir runs/finetune_<your_run> --only fig1,fig3
+
+# skip checkpoint inference (attention-only figures)
+uv run python make_publication_figures.py --run_dir runs/finetune_<your_run> --skip-inference
+```
+
+| Task | Inference figures |
+| ---- | ----------------- |
+| `quantification_binned` | `fig4_pred_vs_true`, `fig4b_per_element_r2` |
+| `detection` | `fig4_presence_detection`, `fig4b_per_element_f1` |
+
+Shared outputs: annotated spectrum, attention heatmaps, training curves, t-SNE embedding map, graphical abstract, Voigt-fit zoom, GIFs. See `FIGURES_README.txt` in the output folder.
 
 ---
 
@@ -140,6 +198,7 @@ uv run tensorboard --logdir runs/
 | `config/libs_data_smoke.yaml`      | 3 types × 6 shots                                                                       |
 | `config/line_embedding.yaml`       | Te/Ne grid, line-selection mode (`top_percent_per_element` default), Voigt-fit settings |
 | `config/line_embedding_smoke.yaml` | `max_lines: 400` for fast tests                                                         |
+| `config/element_lod.yaml`          | Per-element limits of detection (mass fraction) for the `detection` task                |
 
 
 **Line selection:** `line_dictionary.selection` in `line_embedding.yaml` defaults to top 10% per element (`min_keep: 10`); legacy threshold mode remains available via `selection.mode: threshold`.
@@ -158,7 +217,7 @@ uv run tensorboard --logdir runs/
 | `--num_workers`           | DataLoader workers (default 0)                                                                                |
 
 
-**Fine-tune:** `--pretrain_run_dir`, `--task` (`quantification_binned`, `classification`, …), `--pool` (`cls`, `mean`, `cls_mean`).
+**Fine-tune:** `--pretrain_run_dir`, `--task` (`quantification_binned`, `detection`, `classification`, …), `--pool` (`cls`, `mean`, `cls_mean`). For `detection`, also `--element_lod_config` (default `config/element_lod.yaml`).
 
 ---
 
@@ -196,7 +255,8 @@ LIBS_foundation/
 │   ├── config_libs_token_{4090,}.yaml          # line_token (runtime embedding)
 │   ├── config_libs_token_linear_{4090,}.yaml   # line_token_linear (pre-baked tokens)
 │   ├── libs_data.yaml, libs_data_smoke.yaml
-│   └── line_embedding.yaml, line_embedding_smoke.yaml
+│   ├── line_embedding.yaml, line_embedding_smoke.yaml
+│   └── element_lod.yaml
 ├── data/
 │   ├── libs_pipeline.py
 │   ├── line_dictionary.py, line_features.py, line_tokenization.py
@@ -207,6 +267,9 @@ LIBS_foundation/
 │   ├── libs_transformer.py, line_token_embedding.py, heads.py
 ├── training/pretrain.py, training/finetune.py
 ├── train_pretrain.py, train_finetune.py
+├── analyze_attention_importance.py             # CLS attention over lines
+├── make_publication_figures.py                 # publication PNG/SVG + GIFs
+├── evaluate_model.py, list_runs.py
 └── run_pretrain_libs.slurm, run_finetune_libs.slurm
 ```
 

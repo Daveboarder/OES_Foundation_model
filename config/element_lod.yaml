@@ -1,0 +1,69 @@
+# =============================================================================
+# Limit-of-detection (LOD) thresholds for the `detection` downstream task.
+# =============================================================================
+# The `detection` task is multi-label binary classification: for every element
+# the model predicts whether that element is PRESENT or ABSENT in a spectrum.
+#
+# Labels are derived from the regression concentrations on the fly:
+#       concentration >= LOD   ->  present (1)
+#       concentration <  LOD   ->  absent  (0)
+#
+# UNITS: mass fraction in [0, 1] — the same units as the pipeline's
+# concentration targets (extract_finetune_labels), so 1.0e-4 = 100 ppm = 0.01 wt%.
+#
+# Any element that appears in the training data but is missing from
+# `limits_of_detection` below falls back to `default_lod`.
+#
+# These are physically plausible LIBS detection limits chosen so that the
+# present/absent split is informative for this Fe-matrix dataset; tune them to
+# your instrument / calibration as needed.
+# =============================================================================
+
+default_lod: 1.0e-4          # 100 ppm fallback for unlisted elements
+
+limits_of_detection:
+  # Matrix / major elements
+  Fe: 1.0e-3
+  C:  5.0e-4
+  Si: 1.0e-4
+  Mn: 1.0e-4
+  Al: 1.0e-4
+  Mg: 5.0e-5
+  Ca: 1.0e-5
+
+  # Common alloying elements
+  Ni: 1.0e-4
+  Cr: 1.0e-4
+  Cu: 5.0e-5
+  Mo: 1.0e-4
+  V:  5.0e-5
+  Ti: 5.0e-5
+  W:  2.0e-4
+  Co: 1.0e-4
+  Sn: 1.0e-4
+  Pb: 1.0e-4
+
+  # Non-metals (typically weaker LIBS lines -> higher LOD)
+  P:  5.0e-4
+  S:  5.0e-4
+  N:  5.0e-4
+  O:  5.0e-4
+  B:  5.0e-5
+
+  # Trace / minor and rare-earth elements
+  As: 2.0e-4
+  Ta: 2.0e-4
+  Zn: 2.0e-4
+  Ce: 1.0e-4
+  La: 1.0e-4
+  Nd: 1.0e-4
+  Pr: 1.0e-4
+  Sm: 1.0e-4
+  Y:  5.0e-5
+  Sr: 5.0e-6
+  Ba: 5.0e-6
+  Cd: 5.0e-5
+  Hg: 5.0e-4
+  Ag: 5.0e-5
+  Au: 1.0e-4
+  Pt: 1.0e-4

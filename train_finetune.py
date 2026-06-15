@@ -245,6 +245,79 @@ def generate_labeled_data(config: dict, seed: int = 42, libs_config_path: str | 
     return _generate_legacy_labeled(config, seed)
 
 
+def build_lod_vector(element_names: list[str], lod_config_path: str) -> tuple[np.ndarray, dict]:
+    """Build a per-element limit-of-detection vector aligned to `element_names`.
+
+    Reads `config/element_lod.yaml` (keys: `default_lod`, `limits_of_detection`).
+    Elements missing from the config fall back to `default_lod`.
+
+    Returns:
+        (lod_vector [n_elements] float32, lod_map {element: lod}).
+    """
+    cfg = yaml.safe_load(open(lod_config_path))
+    default_lod = float(cfg.get("default_lod", 1.0e-4))
+    table = cfg.get("limits_of_detection", {}) or {}
+    lod_map = {}
+    vec = np.empty(len(element_names), dtype=np.float32)
+    n_default = 0
+    for i, name in enumerate(element_names):
+        if name in table:
+            vec[i] = float(table[name])
+        else:
+            vec[i] = default_lod
+            n_default += 1
+        lod_map[name] = float(vec[i])
+    print(f"Loaded LODs from {lod_config_path}: {len(element_names)} elements "
+          f"({n_default} using default_lod={default_lod:g})")
+    return vec, lod_map
+
+
+def compute_detection_pos_weight(
+    concentrations: np.ndarray,
+    lod_vector: np.ndarray,
+    clip: tuple[float, float] = (0.1, 100.0),
+) -> np.ndarray:
+    """BCE positive-class weight per element = n_absent / n_present (clipped).
+
+    Counters the heavy class imbalance of trace elements that are present in
+    only a small fraction of spectra. Elements with no positives get the upper
+    clip value (the loss term is then effectively inert for them).
+    """
+    present = (concentrations >= lod_vector[None, :]).astype(np.float64)
+    pos = present.sum(axis=0)
+    neg = present.shape[0] - pos
+    with np.errstate(divide="ignore", invalid="ignore"):
+        w = np.where(pos > 0, neg / np.maximum(pos, 1.0), clip[1])
+    return np.clip(w, clip[0], clip[1]).astype(np.float32)
+
+
+def assert_gpu_available(accelerator: str) -> None:
+    """Fail fast with a clear message when CUDA is requested but not allocatable.
+
+    Catches the common case of a stale training process still holding the GPU
+    (this machine runs in Exclusive Process compute mode, so only one client
+    can allocate on the device at a time).
+    """
+    if accelerator != "gpu":
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "config device.accelerator is 'gpu' but torch.cuda.is_available() "
+            "is False. Set device.accelerator: cpu in the config, or fix CUDA."
+        )
+    try:
+        torch.zeros(1, device="cuda")
+        torch.cuda.synchronize()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "CUDA GPU is busy or unavailable — another process is likely "
+            "holding the device.\n"
+            "  Check:  nvidia-smi\n"
+            "  Stop:   kill <pid>   (or kill -9 <pid> if the process is stuck)\n"
+            "  Then re-run this command."
+        ) from exc
+
+
 def load_pretrained_model(
     config: dict,
     checkpoint_path: str,
@@ -420,6 +493,26 @@ def main(args):
     ft_warmup = int(config['finetune'].get('warmup_epochs', min(1, max(0, ft_epochs - 1))))
     ft_warmup = max(1, min(ft_warmup, ft_epochs - 1)) if ft_epochs > 1 else 1
 
+    # Detection task: derive per-element LOD thresholds + class-imbalance weights.
+    lod_vector = None
+    lod_pos_weight = None
+    lod_map = None
+    if args.task == 'detection':
+        if element_names is None:
+            raise ValueError(
+                "detection task requires the LIBS data pipeline "
+                "(--libs_data_config) so element names are known."
+            )
+        lod_np, lod_map = build_lod_vector(element_names, args.element_lod_config)
+        lod_vector = torch.from_numpy(lod_np)
+        pw_np = compute_detection_pos_weight(train_conc, lod_np)
+        lod_pos_weight = torch.from_numpy(pw_np)
+        present_frac = (train_conc >= lod_np[None, :]).mean(axis=0)
+        print("Detection labels (train present fraction per element):")
+        for name, frac in sorted(zip(element_names, present_frac),
+                                 key=lambda kv: kv[1], reverse=True):
+            print(f"  {name:>3s}: present={frac:6.2%}  lod={lod_map[name]:.1e}")
+
     finetune_module = LIBSFinetuneModule(
         encoder=encoder,
         task=args.task,
@@ -433,9 +526,11 @@ def main(args):
         max_epochs=ft_epochs,
         pool=args.pool,
         element_names=element_names,
+        lod=lod_vector,
+        detection_pos_weight=lod_pos_weight,
     )
 
-    needs_concentrations = args.task in ('regression', 'quantification', 'quantification_binned', 'both')
+    needs_concentrations = args.task in ('regression', 'quantification', 'quantification_binned', 'detection', 'both')
     spectra_unused = line_features_path is not None or line_tokens_path is not None
     data_module = FinetuneDataModule(
         train_spectra=train_spectra if not spectra_unused else None,
@@ -485,6 +580,8 @@ def main(args):
         monitor, mon_mode = 'val/reg_mae', 'min'
     elif args.task == 'quantification_binned':
         monitor, mon_mode = 'val/bin_accuracy', 'max'
+    elif args.task == 'detection':
+        monitor, mon_mode = 'val/det_f1', 'max'
     else:
         monitor, mon_mode = 'val/loss', 'min'
 
@@ -552,6 +649,7 @@ def main(args):
     print(f"Checkpoints: {run_mgr.checkpoint_dir}")
     print(f"Logs: {run_mgr.log_dir}")
 
+    assert_gpu_available(config['device']['accelerator'])
     trainer.fit(finetune_module, data_module)
 
     # Test
@@ -589,12 +687,17 @@ def main(args):
         n_elements=n_elements,
         n_concentration_bins=n_concentration_bins,
         element_names=element_names,
+        lod=lod_vector,
+        detection_pos_weight=lod_pos_weight,
     )
     test_results = trainer.test(best_model, dataloaders=test_loader)
     aggregate_test_results = dict(test_results[0]) if test_results else {}
     per_element_test = getattr(best_model, "test_per_element_metrics", {}) or {}
     if per_element_test:
         aggregate_test_results["per_element"] = per_element_test
+    detection_test = getattr(best_model, "test_detection_metrics", {}) or {}
+    if detection_test:
+        aggregate_test_results["detection"] = detection_test
 
     # Save final raw encoder weights
     final_path = run_mgr.checkpoint_dir / 'final_encoder.pt'
@@ -622,6 +725,8 @@ def main(args):
         "status": "completed",
         "best_metric": float(checkpoint_callback.best_model_score) if checkpoint_callback.best_model_score else None,
         "final_encoder": str(final_path),
+        "element_lod_config": args.element_lod_config if args.task == 'detection' else None,
+        "element_lod": lod_map,
         "test_results": aggregate_test_results if aggregate_test_results else None,
     })
 
@@ -633,9 +738,23 @@ def main(args):
         print(f"Best {monitor}: {checkpoint_callback.best_model_score:.4f}")
     if aggregate_test_results:
         print("\nTest metrics (aggregate):")
-        for k in ("test/bin_accuracy", "test/decoded_mae", "test/decoded_r2", "test/loss"):
+        for k in ("test/bin_accuracy", "test/decoded_mae", "test/decoded_r2",
+                  "test/det_f1", "test/det_accuracy", "test/det_precision",
+                  "test/det_recall", "test/loss"):
             if k in aggregate_test_results:
                 print(f"  {k}: {float(aggregate_test_results[k]):.6f}")
+    if detection_test:
+        print("\nDetection metrics:")
+        for k in ("macro_f1", "micro_f1", "element_accuracy", "exact_match"):
+            print(f"  {k}: {detection_test[k]:.4f}")
+        print("\nPer-element detection (precision / recall / f1, support):")
+        names = element_names if element_names is not None else sorted(detection_test["per_element"])
+        for name in names:
+            m = detection_test["per_element"].get(name)
+            if m is None:
+                continue
+            print(f"  {name:>3s}: P={m['precision']:.3f} R={m['recall']:.3f} "
+                  f"F1={m['f1']:.3f}  (support={int(m['support'])}, lod={m['lod']:.1e})")
     if per_element_test:
         print("\nTest metrics (per element):")
         names = element_names if element_names is not None else sorted(per_element_test.keys())
@@ -660,12 +779,18 @@ if __name__ == "__main__":
                         help='Path to pretrain run directory')
     parser.add_argument('--task', type=str,
                         choices=['classification', 'quantification',
-                                 'quantification_binned', 'regression', 'both'],
+                                 'quantification_binned', 'detection',
+                                 'regression', 'both'],
                         default='both',
                         help='Downstream task: classification (cluster ID), '
                              'quantification (MSE regression on concentrations), '
                              'quantification_binned (per-element bin CE, upstream-style), '
+                             'detection (multi-label element presence/absence vs LOD), '
                              'regression/both (legacy, kept for backward compat)')
+    parser.add_argument('--element_lod_config', type=str,
+                        default='config/element_lod.yaml',
+                        help='Per-element limit-of-detection YAML used to derive '
+                             'presence/absence labels for the detection task.')
     parser.add_argument('--libs_data_config', type=str, default=None,
                         help='Path to physics-based LIBS data pipeline config '
                              '(e.g. config/libs_data.yaml). If set, replaces the '

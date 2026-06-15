@@ -15,9 +15,11 @@ from scipy.stats import spearmanr
 from models.heads import (
     BinnedQuantificationHead,
     ClassificationHead,
+    DetectionHead,
     RegressionHead,
     bin_to_concentration,
     concentration_to_bin,
+    concentration_to_presence,
 )
 
 
@@ -25,6 +27,8 @@ from models.heads import (
 #   'classification'         — single class label, cross-entropy
 #   'quantification'         — concentration vector, MSE (standard regression)
 #   'quantification_binned'  — per-element bin CE (upstream-style, 1000-way per element)
+#   'detection'              — multi-label element presence/absence (BCE), labels
+#                              derived from concentrations vs per-element LODs
 #   'regression' / 'both'    — legacy aliases kept for backward compatibility:
 #                              'regression' == 'quantification' (sigmoid head),
 #                              'both' = classification + regression jointly.
@@ -32,6 +36,7 @@ TaskName = Literal[
     'classification',
     'quantification',
     'quantification_binned',
+    'detection',
     'regression',
     'both',
 ]
@@ -80,9 +85,12 @@ class LIBSFinetuneModule(pl.LightningModule):
         class_weights: Optional[torch.Tensor] = None,
         pool: Literal['cls', 'mean', 'cls_mean'] = 'cls',
         element_names: Optional[list[str]] = None,
+        lod: Optional[torch.Tensor] = None,
+        detection_pos_weight: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['encoder', 'class_weights'])
+        self.save_hyperparameters(
+            ignore=['encoder', 'class_weights', 'lod', 'detection_pos_weight'])
 
         self.encoder = encoder
         self.task = task
@@ -105,6 +113,10 @@ class LIBSFinetuneModule(pl.LightningModule):
         self._test_conc_preds: list[torch.Tensor] = []
         self._test_conc_targets: list[torch.Tensor] = []
         self.test_per_element_metrics: dict[str, dict[str, float]] = {}
+        # Test-only buffers for detection (presence) diagnostics.
+        self._test_det_probs: list[torch.Tensor] = []
+        self._test_det_targets: list[torch.Tensor] = []
+        self.test_detection_metrics: dict[str, Any] = {}
 
         d_model = encoder.d_model
         head_in_dim = 2 * d_model if pool == 'cls_mean' else d_model
@@ -123,6 +135,26 @@ class LIBSFinetuneModule(pl.LightningModule):
                 n_elements=self.n_elements,
                 n_bins=n_concentration_bins,
             )
+        if task == 'detection':
+            self.detection_head = DetectionHead(
+                d_model=head_in_dim,
+                n_elements=self.n_elements,
+            )
+
+        # Per-element limit-of-detection thresholds (mass fraction) used to turn
+        # concentrations into presence/absence targets for the detection task.
+        if lod is not None:
+            self.register_buffer('detection_lod', torch.as_tensor(lod, dtype=torch.float32))
+        else:
+            self.detection_lod = None
+        # Optional positive-class weighting for the (often imbalanced) BCE loss.
+        if detection_pos_weight is not None:
+            self.register_buffer(
+                'detection_pos_weight',
+                torch.as_tensor(detection_pos_weight, dtype=torch.float32),
+            )
+        else:
+            self.detection_pos_weight = None
 
         if class_weights is not None:
             self.register_buffer('class_weights', class_weights)
@@ -207,6 +239,11 @@ class LIBSFinetuneModule(pl.LightningModule):
             result['concentrations_pred'] = bin_to_concentration(
                 logits.argmax(dim=-1), n_bins=self.n_concentration_bins,
             )
+        if self.task == 'detection':
+            det_logits = self.detection_head(representation)  # [B, n_elements]
+            result['detection_logits'] = det_logits
+            result['presence_prob'] = torch.sigmoid(det_logits)
+            result['presence_pred'] = (result['presence_prob'] >= 0.5).float()
         return result
     
     def compute_classification_loss(
@@ -315,6 +352,51 @@ class LIBSFinetuneModule(pl.LightningModule):
             'decoded_r2': r2,
         }
     
+    def presence_targets(self, concentrations: torch.Tensor) -> torch.Tensor:
+        """Binarize concentrations against the per-element LOD buffer."""
+        if self.detection_lod is None:
+            raise ValueError(
+                "detection task requires `lod` (per-element limits of detection); "
+                "none were provided to LIBSFinetuneModule."
+            )
+        return concentration_to_presence(concentrations, self.detection_lod)
+
+    def compute_detection_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Multi-label BCE-with-logits loss for element presence."""
+        pos_weight = self.detection_pos_weight
+        return nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=pos_weight,
+        )
+
+    def compute_detection_metrics(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Micro-averaged presence metrics over all element decisions."""
+        preds = (torch.sigmoid(logits) >= 0.5).float()
+        correct = (preds == targets).float()
+        accuracy = correct.mean()
+        tp = (preds * targets).sum()
+        fp = (preds * (1 - targets)).sum()
+        fn = ((1 - preds) * targets).sum()
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        # Exact-match: all elements of a spectrum correct simultaneously.
+        exact = (preds == targets).all(dim=1).float().mean()
+        return {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'exact_match': exact,
+        }
+
     def _step(self, batch: Dict[str, torch.Tensor], stage: str) -> Dict[str, torch.Tensor]:
         """Shared train/val/test logic, dispatched by self.task.
 
@@ -362,6 +444,21 @@ class LIBSFinetuneModule(pl.LightningModule):
             results['conc_predictions'] = outputs['concentrations_pred']
             results['conc_targets'] = batch['concentrations']
 
+        # ── Element detection (presence/absence) ─────────────────────────
+        if self.task == 'detection' and 'concentrations' in batch:
+            det_targets = self.presence_targets(batch['concentrations'])
+            det_loss = self.compute_detection_loss(outputs['detection_logits'], det_targets)
+            total_loss = total_loss + det_loss
+            self.log(f'{stage}/det_loss', det_loss, **log_kw)
+            m = self.compute_detection_metrics(outputs['detection_logits'], det_targets)
+            self.log(f'{stage}/det_accuracy', m['accuracy'], **{**log_kw, 'prog_bar': stage != 'train'})
+            self.log(f'{stage}/det_precision', m['precision'], **log_kw)
+            self.log(f'{stage}/det_recall', m['recall'], **log_kw)
+            self.log(f'{stage}/det_f1', m['f1'], **{**log_kw, 'prog_bar': stage != 'train'})
+            self.log(f'{stage}/det_exact_match', m['exact_match'], **log_kw)
+            results['presence_prob'] = outputs['presence_prob']
+            results['presence_targets'] = det_targets
+
         self.log(f'{stage}/loss', total_loss, **{**log_kw, 'prog_bar': True})
         results['loss'] = total_loss
         return results
@@ -381,12 +478,21 @@ class LIBSFinetuneModule(pl.LightningModule):
             if pred is not None and targ is not None:
                 self._test_conc_preds.append(pred.detach().float().cpu())
                 self._test_conc_targets.append(targ.detach().float().cpu())
+        if self.task == 'detection':
+            prob = out.get('presence_prob')
+            targ = out.get('presence_targets')
+            if prob is not None and targ is not None:
+                self._test_det_probs.append(prob.detach().float().cpu())
+                self._test_det_targets.append(targ.detach().float().cpu())
         return out
 
     def on_test_epoch_start(self) -> None:
         self._test_conc_preds = []
         self._test_conc_targets = []
         self.test_per_element_metrics = {}
+        self._test_det_probs = []
+        self._test_det_targets = []
+        self.test_detection_metrics = {}
 
     @staticmethod
     def _safe_pearson(x: np.ndarray, y: np.ndarray) -> float:
@@ -408,6 +514,9 @@ class LIBSFinetuneModule(pl.LightningModule):
         return float(corr)
 
     def on_test_epoch_end(self) -> None:
+        if self.task == 'detection':
+            self._finalize_detection_test()
+            return
         if self.task != 'quantification_binned':
             return
         if not self._test_conc_preds or not self._test_conc_targets:
@@ -463,6 +572,74 @@ class LIBSFinetuneModule(pl.LightningModule):
         self._test_conc_preds = []
         self._test_conc_targets = []
     
+    def _finalize_detection_test(self) -> None:
+        """Aggregate per-element + overall presence metrics over the test set."""
+        if not self._test_det_probs or not self._test_det_targets:
+            return
+        probs = torch.cat(self._test_det_probs, dim=0).numpy()
+        targets = torch.cat(self._test_det_targets, dim=0).numpy()
+        preds = (probs >= 0.5).astype(np.float64)
+        n_samples = int(targets.shape[0])
+
+        per_elem: dict[str, dict[str, float]] = {}
+        for i in range(self.n_elements):
+            name = self.element_names[i] if i < len(self.element_names) else f"elem_{i}"
+            t = targets[:, i]
+            p = preds[:, i]
+            tp = float(np.sum(p * t))
+            fp = float(np.sum(p * (1 - t)))
+            fn = float(np.sum((1 - p) * t))
+            tn = float(np.sum((1 - p) * (1 - t)))
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * precision * recall / (precision + recall)
+                  if (precision + recall) > 0 else 0.0)
+            per_elem[name] = {
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "accuracy": (tp + tn) / max(n_samples, 1),
+                "support": float(np.sum(t)),       # n present in test set
+                "lod": float(self.detection_lod[i]) if self.detection_lod is not None else float("nan"),
+                "n_samples": float(n_samples),
+            }
+
+        # Macro (unweighted mean over elements) and micro (pooled) summaries.
+        macro_f1 = float(np.mean([m["f1"] for m in per_elem.values()]))
+        macro_precision = float(np.mean([m["precision"] for m in per_elem.values()]))
+        macro_recall = float(np.mean([m["recall"] for m in per_elem.values()]))
+        tp = float(np.sum(preds * targets))
+        fp = float(np.sum(preds * (1 - targets)))
+        fn = float(np.sum((1 - preds) * targets))
+        micro_precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        micro_recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        micro_f1 = (2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+                    if (micro_precision + micro_recall) > 0 else 0.0)
+
+        self.test_detection_metrics = {
+            "macro_f1": macro_f1,
+            "macro_precision": macro_precision,
+            "macro_recall": macro_recall,
+            "micro_f1": micro_f1,
+            "micro_precision": micro_precision,
+            "micro_recall": micro_recall,
+            "element_accuracy": float(np.mean(preds == targets)),
+            "exact_match": float(np.mean((preds == targets).all(axis=1))),
+            "per_element": per_elem,
+        }
+
+        logger_exp = getattr(self.logger, "experiment", None)
+        add_scalar = getattr(logger_exp, "add_scalar", None) if logger_exp else None
+        if add_scalar is not None:
+            step = int(self.current_epoch)
+            for key in ("macro_f1", "micro_f1", "element_accuracy", "exact_match"):
+                add_scalar(f"test/detection/{key}", self.test_detection_metrics[key], step)
+            for name, m in per_elem.items():
+                add_scalar(f"test/detection/per_element/{name}/f1", m["f1"], step)
+
+        self._test_det_probs = []
+        self._test_det_targets = []
+
     def configure_optimizers(self):
         """Configure optimizer and scheduler."""
         # Separate encoder and head parameters for different learning rates
@@ -475,6 +652,8 @@ class LIBSFinetuneModule(pl.LightningModule):
             head_params.extend(self.regression_head.parameters())
         if self.task == 'quantification_binned':
             head_params.extend(self.binned_head.parameters())
+        if self.task == 'detection':
+            head_params.extend(self.detection_head.parameters())
         
         # Use lower learning rate for encoder
         param_groups = [
