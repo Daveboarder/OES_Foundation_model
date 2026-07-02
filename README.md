@@ -171,6 +171,29 @@ uv run python make_publication_figures.py --run_dir runs/finetune_<your_run> --s
 
 Shared outputs: annotated spectrum, attention heatmaps, training curves, t-SNE embedding map, graphical abstract, Voigt-fit zoom, GIFs. See `FIGURES_README.txt` in the output folder.
 
+### Raw vs tokenized comparison (detection)
+
+Side-by-side figures for two fine-tuned detection runs (intensity vs `line_token_linear`):
+
+```bash
+uv run python make_comparison_figures.py \
+  --run_dir_raw runs/finetune_2026-06-17_10-44-48_libs_detection_bin_4090 \
+  --run_dir_token runs/finetune_2026-06-14_20-14-42_libs_detection
+```
+
+Outputs `cmp_fig0`–`cmp_fig7` (aggregate metrics, per-element F1, ΔF1, training curves, embeddings, detection panels, composite) under `runs/comparison_detection_raw_vs_token/publication_<timestamp>/`. The methodology panel documents pretrain differences when runs are not from a matched comparison campaign.
+
+### VASKUT spectrum zoom (element lines)
+
+Plot a 5 nm spectrum slice from `VASKUT K8.json` with color-coded theoretical DB lines (one strongest line per element in the window):
+
+```bash
+uv run python scripts/plot_vaskut_spectrum_zoom.py
+# manual window: --wl_min 250 --wl_max 255
+```
+
+Saves PNG + SVG to `Outputs/`.
+
 ---
 
 ## Configuration

@@ -635,8 +635,9 @@ def draw_pred_scatter(ax, y_true: np.ndarray, y_pred: np.ndarray, elem: str,
     return r2
 
 
-def draw_embedding_map(ax, fig, reprs: np.ndarray, fe_conc: np.ndarray,
-                       seed: int, cbar: bool = True, max_points: int = 3000):
+def draw_embedding_map(ax, fig, reprs: np.ndarray, color_values: np.ndarray,
+                       seed: int, cbar: bool = True, max_points: int = 3000,
+                       color_label: str = "Fe content (wt.%)"):
     from sklearn.manifold import TSNE
     n = min(max_points, reprs.shape[0])
     rng = np.random.default_rng(seed)
@@ -644,7 +645,7 @@ def draw_embedding_map(ax, fig, reprs: np.ndarray, fe_conc: np.ndarray,
     X = reprs[pick].astype(np.float64)
     emb = TSNE(n_components=2, random_state=seed, perplexity=min(30, n // 4),
                init="pca").fit_transform(X)
-    sc = ax.scatter(emb[:, 0], emb[:, 1], c=fe_conc[pick] * 100, s=8,
+    sc = ax.scatter(emb[:, 0], emb[:, 1], c=color_values[pick] * 100, s=8,
                     cmap="viridis", alpha=0.8, edgecolors="none",
                     rasterized=True)
     ax.set_xlabel("t-SNE 1")
@@ -652,7 +653,7 @@ def draw_embedding_map(ax, fig, reprs: np.ndarray, fe_conc: np.ndarray,
     ax.set_xticks([])
     ax.set_yticks([])
     if cbar:
-        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.03, label="Fe content (wt.%)")
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.03, label=color_label)
     return sc
 
 
@@ -1095,17 +1096,17 @@ def make_fig5(assets: Assets, reg: FigureRegistry):
 
 def make_fig6(assets: Assets, reg: FigureRegistry):
     inf = assets.inference()
-    fe_idx = assets.element_names.index("Fe")
+    c_idx = assets.element_names.index("C")
     color_values = (
-        inf["concentrations"][:, fe_idx]
+        inf["concentrations"][:, c_idx]
         if assets.task == "detection"
-        else inf["targets"][:, fe_idx]
+        else inf["targets"][:, c_idx]
     )
     fig, ax = plt.subplots(figsize=(7.6, 6.2))
     print("Computing t-SNE embedding map...")
     draw_embedding_map(ax, fig, inf["representations"], color_values,
-                       seed=assets.args.seed)
-    color_label = "Fe content" if assets.task != "detection" else "Fe concentration"
+                       seed=assets.args.seed, color_label="C content (wt.%)")
+    color_label = "C content" if assets.task != "detection" else "C concentration"
     ax.set_title("Learned spectral embeddings (t-SNE)", fontsize=13)
     fig.tight_layout()
     reg.save(fig, "fig6_embedding_map",
@@ -1140,6 +1141,7 @@ def make_fig7(assets: Assets, reg: FigureRegistry, top_n: int,
 
     if with_inference:
         inf = assets.inference()
+        c_idx = assets.element_names.index("C")
         fe_idx = assets.element_names.index("Fe")
         if assets.task == "detection":
             probs = inf.get("probs", inf["preds"])
@@ -1148,15 +1150,16 @@ def make_fig7(assets: Assets, reg: FigureRegistry, top_n: int,
                 color="#0072B2", show_xlabel=True, show_ylabel=True,
             )
             ax_c.set_title("Presence detection (test set)", fontsize=11.5)
-            color_values = inf["concentrations"][:, fe_idx]
+            color_values = inf["concentrations"][:, c_idx]
         else:
             draw_pred_scatter(ax_c, inf["targets"][:, fe_idx], inf["preds"][:, fe_idx],
                               "Fe", color="#0072B2")
             ax_c.set_title("Quantification (test set)", fontsize=11.5)
-            color_values = inf["targets"][:, fe_idx]
+            color_values = inf["targets"][:, c_idx]
         draw_embedding_map(ax_d, fig, inf["representations"],
                            color_values, seed=assets.args.seed,
-                           cbar=True, max_points=2000)
+                           cbar=True, max_points=2000,
+                           color_label="C content (wt.%)")
         ax_d.set_title("Learned embeddings", fontsize=11.5)
     else:
         per_elem = (assets.run_info.get("test_results") or {}).get("per_element", {})
