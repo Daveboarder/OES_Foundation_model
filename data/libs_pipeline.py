@@ -231,6 +231,21 @@ def create_spectra(
 # ─────────────────────────────────────────────────────────────────────────────
 # Wavelength loading from VASKUT-style spectrometer JSON
 # ─────────────────────────────────────────────────────────────────────────────
+def compute_ccd_wavelengths(
+    n_pixels: int,
+    pixel_to_wl: list[float],
+    drift: list[float],
+) -> np.ndarray:
+    """Per-pixel wavelength axis from VASKUT drift + pixel→wavelength polynomials.
+
+    Intensity at pixel index *i* must be paired with ``wp[i]`` — do not replace
+    with ``np.linspace(wp.min(), wp.max(), n)`` because the mapping is
+    nonlinear and causes multi-nm line-position errors.
+    """
+    pixels = np.arange(0, n_pixels) + 1
+    return Polynomial(pixel_to_wl)(Polynomial(drift)(pixels))
+
+
 def _get_one_ccd_range(json_path: str, run_id: int, integration_phase: int, ccd_range: int):
     j = json.load(open(json_path))["analysis"]
     for run in j["results"]:
@@ -244,12 +259,10 @@ def _get_one_ccd_range(json_path: str, run_id: int, integration_phase: int, ccd_
     I = np.asarray(rng["results"])
     drift = [rng["drift"]["beta"], rng["drift"]["alpha"]]
     p2w = rng["pixelToWaveLength"][::-1]
-    p = np.arange(0, I.size) + 1
-    wp = Polynomial(p2w)(Polynomial(drift)(p))
     # Native spectrometer pixel grid (no upsampling). Upstream uses I.size*4
     # for fitting; for a transformer encoder it just inflates n_bins (and
     # attention cost is O(n^2)).
-    return np.linspace(wp.min(), wp.max(), num=I.size)
+    return compute_ccd_wavelengths(I.size, p2w, drift)
 
 
 def load_wavelength(json_path: str, run_id: int = 1, integration_phase: int = 1) -> np.ndarray:

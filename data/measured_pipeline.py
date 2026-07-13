@@ -18,12 +18,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from numpy.polynomial import Polynomial
 from torch.utils.data import Dataset
 
 from data.libs_pipeline import (
     _db_elements,
     _normalize_sample_id,
+    compute_ccd_wavelengths,
     load_spectra_cache,
     load_wavelength,
     save_spectra_cache,
@@ -62,9 +62,7 @@ def _get_ccd_wavelength_intensity(
     intensities = np.asarray(rng["results"], dtype=np.float64)
     drift = [rng["drift"]["beta"], rng["drift"]["alpha"]]
     p2w = rng["pixelToWaveLength"][::-1]
-    pixels = np.arange(0, intensities.size) + 1
-    wp = Polynomial(p2w)(Polynomial(drift)(pixels))
-    wavelength = np.linspace(wp.min(), wp.max(), num=intensities.size)
+    wavelength = compute_ccd_wavelengths(intensities.size, p2w, drift)
     return wavelength, intensities
 
 

@@ -72,7 +72,7 @@ def _get_eion(element: str, db_path: str) -> float:
 # ---------------------------------------------------------------------------
 # Voigt profile constants (fixed across all calls)
 # ---------------------------------------------------------------------------
-_GAMMA_FIT = 0.1
+_GAMMA_FIT = 0.01
 _SIGMA_FIT = 0.006
 _SIGMA_SQRT2 = _SIGMA_FIT * np.sqrt(2)
 _NORM = 1.0 / (_SIGMA_FIT * np.sqrt(2 * np.pi))
