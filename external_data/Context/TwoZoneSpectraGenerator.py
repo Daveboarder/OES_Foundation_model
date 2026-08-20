@@ -735,9 +735,9 @@ def main() -> None:
         )
 
     # 2 two-zone plasma parameters.
-    te1, te2 = 18370.0, 2200.0
-    ne1, ne2 = 10.0**17.397, 10.0**16.4
-    r11_mm, r12_mm = 1.46, 4.86
+    te1, te2 = 22370.0, 3200.0
+    ne1, ne2 = 10.0**17.397, 10.0**15.4
+    r11_mm, r12_mm = 1.46, 2.86
     n_density = 1e-4
     l_path = 1.4e-4
     l_outer, l_inner = _path_lengths_from_radii(r11_mm, r12_mm)
