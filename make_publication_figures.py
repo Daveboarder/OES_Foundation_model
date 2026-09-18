@@ -726,10 +726,18 @@ def draw_embedding_map(ax, fig, reprs: np.ndarray, color_values: np.ndarray,
                        color_label: str = "Fe content (wt.%)"):
     from sklearn.manifold import TSNE
     n = min(max_points, reprs.shape[0])
+    if n < 5:
+        # smoke runs have a handful of test spectra; t-SNE needs more than that
+        ax.text(0.5, 0.5, f"t-SNE needs ≥ 5 spectra (got {n})",
+                transform=ax.transAxes, ha="center", va="center", fontsize=11)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return None
     rng = np.random.default_rng(seed)
     pick = rng.choice(reprs.shape[0], size=n, replace=False)
     X = reprs[pick].astype(np.float64)
-    emb = TSNE(n_components=2, random_state=seed, perplexity=min(30, n // 4),
+    emb = TSNE(n_components=2, random_state=seed,
+               perplexity=float(max(2.0, min(30.0, (n - 1) / 3.0))),
                init="pca").fit_transform(X)
     sc = ax.scatter(emb[:, 0], emb[:, 1], c=color_values[pick] * 100, s=8,
                     cmap="viridis", alpha=0.8, edgecolors="none",
@@ -1621,15 +1629,20 @@ def make_fig_cf_comparison(assets: Assets, reg: FigureRegistry):
     candidates = [("within_2x", "Fraction within a factor of 2", False),
                   ("r2", "Test $R^2$", False),
                   ("log_rmse", "log-RMSE (lower is better)", True)]
-    best = None
-    for metric, label, lower_better in candidates:
-        n_have = sum(
-            1 for pe in sources.values()
-            if any(e in dict(_per_element_metric_items(pe, metric)) for e in majors)
-        )
-        if best is None or n_have > best[0]:
-            best = (n_have, metric, label, lower_better)
-    n_have, metric, metric_label, lower_better = best
+    cf_keys = {k for k in sources if k[1].startswith("CF")}
+    counts = {}
+    for metric, _label, _lb in candidates:
+        have = [k for k, pe in sources.items()
+                if any(e in dict(_per_element_metric_items(pe, metric)) for e in majors)]
+        counts[metric] = (sum(1 for k in have if k in cf_keys), len(have))
+    # The figure is about CF: take the first metric the CF runs themselves
+    # report, never r2 just because a seed run has it — r2 in linear wt.% is
+    # meaningless for a solver judged in log space (it clips to an empty bar).
+    best = next((c for c in candidates if counts[c[0]][0] > 0), None)
+    if best is None:  # no CF metric at all: fall back to the widest-reported one
+        best = max(candidates, key=lambda c: counts[c[0]][1])
+    metric, metric_label, lower_better = best
+    n_have = counts[metric][1]
     if n_have == 0:
         print("fig_cf_comparison: no comparable per-element metric — skipped")
         return

@@ -858,14 +858,19 @@ def main(args):
     lod_vector = None
     lod_pos_weight = None
     lod_map = None
+    # Detection needs the LOD as its label threshold; the concentration tasks
+    # only use it for the per-element log_rmse / within_2x block, so it is built
+    # whenever element names are known and never required there.
+    if element_names is not None and args.task in (
+            'detection', 'quantification_binned', 'quantification', 'regression'):
+        lod_np, lod_map = build_lod_vector(element_names, args.element_lod_config)
+        lod_vector = torch.from_numpy(lod_np)
     if args.task == 'detection':
         if element_names is None:
             raise ValueError(
                 "detection task requires the LIBS data pipeline "
                 "(--libs_data_config) so element names are known."
             )
-        lod_np, lod_map = build_lod_vector(element_names, args.element_lod_config)
-        lod_vector = torch.from_numpy(lod_np)
         pw_np = compute_detection_pos_weight(train_conc, lod_np)
         lod_pos_weight = torch.from_numpy(pw_np)
         present_frac = (train_conc >= lod_np[None, :]).mean(axis=0)

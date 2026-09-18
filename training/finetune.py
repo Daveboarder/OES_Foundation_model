@@ -1049,11 +1049,19 @@ class LIBSFinetuneModule(pl.LightningModule):
                 "spearman": spearman,
                 "n_samples": float(n_samples),
             }
+            # log_rmse / within_2x need a per-element LOD: cf_lod for the CF
+            # task, the detection LOD vector for the learned concentration
+            # tasks, so the binned seed stays comparable with CF.
+            lod_i = None
             if self.task == 'cf_quantification':
+                lod_i = float(self.cf_lod[i])
+            elif self.detection_lod is not None:
+                lod_i = float(self.detection_lod[i])
+            if lod_i is not None:
                 per_elem[name].update(self.cf_element_metrics(
-                    y_true, y_pred, float(self.cf_lod[i]),
+                    y_true, y_pred, lod_i,
                     censored=None if censored_all is None else censored_all[:, i],
-                    eps=float(self.cf_cfg['eps']),
+                    eps=float((self.cf_cfg or {}).get('eps', 1e-7)),
                 ))
 
         # Persist for final run summary / run_info.yaml serialization.
