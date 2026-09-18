@@ -63,6 +63,17 @@ _VOIGT_NORM = 1.0 / (_SIGMA_FIT * np.sqrt(2 * np.pi))
 # Element-name filters (upstream conventions)
 _EXCLUDED_ELEMENTS = {"", "n", "r"}
 
+# Plasma-state columns written by data/two_zone_pipeline.py (physics_version 2).
+# They are metadata, never element concentrations. ``Te``/``Ne`` stay as the
+# aliases of ``Te1``/``Ne1`` so every legacy consumer keeps working.
+ZONE_COLUMNS = (
+    "plasma_model", "Te1", "Ne1", "Te2", "Ne2", "l_inner", "l_outer",
+    "N1", "N2", "gamma_stark1", "gamma_stark2",
+)
+_LEGACY_META_COLS = {"sample_type_id", "sample_type_name", "unique_id", "Te", "Ne"}
+_PLASMA_MODELS_V2 = ("one_zone", "two_zone", "mixed")
+_SPLIT_STRATEGIES = ("random", "group_sample", "group_instrument")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SQLite caches — populated per-process. Multiprocessing workers reset these
@@ -436,7 +447,7 @@ def generate_synthetic_spectra(
 ) -> np.ndarray:
     n_samples = len(sample_table)
     spectra = np.zeros((n_samples, len(wavelength)))
-    skip = {"Te", "Ne", "sample_type_id", "sample_type_name", "unique_id"}
+    skip = _LEGACY_META_COLS | set(ZONE_COLUMNS)
     elements = [c for c in sample_table.columns if c not in skip]
 
     Te_arr = sample_table["Te"].values
@@ -631,7 +642,7 @@ class SyntheticLIBSDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 # Downstream-label helpers: concentration extraction, splits, clustering
 # ─────────────────────────────────────────────────────────────────────────────
-_META_COLS = {"sample_type_id", "sample_type_name", "unique_id", "Te", "Ne"}
+_META_COLS = _LEGACY_META_COLS | set(ZONE_COLUMNS)
 
 
 def extract_finetune_labels(
@@ -665,6 +676,75 @@ def extract_finetune_labels(
     return conc, list(elements), inv.astype(np.int64)
 
 
+def extract_plasma_targets(sample_table: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Per-shot plasma-state targets for the calibration-free (CF) task.
+
+    Reads the physics_version-2 columns written by
+    :mod:`data.two_zone_pipeline` (``Te1, Ne1, N1, l_inner, plasma_model``).
+
+    Returns float32 arrays of length N:
+        Te                inner-zone temperature [K]
+        log10_Ne          log10 of the inner-zone electron density [cm^-3]
+        log10_Nl          log10(N1 * l_inner) [cm^-2], the column density that
+                          sets the optical depth of the inner zone
+        is_two_zone       1 for two-zone shots, 0 otherwise
+        has_plasma_labels 1 when the row carries valid (positive) plasma
+                          labels; 0 (with every other entry zero) when the
+                          zone columns are missing or zero, i.e. for measured
+                          spectra and for the legacy (physics_version 1) cache.
+    """
+    n = len(sample_table)
+    out = {
+        k: np.zeros(n, dtype=np.float32)
+        for k in ("Te", "log10_Ne", "log10_Nl", "is_two_zone", "has_plasma_labels")
+    }
+    needed = ("Te1", "Ne1", "N1", "l_inner")
+    if n == 0 or any(c not in sample_table.columns for c in needed):
+        return out
+
+    te = pd.to_numeric(sample_table["Te1"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    ne = pd.to_numeric(sample_table["Ne1"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    nd = pd.to_numeric(sample_table["N1"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    li = pd.to_numeric(sample_table["l_inner"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    nl = nd * li
+    has = (te > 0) & (ne > 0) & (nl > 0)
+
+    out["Te"][has] = te[has]
+    out["log10_Ne"][has] = np.log10(ne[has])
+    out["log10_Nl"][has] = np.log10(nl[has])
+    if "plasma_model" in sample_table.columns:
+        two = sample_table["plasma_model"].astype(str).to_numpy() == "two_zone"
+        out["is_two_zone"] = (two & has).astype(np.float32)
+    out["has_plasma_labels"] = has.astype(np.float32)
+    return out
+
+
+def measured_groups(sample_table: pd.DataFrame, by: str = "sample") -> np.ndarray:
+    """Group ids for grouped train/val/test splits of measured spectra.
+
+    ``by="sample"``      -> ``sample_type_id`` (one group per physical sample)
+    ``by="instrument"``  -> instrument token parsed from ``unique_id`` of the
+                            form ``{sample_type_id}_{INSTRUMENT}_R{run:02d}``
+                            (see data/measured_pipeline.build_measured_entries),
+                            e.g. ``PURE_KFE_REMUS_9951601_R02`` -> ``REMUS_9951601``.
+                            Rows that do not follow the pattern get ``"unknown"``.
+    Returns an array of strings, one per row.
+    """
+    if by == "sample":
+        return sample_table["sample_type_id"].astype(str).to_numpy()
+    if by != "instrument":
+        raise ValueError(f"measured_groups: unknown grouping {by!r} (use 'sample' or 'instrument')")
+    sids = sample_table["sample_type_id"].astype(str).to_numpy()
+    uids = sample_table["unique_id"].astype(str).to_numpy()
+    pat = re.compile(r"^(?P<inst>.+)_R(?P<run>\d+)$")
+    out = []
+    for sid, uid in zip(sids, uids):
+        rest = uid[len(sid) + 1:] if uid.startswith(sid + "_") else uid
+        m = pat.match(rest)
+        out.append(m.group("inst") if m else "unknown")
+    return np.asarray(out, dtype=str)
+
+
 def make_splits(
     n: int,
     val_fraction: float = 0.15,
@@ -685,6 +765,61 @@ def make_splits(
     val_idx = perm[n_test:n_test + n_val]
     train_idx = perm[n_test + n_val:]
     return {"train": train_idx, "val": val_idx, "test": test_idx}
+
+
+def make_group_splits(
+    groups: np.ndarray,
+    val_fraction: float = 0.15,
+    test_fraction: float = 0.15,
+    seed: int = 42,
+) -> dict[str, np.ndarray]:
+    """Deterministic partition that keeps whole groups together.
+
+    Groups are shuffled with ``seed`` and assigned greedily: test first until
+    it holds at least ``test_fraction`` of the rows, then val likewise, the
+    rest is train. Each non-empty partition gets at least one group. Raises
+    if there are not enough groups to populate every requested partition.
+    """
+    groups = np.asarray(groups).astype(str)
+    n = len(groups)
+    uniq, inv = np.unique(groups, return_inverse=True)
+    n_groups = len(uniq)
+    sizes = np.bincount(inv, minlength=n_groups)
+    need = 1 + int(val_fraction > 0) + int(test_fraction > 0)
+    if n_groups < need:
+        raise ValueError(
+            f"make_group_splits: {n_groups} group(s) cannot fill {need} partitions "
+            f"(val_fraction={val_fraction}, test_fraction={test_fraction})"
+        )
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(n_groups)
+
+    part = np.full(n_groups, 0, dtype=np.int64)  # 0 train, 1 val, 2 test
+    targets = {2: n * test_fraction, 1: n * val_fraction}
+    filled = {2: 0, 1: 0}
+    pos = 0
+    for label in (2, 1):
+        if targets[label] <= 0:
+            continue
+        # at least one group, then keep adding while below target and while
+        # enough groups remain for the partitions still to fill
+        remaining_needed = (1 if label == 2 and val_fraction > 0 else 0) + 1
+        while pos < n_groups - remaining_needed and (
+            filled[label] == 0 or filled[label] < targets[label]
+        ):
+            g = order[pos]
+            part[g] = label
+            filled[label] += int(sizes[g])
+            pos += 1
+    row_part = part[inv]
+    splits = {
+        "train": np.nonzero(row_part == 0)[0].astype(np.int64),
+        "val": np.nonzero(row_part == 1)[0].astype(np.int64),
+        "test": np.nonzero(row_part == 2)[0].astype(np.int64),
+    }
+    if len(splits["train"]) == 0:
+        raise ValueError("make_group_splits: no training groups left")
+    return splits
 
 
 def save_splits(splits: dict[str, np.ndarray], path: str) -> None:
@@ -708,17 +843,40 @@ def get_or_make_splits(
     val_fraction: float = 0.15,
     test_fraction: float = 0.15,
     seed: int = 42,
+    groups: np.ndarray | None = None,
+    strategy: str = "random",
 ) -> tuple[dict[str, np.ndarray], str]:
     """Read split JSON if it matches (n, fractions, seed); otherwise create and
-    save one. Returns (splits, path)."""
-    splits_path = os.path.join(cache_dir, f"splits_{cache_key}.json")
+    save one. Returns (splits, path).
+
+    ``strategy`` selects the partition rule:
+        random           per-row permutation (file ``splits_<key>.json``, unchanged)
+        group_sample     whole groups together, ``groups`` = sample ids
+        group_instrument whole groups together, ``groups`` = instrument ids
+    Grouped strategies require ``groups`` (length ``n``; see
+    :func:`measured_groups`) and use ``splits_<key>_<strategy>.json``.
+    """
+    if strategy not in _SPLIT_STRATEGIES:
+        raise ValueError(f"unknown split strategy {strategy!r}; choose from {_SPLIT_STRATEGIES}")
+    if strategy == "random":
+        splits_path = os.path.join(cache_dir, f"splits_{cache_key}.json")
+    else:
+        if groups is None:
+            raise ValueError(f"split strategy {strategy!r} requires `groups`")
+        groups = np.asarray(groups)
+        if len(groups) != n:
+            raise ValueError(f"`groups` has length {len(groups)}, expected n={n}")
+        splits_path = os.path.join(cache_dir, f"splits_{cache_key}_{strategy}.json")
     if os.path.isfile(splits_path):
         splits = load_splits(splits_path)
         total = sum(len(v) for v in splits.values())
         if total == n:
             return splits, splits_path
         # Stale (n changed) — regenerate
-    splits = make_splits(n, val_fraction, test_fraction, seed)
+    if strategy == "random":
+        splits = make_splits(n, val_fraction, test_fraction, seed)
+    else:
+        splits = make_group_splits(groups, val_fraction, test_fraction, seed)
     save_splits(splits, splits_path)
     return splits, splits_path
 
@@ -749,8 +907,20 @@ def build_dataset_from_config(cfg: dict) -> Dataset:
         return build_measured_dataset_from_config(cfg)
 
     paths = cfg["paths"]
-    ranges = cfg["ranges"]
     gen = cfg.get("generation", {})
+
+    # physics_version 2 generator (Kirchhoff-consistent, physical optical depth)
+    plasma_model = gen.get("plasma_model", "legacy")
+    if plasma_model in _PLASMA_MODELS_V2:
+        from data.two_zone_pipeline import build_two_zone_dataset_from_config  # lazy: avoids cycle
+        return build_two_zone_dataset_from_config(cfg)
+    if plasma_model != "legacy":
+        raise ValueError(
+            f"generation.plasma_model={plasma_model!r} not understood; "
+            f"use 'legacy' or one of {_PLASMA_MODELS_V2}"
+        )
+
+    ranges = cfg["ranges"]
 
     db_path = str(Path(paths["db"]).expanduser().resolve())
     xlsx_path = str(Path(paths["sample_matrix"]).expanduser().resolve())

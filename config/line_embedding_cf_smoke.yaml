@@ -1,0 +1,42 @@
+# Smoke variant of config/line_embedding_cf.yaml: same physics and selection
+# rules, fewer lines per element (8) and a single fit worker.
+
+line_dictionary:
+  db_path: external_data/Source/LIBS_data_vacuum.db
+  te_range: [6500.0, 11000.0]   # K
+  ne_range: [1.0e17, 5.0e17]    # cm^-3
+  n_grid:
+    te: 10
+    ne: 10
+  ne_log_spaced: true
+  selection:
+    mode: cf_isolated
+    isolation_window_nm: 0.3
+    max_interference_fraction: 0.3
+    reference_te: 10000
+    reference_ne: 1.0e17
+    ambient_elements: {Ar: 1.0}
+    max_lines_per_species: 8
+    min_lines_per_species: 4
+    force_include: cf/data/cf_oes_lines_54.tsv
+    target_elements: from_sample_matrix
+    sample_matrix: external_data/Source/Samples_Fe_matrix.xlsx
+    interferer_units: number
+    typical_concentration_floor: 1.0e-4
+  wavelength_clip:
+    min: null
+    max: null
+  wavelength_json: external_data/Data/VASKUT K8.json
+  use_wavelength_json_clip: true
+  cache_dir: external_data/cache
+
+line_features:
+  window_nm: 0.3
+  gamma_init: 0.02
+  sigma_init: 0.02
+  r2_min: 0.85
+  baseline: linear
+  max_delta_nm: 0.1            # fitted centre within ±0.1 nm of the DB wavelength
+  max_fwhm_nm: 0.2             # reject fits broader than 0.2 nm
+  workers: 1
+  cache_dir: external_data/cache

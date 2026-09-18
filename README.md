@@ -5,7 +5,7 @@ A self-supervised foundation model for Laser Induced Breakdown Spectroscopy (LIB
 ## Overview
 
 1. **Pre-trains** on unlabeled spectra (Masked Intensity Prediction on bins, or masked line-feature prediction on spectral lines)
-2. **Fine-tunes** for classification, regression, **binned quantification** (`quantification_binned` with decoded R²), and **element detection** (`detection` — multi-label presence/absence vs per-element limits of detection)
+2. **Fine-tunes** for classification, regression, **binned quantification** (`quantification_binned` with decoded R²), **element detection** (`detection` — multi-label presence/absence vs per-element limits of detection), and **calibration-free quantification** (`cf_quantification` — a differentiable Saha–Boltzmann solver seeded by the learned heads; see below)
 3. **Data** — `config/libs_data.yaml` (~112k shots from the sample matrix) or `config/libs_data_smoke.yaml` for quick tests
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design detail, [PROJECT_SUMMARY.html](PROJECT_SUMMARY.html) / [PROJECT_SUMMARY.json](PROJECT_SUMMARY.json) for full CLI and layout reference.
@@ -126,6 +126,45 @@ uv run python train_finetune.py \
 
 Monitored metric: `val/det_f1`. Test results include micro/macro F1 and per-element precision, recall, F1, and support in `run_info.yaml`.
 
+### Fine-tune (calibration-free quantification)
+
+`cf_quantification` keeps the physics in charge: mass fractions of all 38 elements come from a parameter-free Saha–Boltzmann solver (`cf/layer.py`: one common T, fitted N_e, self-absorption correction via the curve of growth, closure, LOD censoring). The only trainable parts are a per-line reliability-weight head and a T/N_e/N·l initial-guess head, trained on **synthetic data only** (`--cf_pure_physics` reports the zero-parameter variant). Frozen `quantification_binned` / `detection` runs on the **same token cache** provide the starting composition C0 and the element-presence gate.
+
+Data come from the physics-corrected two-zone generator (`data/two_zone_pipeline.py`, `generation.plasma_model: one_zone | two_zone | mixed`, Kirchhoff-consistent Planck source, quasi-neutral number density, cm path lengths). Its caches carry `physics_version: 2` in the cache key, so all `synthetic_cache_*`, `line_dict_*`, `line_features_*` and `line_tokens_*` hashes differ from the legacy generator — the old caches are left in place, never deleted.
+
+```bash
+# 1. CF line list (isolated lines + the 54 curated CF-OES lines) and tokens
+uv run python scripts/build_line_tokens.py \
+  --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding_cf.yaml
+
+# 2. Re-pretrain on the new tokens, then train the two seeds on them
+uv run python train_pretrain.py --config config/config_libs_token_linear_4090.yaml \
+  --libs_data_config config/libs_data.yaml --line_embedding_config config/line_embedding_cf.yaml
+uv run python train_finetune.py --config config/config_libs_token_linear_4090.yaml \
+  --pretrain_run_dir runs/pretrain_<cf_tokens> --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding_cf.yaml --pool cls_mean --task quantification_binned
+uv run python train_finetune.py ... --task detection
+
+# 3. CF task (heads trained on synthetic data, seeds frozen)
+uv run python train_finetune.py --config config/config_libs_cf_4090.yaml \
+  --pretrain_run_dir runs/pretrain_<cf_tokens> --libs_data_config config/libs_data.yaml \
+  --line_embedding_config config/line_embedding_cf.yaml --pool cls_mean \
+  --task cf_quantification \
+  --seed_binned_run_dir runs/finetune_<binned_seed> \
+  --seed_detection_run_dir runs/finetune_<detection_seed> \
+  --experiment_name libs_cf            # add --cf_pure_physics for the zero-parameter variant
+
+# 4. Zero-shot evaluation on all measured spectra (appends test_results_measured to run_info.yaml)
+uv run python scripts/evaluate_cf.py --run_dir runs/finetune_<cf> \
+  --libs_data_config config/libs_data_measured.yaml --line_embedding_config config/line_embedding_cf.yaml
+
+# 5. Classical CF baseline on the curated 54-line list (compare with the R reference)
+uv run python scripts/run_cf_classical.py --line_list cf_oes54 --sample "PURE KFE"
+```
+
+Monitored metric: `val/cf_log_rmse` (min). `run_info.yaml` gains `test_results.per_element.<El>.{log_rmse, within_2x, n_censored}`, plasma metrics (`te_mape`, `ne_log_mae`) and a `cf:` block (`seed_binned_run`, `seed_detection_run`, `pure_physics`, `cf_cfg`, `line_dict_path`, `spectra_cache_path`, `split_strategy`, `c0_source`) that `make_publication_figures.py` uses to rebuild the solver. Smoke variants: `config/libs_data_cf_smoke.yaml`, `config/line_embedding_cf_smoke.yaml`, `config/config_libs_cf_smoke.yaml`.
+
 ```bash
 uv run python list_runs.py --latest
 uv run tensorboard --logdir runs/
@@ -168,6 +207,7 @@ uv run python make_publication_figures.py --run_dir runs/finetune_<your_run> --s
 | ---- | ----------------- |
 | `quantification_binned` | `fig4_pred_vs_true`, `fig4b_per_element_r2` |
 | `detection` | `fig4_presence_detection`, `fig4b_per_element_f1` |
+| `cf_quantification` | `fig4_cf_pred_vs_true` (log–log, censored marked), `fig4b_cf_per_element_within2x`, `fig_cf_sb_plot` (Saha–Boltzmann plots, points sized by line weight), `fig_cf_plasma_recovery` (T / N_e vs generator truth, one- vs two-zone), `fig_cf_comparison` (CF-learned vs CF pure-physics vs binned seed; add runs with `--compare_runs "label=run_dir,..."`) |
 
 Shared outputs: annotated spectrum, attention heatmaps, training curves, t-SNE embedding map, graphical abstract, Voigt-fit zoom, GIFs. See `FIGURES_README.txt` in the output folder.
 
@@ -210,6 +250,7 @@ Saves PNG + SVG to `Outputs/`.
 | `config/config_libs_token.yaml`             | line_token        | any      | Small model for smoke          |
 | `config/config_libs_token_linear_4090.yaml` | line_token_linear | RTX 4090 | Pre-baked tokens + `nn.Linear` |
 | `config/config_libs_token_linear.yaml`      | line_token_linear | any      | Smoke for token-linear path    |
+| `config/config_libs_cf_4090.yaml`           | line_token_linear | RTX 4090 | `cf_quantification` (`finetune.cf` solver + loss weights) |
 
 
 ### Data and line embedding
@@ -221,7 +262,9 @@ Saves PNG + SVG to `Outputs/`.
 | `config/libs_data_smoke.yaml`      | 3 types × 6 shots                                                                       |
 | `config/line_embedding.yaml`       | Te/Ne grid, line-selection mode (`top_percent_per_element` default), Voigt-fit settings |
 | `config/line_embedding_smoke.yaml` | `max_lines: 400` for fast tests                                                         |
-| `config/element_lod.yaml`          | Per-element limits of detection (mass fraction) for the `detection` task                |
+| `config/element_lod.yaml`          | Per-element limits of detection (mass fraction) for the `detection` task and CF censoring |
+| `config/line_embedding_cf.yaml`    | CF line list: `selection.mode: cf_isolated`, forced 54 CF-OES lines, `isolation_score`/`forced` in `line_dict_*.h5` |
+| `config/libs_data_cf_smoke.yaml`   | Two-zone generator smoke config (`generation.plasma_model`, `zones`, `instrument`; caches tagged `physics_version: 2`) |
 
 
 **Line selection:** `line_dictionary.selection` in `line_embedding.yaml` defaults to top 10% per element (`min_keep: 10`); legacy threshold mode remains available via `selection.mode: threshold`.
@@ -240,7 +283,7 @@ Saves PNG + SVG to `Outputs/`.
 | `--num_workers`           | DataLoader workers (default 0)                                                                                |
 
 
-**Fine-tune:** `--pretrain_run_dir`, `--task` (`quantification_binned`, `detection`, `classification`, …), `--pool` (`cls`, `mean`, `cls_mean`). For `detection`, also `--element_lod_config` (default `config/element_lod.yaml`).
+**Fine-tune:** `--pretrain_run_dir`, `--task` (`quantification_binned`, `detection`, `cf_quantification`, `classification`, …), `--pool` (`cls`, `mean`, `cls_mean`). For `detection`, also `--element_lod_config` (default `config/element_lod.yaml`). For `cf_quantification`: `--seed_binned_run_dir`, `--seed_detection_run_dir`, `--cf_pure_physics`, `--cf_c0_source binned|uniform|truth`.
 
 ---
 

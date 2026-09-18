@@ -653,8 +653,41 @@ class MaskedLineTokensDataset(LineTokensDataset):
         }
 
 
+def _prepare_aux_targets(
+    aux_targets: Optional[Dict[str, np.ndarray]],
+    n: int,
+) -> Dict[str, np.ndarray]:
+    """Validate per-spectrum auxiliary targets (already sliced to the split).
+
+    Each value is coerced to a float32 array of length ``n`` (one scalar per
+    spectrum, matching ``indices``). Used for the plasma-state labels of the
+    ``cf_quantification`` task (``Te``, ``log10_Ne``, ``log10_Nl``,
+    ``is_two_zone``, ``has_plasma_labels``); any key is accepted and emitted
+    verbatim so the default collate produces one ``[B]`` tensor per key.
+    """
+    out: Dict[str, np.ndarray] = {}
+    if not aux_targets:
+        return out
+    for key, value in aux_targets.items():
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 0:
+            arr = np.full(n, float(arr), dtype=np.float32)
+        if arr.shape[0] != n:
+            raise ValueError(
+                f"aux_targets[{key!r}] has {arr.shape[0]} rows but the dataset has {n} indices"
+            )
+        out[str(key)] = arr
+    return out
+
+
 class LineTokensLabeledDataset(LineTokensDataset):
-    """Labeled fine-tuning with pre-baked tokens + class / concentration targets."""
+    """Labeled fine-tuning with pre-baked tokens + class / concentration targets.
+
+    ``aux_targets`` (optional) is a dict of per-spectrum float arrays already
+    sliced to the same split as ``labels`` (e.g. the output of
+    ``data.libs_pipeline.extract_plasma_targets`` indexed by the split);
+    every key is emitted as a float32 scalar tensor per item.
+    """
 
     def __init__(
         self,
@@ -662,6 +695,7 @@ class LineTokensLabeledDataset(LineTokensDataset):
         labels: np.ndarray,
         concentrations: Optional[np.ndarray] = None,
         indices: Optional[np.ndarray] = None,
+        aux_targets: Optional[Dict[str, np.ndarray]] = None,
     ):
         super().__init__(tokens_path, indices=indices)
         self.labels = np.asarray(labels).astype(np.int64)
@@ -673,6 +707,7 @@ class LineTokensLabeledDataset(LineTokensDataset):
             raise ValueError(
                 f"labels ({len(self.labels)}) must match indices ({len(self.indices)})"
             )
+        self.aux_targets = _prepare_aux_targets(aux_targets, len(self.indices))
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         spec_idx = int(self.indices[idx])
@@ -684,11 +719,16 @@ class LineTokensLabeledDataset(LineTokensDataset):
         }
         if self.concentrations is not None:
             out["concentrations"] = torch.from_numpy(self.concentrations[idx])
+        for key, arr in self.aux_targets.items():
+            out[key] = torch.tensor(arr[idx], dtype=torch.float32)
         return out
 
 
 class LineTokenLabeledDataset(LineFeaturesDataset):
-    """Labeled fine-tuning with line features + class/concentration targets."""
+    """Labeled fine-tuning with line features + class/concentration targets.
+
+    ``aux_targets`` behaves as in :class:`LineTokensLabeledDataset`.
+    """
 
     def __init__(
         self,
@@ -696,11 +736,13 @@ class LineTokenLabeledDataset(LineFeaturesDataset):
         labels: np.ndarray,
         concentrations: Optional[np.ndarray] = None,
         indices: Optional[np.ndarray] = None,
+        aux_targets: Optional[Dict[str, np.ndarray]] = None,
     ):
         super().__init__(features_path, indices=indices)
         self.labels = np.asarray(labels).astype(np.int64)
         self.concentrations = None if concentrations is None else np.asarray(concentrations, dtype=np.float32)
         assert len(self.labels) == len(self.indices)
+        self.aux_targets = _prepare_aux_targets(aux_targets, len(self.indices))
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         feats = super().__getitem__(idx)
@@ -711,6 +753,8 @@ class LineTokenLabeledDataset(LineFeaturesDataset):
         }
         if self.concentrations is not None:
             out["concentrations"] = torch.from_numpy(self.concentrations[idx])
+        for key, arr in self.aux_targets.items():
+            out[key] = torch.tensor(arr[idx], dtype=torch.float32)
         return out
 
 

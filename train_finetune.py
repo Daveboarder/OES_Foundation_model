@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -41,6 +42,75 @@ from data.line_embedding_pipeline import (
 from models.libs_transformer import LIBSTransformer
 from training.finetune import LIBSFinetuneModule, FinetuneDataModule
 from utils.run_manager import RunManager
+
+# Plasma-state targets and grouped splits (contracts C2/C3 in data/libs_pipeline.py).
+# Imported lazily-with-fallback so this script stays importable while the
+# generator module is still being landed; the fallbacks give "no plasma labels"
+# and the plain unique_id parser respectively.
+try:
+    from data.libs_pipeline import extract_plasma_targets
+except ImportError:  # pragma: no cover - transitional
+    extract_plasma_targets = None
+try:
+    from data.libs_pipeline import measured_groups
+except ImportError:  # pragma: no cover - transitional
+    measured_groups = None
+
+SPLIT_STRATEGIES = ('random', 'group_sample', 'group_instrument')
+PLASMA_TARGET_KEYS = ('Te', 'log10_Ne', 'log10_Nl', 'is_two_zone', 'has_plasma_labels')
+
+
+def _fallback_plasma_targets(sample_table) -> dict[str, np.ndarray]:
+    """C2-shaped zeros for tables without zone columns (measured data or a
+    libs_pipeline that predates extract_plasma_targets)."""
+    n = len(sample_table)
+    return {k: np.zeros(n, dtype=np.float32) for k in PLASMA_TARGET_KEYS}
+
+
+def plasma_targets_for_table(sample_table) -> dict[str, np.ndarray]:
+    """`extract_plasma_targets` (C2) with the zeros fallback; every value is a
+    float32 array of length len(sample_table)."""
+    if extract_plasma_targets is None:
+        return _fallback_plasma_targets(sample_table)
+    aux = extract_plasma_targets(sample_table)
+    out = {}
+    for key in PLASMA_TARGET_KEYS:
+        v = aux.get(key)
+        out[key] = (np.zeros(len(sample_table), dtype=np.float32) if v is None
+                    else np.asarray(v, dtype=np.float32).reshape(-1))
+    return out
+
+
+_RUN_SUFFIX_RE = re.compile(r"_R\d+$")
+
+
+def _fallback_measured_groups(sample_table, by: str = "sample") -> np.ndarray:
+    """Group ids from `unique_id` = `{sample}_{INSTRUMENT}_R{run:02d}` (the
+    instrument token is `NAME_SERIAL`, e.g. REMUS_9951601): strip the
+    `sample_type_id` prefix and the `_R<run>` suffix. Used only when
+    data.libs_pipeline.measured_groups is unavailable."""
+    if by == "sample":
+        return sample_table["sample_type_id"].astype(str).to_numpy()
+    if by != "instrument":
+        raise ValueError(f"measured_groups: by must be 'sample' or 'instrument', got {by!r}")
+    ids = sample_table["unique_id"].astype(str).to_numpy()
+    samples = sample_table["sample_type_id"].astype(str).to_numpy()
+    out = []
+    for uid, sid in zip(ids, samples):
+        rest = uid[len(sid) + 1:] if uid.startswith(sid + "_") else uid
+        out.append(_RUN_SUFFIX_RE.sub("", rest))
+    return np.asarray(out, dtype=str)
+
+
+def groups_for_strategy(sample_table, strategy: str) -> np.ndarray | None:
+    """Group ids for a split strategy (None for 'random')."""
+    if strategy == 'random':
+        return None
+    if strategy not in SPLIT_STRATEGIES:
+        raise ValueError(f"split strategy must be one of {SPLIT_STRATEGIES}, got {strategy!r}")
+    by = 'sample' if strategy == 'group_sample' else 'instrument'
+    fn = measured_groups if measured_groups is not None else _fallback_measured_groups
+    return np.asarray(fn(sample_table, by=by)).astype(str)
 
 
 class SaveRawEncoderCallback(Callback):
@@ -166,7 +236,12 @@ def _generate_legacy_labeled(config: dict, seed: int):
     }
 
 
-def _generate_libs_pipeline_labeled(config: dict, libs_config_path: str, seed: int):
+def _generate_libs_pipeline_labeled(
+    config: dict,
+    libs_config_path: str,
+    seed: int,
+    split_strategy: str | None = None,
+):
     """Realistic physics-based labeled data.
 
     Loads (or generates from cache) the full synthetic dataset, extracts
@@ -175,7 +250,11 @@ def _generate_libs_pipeline_labeled(config: dict, libs_config_path: str, seed: i
 
     Returns the same dict shape as the legacy path but with concentrations of
     shape [N, n_elements] (60 elements by default) and labels coming from
-    KMeans clustering on the concentration vectors.
+    KMeans clustering on the concentration vectors. Also returns `'aux'`:
+    the plasma-state targets of `extract_plasma_targets` (Te, log10_Ne,
+    log10_Nl, is_two_zone, has_plasma_labels) split like the labels, and
+    `'split_strategy'` (random | group_sample | group_instrument; the CLI
+    override wins over `downstream.splits.strategy`).
     """
     print(f"Generating LIBS-pipeline labeled data from {libs_config_path}...")
     libs_cfg = yaml.safe_load(open(libs_config_path))
@@ -193,6 +272,10 @@ def _generate_libs_pipeline_labeled(config: dict, libs_config_path: str, seed: i
     concentrations, element_names, sample_type_ids = extract_finetune_labels(
         ds.sample_table, elements=elements,
     )
+    aux_all = plasma_targets_for_table(ds.sample_table)
+    n_labelled = int(np.sum(aux_all['has_plasma_labels'] > 0))
+    print(f"Plasma-state labels: {n_labelled}/{len(ds)} spectra "
+          f"(two-zone: {int(np.sum(aux_all['is_two_zone'] > 0))})")
 
     # Override n_bins from the actual wavelength array
     actual_n_bins = spectra.shape[1]
@@ -212,8 +295,13 @@ def _generate_libs_pipeline_labeled(config: dict, libs_config_path: str, seed: i
 
     # Shared deterministic split — cached alongside the spectra. Pretrain and
     # finetune will read the same JSON so test set is consistent across phases.
+    # Grouped strategies (C3) keep whole samples / instruments on one side so
+    # measured evaluation does not leak replicate shots between train and test.
     split_cfg = downstream.get('splits', {})
-    splits, splits_path = get_or_make_splits(
+    strategy = str(split_strategy or split_cfg.get('strategy', 'random'))
+    if strategy not in SPLIT_STRATEGIES:
+        raise ValueError(f"split strategy must be one of {SPLIT_STRATEGIES}, got {strategy!r}")
+    split_kwargs = dict(
         n=len(spectra),
         cache_dir=ds.cache_dir,
         cache_key=ds.cache_key,
@@ -221,6 +309,18 @@ def _generate_libs_pipeline_labeled(config: dict, libs_config_path: str, seed: i
         test_fraction=split_cfg.get('test_fraction', 0.15),
         seed=split_cfg.get('seed', seed),
     )
+    if strategy != 'random':
+        groups = groups_for_strategy(ds.sample_table, strategy)
+        print(f"Split strategy {strategy}: {len(np.unique(groups))} groups")
+        try:
+            splits, splits_path = get_or_make_splits(**split_kwargs, groups=groups, strategy=strategy)
+        except TypeError as exc:
+            raise RuntimeError(
+                "data.libs_pipeline.get_or_make_splits does not accept groups/strategy yet "
+                f"(needed for split strategy {strategy!r})"
+            ) from exc
+    else:
+        splits, splits_path = get_or_make_splits(**split_kwargs)
     print(f"Splits: train={len(splits['train'])}, val={len(splits['val'])}, "
           f"test={len(splits['test'])}  (saved to {splits_path})")
     print(f"Elements: {len(element_names)}  Clusters: {n_clusters}  "
@@ -229,19 +329,34 @@ def _generate_libs_pipeline_labeled(config: dict, libs_config_path: str, seed: i
     def pick(idx):
         return spectra[idx], cluster_labels[idx], concentrations[idx]
 
+    def pick_aux(idx):
+        return {k: v[idx] for k, v in aux_all.items()}
+
     return {
         'train': pick(splits['train']),
         'val':   pick(splits['val']),
         'test':  pick(splits['test']),
+        'aux': {
+            'train': pick_aux(splits['train']),
+            'val':   pick_aux(splits['val']),
+            'test':  pick_aux(splits['test']),
+        },
         'element_names': element_names,
         'splits': splits,
+        'split_strategy': strategy,
         'libs_dataset': ds,
     }
 
 
-def generate_labeled_data(config: dict, seed: int = 42, libs_config_path: str | None = None):
+def generate_labeled_data(
+    config: dict,
+    seed: int = 42,
+    libs_config_path: str | None = None,
+    split_strategy: str | None = None,
+):
     if libs_config_path:
-        return _generate_libs_pipeline_labeled(config, libs_config_path, seed)
+        return _generate_libs_pipeline_labeled(config, libs_config_path, seed,
+                                               split_strategy=split_strategy)
     return _generate_legacy_labeled(config, seed)
 
 
@@ -385,6 +500,243 @@ def create_fresh_model(
     return model
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# cf_quantification helpers (also reused by scripts/evaluate_cf.py)
+# ─────────────────────────────────────────────────────────────────────────────
+def finetune_checkpoint_path(run_dir: str | Path) -> Path:
+    """`best.ckpt` of a fine-tune run when present, else the RunManager order."""
+    run_dir = Path(run_dir)
+    best = run_dir / "checkpoints" / "best.ckpt"
+    if best.is_file():
+        return best
+    ckpt = RunManager.from_existing_run(str(run_dir)).get_checkpoint_for_mode("finetune")
+    if ckpt is None or Path(ckpt).suffix != ".ckpt":
+        raise FileNotFoundError(f"no Lightning checkpoint (best.ckpt / last.ckpt) in {run_dir}")
+    return Path(ckpt)
+
+
+def load_module_state_shape_safe(module: torch.nn.Module, checkpoint_path: str | Path) -> None:
+    """Load a Lightning checkpoint's state_dict into `module`, keeping only
+    tensors whose key and shape match (mirrors publication/inference_runner)."""
+    ckpt_obj = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    sd = ckpt_obj["state_dict"] if isinstance(ckpt_obj, dict) and "state_dict" in ckpt_obj else ckpt_obj
+    mod_sd = module.state_dict()
+    filtered = {k: v for k, v in sd.items() if k in mod_sd and mod_sd[k].shape == v.shape}
+    missing, unexpected = module.load_state_dict(filtered, strict=False)
+    n_skipped = len(sd) - len(filtered)
+    if n_skipped or missing:
+        print(f"  state_dict: loaded {len(filtered)}/{len(mod_sd)} tensors "
+              f"(skipped {n_skipped} from checkpoint, {len(missing)} missing in checkpoint)")
+
+
+def lod_vector_from_run_info(run_info: dict, element_names: list[str]) -> torch.Tensor:
+    lod_map = run_info.get("element_lod") or {}
+    default = float(run_info.get("default_lod", 1e-4))
+    return torch.tensor([float(lod_map.get(n, default)) for n in element_names], dtype=torch.float32)
+
+
+def _token_cache_line_dict_hash(tokens_path: str | Path | None) -> str | None:
+    if not tokens_path or not Path(tokens_path).is_file():
+        return None
+    import h5py
+    with h5py.File(tokens_path, "r") as f:
+        h = f.attrs.get("line_dict_hash")
+    return str(h) if h is not None else None
+
+
+def align_model_section_with_pretrain(cfg: dict, pretrain_run: str | None) -> None:
+    """Overlay `cfg['model']` with the pretrain run's model section (if any),
+    exactly as align_config_with_pretrain_run does at training time."""
+    if not pretrain_run:
+        return
+    pre_cfg_path = Path(pretrain_run) / "config.yaml"
+    if not pre_cfg_path.is_file():
+        return
+    pre_cfg = yaml.safe_load(open(pre_cfg_path)) or {}
+    if "model" in pre_cfg:
+        cfg.setdefault("model", {}).update(pre_cfg["model"])
+
+
+def load_seed_module(
+    run_dir: str | Path,
+    config: dict,
+    token_meta: dict,
+    line_dict_meta: dict | None = None,
+    strict_tokens: bool = True,
+    expected_element_names: list[str] | None = None,
+) -> LIBSFinetuneModule:
+    """Load a frozen fine-tuned seed (quantification_binned / detection) for the
+    CF task, mirroring publication.inference_runner.FinetuneInferenceRunner.module.
+
+    Args:
+        run_dir: fine-tune run directory of the seed
+        config: current (aligned) training config — fallback for `data.n_classes`
+                and the model section when the seed run has no config.yaml
+        token_meta: current token cache meta (prepare_line_tokens_assets) —
+                    defines n_lines / feature normalisation of the encoder
+        line_dict_meta: unused for line_token_linear seeds (kept for symmetry
+                    with load_pretrained_model)
+        strict_tokens: require the seed's `line_tokens_path` basename to equal
+                    the current token cache basename (training). Evaluation on
+                    another spectra cache (scripts/evaluate_cf.py) passes False
+                    and only the line-dictionary hash / n_lines are compared.
+        expected_element_names: raise if the seed's element order differs
+
+    Returns:
+        LIBSFinetuneModule in eval mode with all parameters frozen.
+    """
+    from analyze_attention_importance import _checkpoint_encoder_state, build_encoder
+
+    run_dir = Path(run_dir)
+    run_info_path = run_dir / "run_info.yaml"
+    if not run_info_path.is_file():
+        raise FileNotFoundError(f"seed run has no run_info.yaml: {run_dir}")
+    run_info = yaml.safe_load(open(run_info_path))
+    cfg_path = run_dir / "config.yaml"
+    cfg = yaml.safe_load(open(cfg_path)) if cfg_path.is_file() else {}
+    cfg.setdefault("model", dict(config.get("model", {})))
+    cfg.setdefault("data", {})
+    cfg["data"].setdefault("n_classes", config.get("data", {}).get("n_classes", 10))
+    # The effective model section of a fine-tune run is the one of its pretrain
+    # run (align_config_with_pretrain_run); run_dir/config.yaml is the raw copy.
+    align_model_section_with_pretrain(cfg, run_info.get("pretrain_run"))
+
+    emb_type = run_info.get("embedding_type") or cfg["model"].get("embedding_type", "intensity")
+    if emb_type != "line_token_linear":
+        raise ValueError(
+            f"seed run {run_dir.name} has embedding_type={emb_type!r}; the CF task "
+            "needs line_token_linear seeds (same token cache as the CF encoder)."
+        )
+    cfg["model"]["embedding_type"] = emb_type
+
+    # Token-layout consistency between the seed and the current cache.
+    seed_tokens = run_info.get("line_tokens_path")
+    cur_tokens = token_meta.get("line_tokens_path")
+    if strict_tokens:
+        if not seed_tokens or not cur_tokens or Path(seed_tokens).name != Path(cur_tokens).name:
+            raise AssertionError(
+                f"seed run {run_dir.name} was trained on token cache "
+                f"{Path(seed_tokens).name if seed_tokens else None}, but the current cache is "
+                f"{Path(cur_tokens).name if cur_tokens else None}. Re-train the seed on the "
+                "current tokens (same libs_data / line_embedding configs)."
+            )
+    else:
+        seed_hash = _token_cache_line_dict_hash(seed_tokens)
+        cur_hash = _token_cache_line_dict_hash(cur_tokens)
+        if seed_hash and cur_hash and seed_hash != cur_hash:
+            raise AssertionError(
+                f"seed run {run_dir.name} used line dictionary {seed_hash}, current cache "
+                f"uses {cur_hash} — token layouts differ."
+            )
+    n_lines = int(token_meta["n_lines"])
+    cfg["data"]["n_bins"] = n_lines
+    cfg["model"]["max_seq_len"] = n_lines + 1
+
+    encoder = build_encoder(cfg, run_info, token_meta)
+    ckpt = finetune_checkpoint_path(run_dir)
+    enc_state = _checkpoint_encoder_state(str(ckpt))
+    enc_sd = encoder.state_dict()
+    encoder.load_state_dict(
+        {k: v for k, v in enc_state.items() if k in enc_sd and enc_sd[k].shape == v.shape},
+        strict=False,
+    )
+
+    element_names = list(run_info["element_names"])
+    if expected_element_names is not None and element_names != list(expected_element_names):
+        raise ValueError(
+            f"seed run {run_dir.name} predicts {len(element_names)} elements in a different "
+            f"order than the current run ({len(expected_element_names)}); C0 / presence "
+            "columns would be misaligned."
+        )
+    module = LIBSFinetuneModule(
+        encoder=encoder,
+        task=run_info["task"],
+        n_classes=int(cfg["data"]["n_classes"]),
+        n_elements=int(run_info["n_elements"]),
+        n_concentration_bins=int(run_info.get("n_concentration_bins", 1000)),
+        pool=run_info.get("pool", "cls"),
+        element_names=element_names,
+        lod=lod_vector_from_run_info(run_info, element_names),
+    )
+    load_module_state_shape_safe(module, ckpt)
+    module.eval()
+    for p in module.parameters():
+        p.requires_grad_(False)
+    print(f"Loaded seed {run_info['task']} module from {ckpt} "
+          f"(best {run_info.get('best_metric')})")
+    return module
+
+
+def build_cf_assets(
+    args,
+    config: dict,
+    element_names: list[str],
+    libs_data_config: str,
+    token_meta: dict,
+    spectra_cache_path: str | None,
+    split_strategy: str | None,
+    strict_tokens: bool = True,
+) -> dict:
+    """Everything the cf_quantification module needs: CF tables, the `finetune.cf`
+    config with CLI overrides, the frozen seeds and the run_info `cf` block (C7).
+
+    `args` must carry seed_binned_run_dir, seed_detection_run_dir,
+    cf_pure_physics, cf_c0_source and element_lod_config.
+    """
+    from cf.tables import build_cf_tables  # lazy: cf/ is only needed for this task
+
+    if element_names is None:
+        raise ValueError("cf_quantification requires the LIBS data pipeline (--libs_data_config).")
+    libs_cfg = yaml.safe_load(open(libs_data_config))
+    db_path = str(Path(libs_cfg["paths"]["db"]).expanduser().resolve())
+    cf_tables = build_cf_tables(element_names, db_path, args.element_lod_config)
+
+    cf_cfg = dict(config.get("finetune", {}).get("cf", {}) or {})
+    cf_cfg["pure_physics"] = bool(args.cf_pure_physics)
+    cf_cfg["c0_source"] = str(args.cf_c0_source)
+    cf_cfg["line_dict_path"] = token_meta.get("line_dict_path")
+
+    seed_binned = seed_detection = None
+    if args.seed_binned_run_dir:
+        seed_binned = load_seed_module(
+            args.seed_binned_run_dir, config, token_meta,
+            strict_tokens=strict_tokens, expected_element_names=element_names,
+        )
+        if seed_binned.task != "quantification_binned":
+            raise ValueError(f"--seed_binned_run_dir must be a quantification_binned run "
+                             f"(got {seed_binned.task})")
+    elif cf_cfg["c0_source"] == "binned":
+        print("WARNING: --cf_c0_source binned without --seed_binned_run_dir → uniform C0")
+    if args.seed_detection_run_dir:
+        seed_detection = load_seed_module(
+            args.seed_detection_run_dir, config, token_meta,
+            strict_tokens=strict_tokens, expected_element_names=element_names,
+        )
+        if seed_detection.task != "detection":
+            raise ValueError(f"--seed_detection_run_dir must be a detection run "
+                             f"(got {seed_detection.task})")
+
+    run_info_cf = {
+        "seed_binned_run": str(args.seed_binned_run_dir) if args.seed_binned_run_dir else None,
+        "seed_detection_run": str(args.seed_detection_run_dir) if args.seed_detection_run_dir else None,
+        "pure_physics": bool(args.cf_pure_physics),
+        "cf_cfg": {k: (v if isinstance(v, (int, float, str, bool, type(None), list, dict)) else str(v))
+                   for k, v in cf_cfg.items()},
+        "line_dict_path": cf_cfg["line_dict_path"],
+        "spectra_cache_path": spectra_cache_path,
+        "split_strategy": split_strategy,
+        "c0_source": cf_cfg["c0_source"],
+    }
+    return {
+        "cf_tables": cf_tables,
+        "cf_cfg": cf_cfg,
+        "seed_binned": seed_binned,
+        "seed_detection": seed_detection,
+        "run_info_cf": run_info_cf,
+        "lod_map": {n: float(cf_tables.lod[i]) for i, n in enumerate(element_names)},
+    }
+
+
 def main(args):
     config = load_config(args.config)
 
@@ -431,11 +783,20 @@ def main(args):
                 "--line_embedding_config and --libs_data_config"
             )
 
-    data = generate_labeled_data(config, seed=args.seed, libs_config_path=args.libs_data_config)
+    data = generate_labeled_data(
+        config, seed=args.seed, libs_config_path=args.libs_data_config,
+        split_strategy=getattr(args, 'split_strategy', None),
+    )
     train_spectra, train_labels, train_conc = data['train']
     val_spectra, val_labels, val_conc = data['val']
     test_spectra, test_labels, test_conc = data['test']
     element_names = data.get('element_names')
+    aux = data.get('aux') or {}
+    train_aux, val_aux, test_aux = aux.get('train'), aux.get('val'), aux.get('test')
+    split_strategy = data.get('split_strategy')
+    spectra_cache_path = None
+    if 'libs_dataset' in data and hasattr(data['libs_dataset'], '_cache_path'):
+        spectra_cache_path = str(data['libs_dataset']._cache_path())
 
     if use_line_token and 'libs_dataset' in data:
         ds = data['libs_dataset']
@@ -513,6 +874,34 @@ def main(args):
                                  key=lambda kv: kv[1], reverse=True):
             print(f"  {name:>3s}: present={frac:6.2%}  lod={lod_map[name]:.1e}")
 
+    # CF task: physics tables, frozen seeds and the `finetune.cf` block.
+    cf_assets = None
+    cf_module_kwargs: dict = {}
+    if args.task == 'cf_quantification':
+        if line_token_meta is None:
+            raise ValueError(
+                "cf_quantification requires the line_token_linear path "
+                "(--libs_data_config + --line_embedding_config)."
+            )
+        cf_assets = build_cf_assets(
+            args, config, element_names, args.libs_data_config, line_token_meta,
+            spectra_cache_path=spectra_cache_path, split_strategy=split_strategy,
+        )
+        cf_module_kwargs = {
+            'cf_tables': cf_assets['cf_tables'],
+            'cf_cfg': cf_assets['cf_cfg'],
+            'seed_binned': cf_assets['seed_binned'],
+            'seed_detection': cf_assets['seed_detection'],
+        }
+        lod_map = cf_assets['lod_map']
+        n_labelled_train = int(np.sum(train_aux['has_plasma_labels'] > 0)) if train_aux else 0
+        print(f"CF task: pure_physics={args.cf_pure_physics}, c0_source={args.cf_c0_source}, "
+              f"presence_gate={cf_assets['cf_cfg'].get('presence_gate', True)}, "
+              f"train shots with plasma labels: {n_labelled_train}/{len(train_labels)}")
+        if n_labelled_train == 0:
+            print("WARNING: no training shot carries plasma labels — the CF heads will not "
+                  "receive any gradient (measured data never trains the CF task).")
+
     finetune_module = LIBSFinetuneModule(
         encoder=encoder,
         task=args.task,
@@ -528,9 +917,12 @@ def main(args):
         element_names=element_names,
         lod=lod_vector,
         detection_pos_weight=lod_pos_weight,
+        **cf_module_kwargs,
     )
 
-    needs_concentrations = args.task in ('regression', 'quantification', 'quantification_binned', 'detection', 'both')
+    needs_concentrations = args.task in ('regression', 'quantification', 'quantification_binned',
+                                         'detection', 'cf_quantification', 'both')
+    needs_aux = args.task == 'cf_quantification'
     spectra_unused = line_features_path is not None or line_tokens_path is not None
     data_module = FinetuneDataModule(
         train_spectra=train_spectra if not spectra_unused else None,
@@ -545,6 +937,8 @@ def main(args):
         line_tokens_path=line_tokens_path,
         train_indices=train_indices,
         val_indices=val_indices,
+        train_aux=train_aux if needs_aux else None,
+        val_aux=val_aux if needs_aux else None,
     )
 
     # Logger
@@ -582,6 +976,8 @@ def main(args):
         monitor, mon_mode = 'val/bin_accuracy', 'max'
     elif args.task == 'detection':
         monitor, mon_mode = 'val/det_f1', 'max'
+    elif args.task == 'cf_quantification':
+        monitor, mon_mode = 'val/cf_log_rmse', 'min'
     else:
         monitor, mon_mode = 'val/loss', 'min'
 
@@ -610,7 +1006,7 @@ def main(args):
         ))
 
     # Run info
-    run_mgr.save_run_info({
+    run_info_common = {
         "task": args.task,
         "pool": args.pool,
         "embedding_type": config['model'].get('embedding_type', 'intensity'),
@@ -621,14 +1017,21 @@ def main(args):
         "line_embedding_config": args.line_embedding_config,
         "line_features_path": line_features_path,
         "line_tokens_path": line_tokens_path,
+        "spectra_cache_path": spectra_cache_path,
+        "split_strategy": split_strategy,
         "model_params": encoder.num_parameters,
         "train_samples": len(train_labels),
         "val_samples": len(val_labels),
         "test_samples": len(test_labels),
         "freeze_encoder": args.freeze_encoder,
         "pretrain_run": pretrain_run_dir,
-        "pretrain_checkpoint": str(pretrained_checkpoint) if pretrained_checkpoint else None,
         "seed": args.seed,
+    }
+    if cf_assets is not None:
+        run_info_common["cf"] = cf_assets["run_info_cf"]
+    run_mgr.save_run_info({
+        **run_info_common,
+        "pretrain_checkpoint": str(pretrained_checkpoint) if pretrained_checkpoint else None,
         "status": "running",
     })
 
@@ -661,6 +1064,7 @@ def main(args):
             test_labels,
             concentrations=test_conc if needs_concentrations else None,
             indices=test_indices,
+            aux_targets=test_aux if needs_aux else None,
         )
     elif line_features_path:
         from data.dataset import LineTokenLabeledDataset
@@ -669,6 +1073,7 @@ def main(args):
             test_labels,
             concentrations=test_conc if needs_concentrations else None,
             indices=test_indices,
+            aux_targets=test_aux if needs_aux else None,
         )
     else:
         test_dataset = LabeledLIBSDataset(
@@ -689,6 +1094,7 @@ def main(args):
         element_names=element_names,
         lod=lod_vector,
         detection_pos_weight=lod_pos_weight,
+        **cf_module_kwargs,
     )
     test_results = trainer.test(best_model, dataloaders=test_loader)
     aggregate_test_results = dict(test_results[0]) if test_results else {}
@@ -698,6 +1104,9 @@ def main(args):
     detection_test = getattr(best_model, "test_detection_metrics", {}) or {}
     if detection_test:
         aggregate_test_results["detection"] = detection_test
+    plasma_test = getattr(best_model, "test_plasma_metrics", {}) or {}
+    if plasma_test:
+        aggregate_test_results["test_plasma_metrics"] = plasma_test
 
     # Save final raw encoder weights
     final_path = run_mgr.checkpoint_dir / 'final_encoder.pt'
@@ -705,27 +1114,12 @@ def main(args):
     print(f"\nSaved final encoder to {final_path}")
 
     run_mgr.save_run_info({
-        "task": args.task,
-        "pool": args.pool,
-        "embedding_type": config['model'].get('embedding_type', 'intensity'),
-        "n_elements": n_elements,
-        "n_concentration_bins": n_concentration_bins,
-        "element_names": element_names,
-        "libs_data_config": args.libs_data_config,
-        "line_embedding_config": args.line_embedding_config,
-        "line_features_path": line_features_path,
-        "line_tokens_path": line_tokens_path,
-        "model_params": encoder.num_parameters,
-        "train_samples": len(train_labels),
-        "val_samples": len(val_labels),
-        "test_samples": len(test_labels),
-        "freeze_encoder": args.freeze_encoder,
-        "pretrain_run": pretrain_run_dir,
-        "seed": args.seed,
+        **run_info_common,
         "status": "completed",
         "best_metric": float(checkpoint_callback.best_model_score) if checkpoint_callback.best_model_score else None,
         "final_encoder": str(final_path),
-        "element_lod_config": args.element_lod_config if args.task == 'detection' else None,
+        "element_lod_config": (args.element_lod_config
+                               if args.task in ('detection', 'cf_quantification') else None),
         "element_lod": lod_map,
         "test_results": aggregate_test_results if aggregate_test_results else None,
     })
@@ -740,9 +1134,14 @@ def main(args):
         print("\nTest metrics (aggregate):")
         for k in ("test/bin_accuracy", "test/decoded_mae", "test/decoded_r2",
                   "test/det_f1", "test/det_accuracy", "test/det_precision",
-                  "test/det_recall", "test/loss"):
+                  "test/det_recall", "test/cf_log_rmse", "test/cf_within2x",
+                  "test/cf_r2_major", "test/te_mape", "test/ne_log_mae", "test/loss"):
             if k in aggregate_test_results:
                 print(f"  {k}: {float(aggregate_test_results[k]):.6f}")
+    if plasma_test:
+        print("\nCF plasma-state recovery (one-zone synthetic test shots):")
+        for k, v in plasma_test.items():
+            print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
     if detection_test:
         print("\nDetection metrics:")
         for k in ("macro_f1", "micro_f1", "element_accuracy", "exact_match"):
@@ -762,12 +1161,18 @@ def main(args):
             if name not in per_element_test:
                 continue
             m = per_element_test[name]
-            print(
-                f"  {name}: mae={m['mae']:.6f}, r2={m['r2']:.6f}, "
-                f"pearson={m['pearson']:.6f}, spearman={m['spearman']:.6f}"
-            )
+            line = (f"  {name}: mae={m['mae']:.6f}, r2={m['r2']:.6f}, "
+                    f"pearson={m['pearson']:.6f}, spearman={m['spearman']:.6f}")
+            if 'log_rmse' in m:
+                line += (f", log_rmse={m['log_rmse']:.4f}, within_2x={m['within_2x']:.3f}, "
+                         f"n_censored={int(m['n_censored'])}")
+            print(line)
     print(f"\nTo evaluate:")
-    print(f"  uv run python evaluate_model.py --run_dir {run_mgr.run_dir}")
+    if args.task == 'cf_quantification':
+        print(f"  uv run python scripts/evaluate_cf.py --run_dir {run_mgr.run_dir} "
+              f"--libs_data_config config/libs_data_measured.yaml")
+    else:
+        print(f"  uv run python evaluate_model.py --run_dir {run_mgr.run_dir}")
 
 
 if __name__ == "__main__":
@@ -780,17 +1185,42 @@ if __name__ == "__main__":
     parser.add_argument('--task', type=str,
                         choices=['classification', 'quantification',
                                  'quantification_binned', 'detection',
+                                 'cf_quantification',
                                  'regression', 'both'],
                         default='both',
                         help='Downstream task: classification (cluster ID), '
                              'quantification (MSE regression on concentrations), '
                              'quantification_binned (per-element bin CE, upstream-style), '
                              'detection (multi-label element presence/absence vs LOD), '
+                             'cf_quantification (calibration-free Saha–Boltzmann solver '
+                             'seeded by frozen binned/detection runs; needs the '
+                             'line_token_linear path), '
                              'regression/both (legacy, kept for backward compat)')
     parser.add_argument('--element_lod_config', type=str,
                         default='config/element_lod.yaml',
                         help='Per-element limit-of-detection YAML used to derive '
-                             'presence/absence labels for the detection task.')
+                             'presence/absence labels for the detection task and the '
+                             'censoring thresholds of cf_quantification.')
+    # cf_quantification only
+    parser.add_argument('--seed_binned_run_dir', type=str, default=None,
+                        help='[cf] fine-tune run (task quantification_binned) on the SAME '
+                             'token cache; its argmax concentrations seed the closure (C0).')
+    parser.add_argument('--seed_detection_run_dir', type=str, default=None,
+                        help='[cf] fine-tune run (task detection) on the SAME token cache; '
+                             'presence >= 0.5 gates the per-line weights.')
+    parser.add_argument('--cf_pure_physics', action='store_true',
+                        help='[cf] zero-parameter variant: classical line weights '
+                             '(cf.classical) and solver default init instead of the '
+                             'learned heads.')
+    parser.add_argument('--cf_c0_source', type=str, choices=['binned', 'uniform', 'truth'],
+                        default='binned',
+                        help='[cf] closure seed: binned (seed run argmax), uniform, or '
+                             'truth (batch concentrations — debugging only).')
+    parser.add_argument('--split_strategy', type=str, choices=list(SPLIT_STRATEGIES),
+                        default=None,
+                        help='Override downstream.splits.strategy of the libs data config: '
+                             'random | group_sample | group_instrument (grouped strategies '
+                             'keep whole measured samples / instruments on one side).')
     parser.add_argument('--libs_data_config', type=str, default=None,
                         help='Path to physics-based LIBS data pipeline config '
                              '(e.g. config/libs_data.yaml). If set, replaces the '

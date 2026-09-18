@@ -1,0 +1,104 @@
+# =============================================================================
+# Calibration-free (CF) quantification — RTX 4090, line_token_linear encoder
+# =============================================================================
+# = config_libs_token_linear_4090.yaml + `finetune.cf` block.  The concentrations
+# come from the parameter-free Saha–Boltzmann layer (cf/); the encoder only
+# feeds a per-line weight head and a plasma-state init head, both trained on
+# synthetic shots (has_plasma_labels == 1) only.
+#
+#   # seeds first (same tokens as the CF encoder):
+#   uv run python train_finetune.py --config config/config_libs_cf_4090.yaml \
+#     --pretrain_run_dir runs/pretrain_<cf tokens> --task quantification_binned \
+#     --libs_data_config config/libs_data.yaml --line_embedding_config config/line_embedding_cf.yaml \
+#     --pool cls_mean --experiment_name cf_seed_binned
+#   uv run python train_finetune.py ... --task detection --experiment_name cf_seed_detection
+#   # CF task:
+#   uv run python train_finetune.py --config config/config_libs_cf_4090.yaml \
+#     --pretrain_run_dir runs/pretrain_<cf tokens> --task cf_quantification \
+#     --libs_data_config config/libs_data.yaml --line_embedding_config config/line_embedding_cf.yaml \
+#     --seed_binned_run_dir runs/finetune_<..>_cf_seed_binned \
+#     --seed_detection_run_dir runs/finetune_<..>_cf_seed_detection \
+#     --pool cls_mean --experiment_name libs_cf_4090 --num_workers 4
+#   # zero-parameter reference: add --cf_pure_physics
+# =============================================================================
+
+data:
+  n_bins: 2048           # overridden to n_lines after tokens build
+  n_classes: 10          # overridden from libs_data downstream.n_clusters
+  n_elements: 60
+  n_concentration_bins: 1000
+  synthetic:
+    val_fraction: 0.15
+
+model:
+  embedding_type: line_token_linear
+  d_model: 128
+  n_heads: 8
+  n_layers: 6
+  d_ff: 512
+  dropout: 0.1
+  max_seq_len: 8192      # placeholder; set to n_lines + 1
+  n_mip_target_channels: 2   # max_intensity + FWHM
+  num_intensity_bins: 256
+  num_fwhm_bins: 100
+
+discretization:
+  intensity:
+    num_bins: 256
+    min_val: 1.0e-4
+    max_val: 1.1
+    strategy: log
+  fwhm:
+    num_bins: 100
+    min_val: 0.01
+    max_val: 1.1
+    strategy: uniform
+
+pretrain:
+  loss: classification               # mse | classification
+  mask_ratio: 0.15
+  batch_size: 4
+  accumulate_grad_batches: 8
+  epochs: 20
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+
+finetune:
+  batch_size: 4
+  epochs: 20
+  warmup_epochs: 1
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder: false
+  # Calibration-free task (task=cf_quantification). Solver keys go to
+  # cf.layer.SahaBoltzmannLayer; lambda_* weight the loss terms
+  #   L = L_conc + λ_T·((T−Te)/Te)²·[one_zone] + λ_Ne·(log10Ne − true)²·[one_zone]
+  #       + λ_Nl·(log10Nl0 − true)² + λ_w·(mean w[fit_valid] − 1)²
+  # (see training/finetune.py: CF_CFG_DEFAULTS, compute_cf_loss).
+  cf:
+    n_iter: 3            # fixed-point iterations for the T in the Saha term
+    ridge: 1.0e-6        # Tikhonov ridge on the weighted LS normal matrix
+    prior_T: 0.1         # weight of the (β − 1/kT0)² prior row
+    prior_Ne: 0.1        # weight of the (η − ln Ne0)² prior row
+    sa_correction: true  # curve-of-growth self-absorption correction of areas
+    gamma_nm: 0.01       # Lorentzian HWHM [nm] used for tau0 (Stark proxy)
+    lambda_T: 0.1
+    lambda_Ne: 0.1
+    lambda_Nl: 0.1
+    lambda_w: 0.01
+    presence_gate: true  # gate line weights by the seed detection head (>= 0.5)
+    eps: 1.0e-7          # ln(C + eps) floor in the loss / solver
+    min_lines: 2         # elements with fewer weighted lines fall back to the seed
+    reject_sigma: 3.0    # robust residual rejection between solves (0 = off)
+    reject_floor: 0.15
+
+logging:
+  logger: tensorboard
+  log_every_n_steps: 25
+  val_check_interval: 1.0
+
+device:
+  accelerator: gpu
+  precision: bf16-mixed

@@ -1,0 +1,54 @@
+# Smoke-test data config for the physics_version-2 (two-zone) generator and
+# the calibration-free (CF) task: 3 sample types × 6 shots.
+# Coarser fine_step_nm than config/libs_data.yaml for speed; everything else
+# mirrors the full config. Cache: synthetic_cache_<key>.h5 (new key).
+paths:
+  db:                "external_data/Source/LIBS_data_vacuum.db"
+  sample_matrix:     "external_data/Source/Samples_Fe_matrix.xlsx"
+  wavelength_json:   "external_data/Data/VASKUT K8.json"
+  cache_dir:         "external_data/cache"
+
+ranges:                       # legacy keys, unused by the v2 generator
+  te: [6500.0, 11000.0]
+  ne: [1.0e+17, 5.0e+17]
+
+generation:
+  n_samples_per_type: 6       # small but enough to satisfy n_clusters + 3-way split
+  max_sample_types: 3
+  number_density:    auto
+  number_density_max: null
+  n_workers:         1
+  seed:              42
+  verbose:           true
+
+  plasma_model: mixed
+  outer_density: isobaric
+  two_zone_fraction: 0.7
+  zones:
+    te1: [8000, 20000]
+    ne1: [5.0e+16, 3.0e+18]
+    te2_ratio: [0.15, 0.6]
+    ne2_log_ratio: [-3, -1]
+    l_inner_cm: [0.003, 0.05]    # log-uniform; calibrated 2026-09-18 on PURE KFE (core N*l 5e15-3e16 cm^-2)
+    l_outer_cm: [2.0e-5, 2.0e-3]  # log-uniform, per outer segment; calibrated (shell N*l 1e14-3e14 cm^-2)
+    gamma_stark_nm: [0.003, 0.03]
+  instrument:
+    profile: gaussian
+    fwhm_nm: 0.047               # calibrated: median of 15 isolated weak Fe lines in PURE KFE
+  fine_step_nm: 0.005         # coarser than the full config (0.002) for speed
+  line_window_nm: 0.4
+  adaptive_window: true
+  min_relative_intensity: 1.0e-7
+  augment:
+    noise_sigma: 0.0
+    continuum: 0.0
+
+downstream:
+  elements_to_predict: null   # all element columns
+  n_clusters: 3               # 3 sample types → 3 clusters
+  n_concentration_bins: 50    # tiny for smoke test (full is 1000)
+  splits:
+    strategy: random
+    val_fraction: 0.2
+    test_fraction: 0.2
+    seed: 42

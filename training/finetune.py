@@ -9,11 +9,14 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from typing import Any, Dict, Optional, Literal
 import math
+import warnings
 import numpy as np
 from scipy.stats import spearmanr
 
 from models.heads import (
     BinnedQuantificationHead,
+    CFLineWeightHead,
+    CFPlasmaInitHead,
     ClassificationHead,
     DetectionHead,
     RegressionHead,
@@ -29,6 +32,11 @@ from models.heads import (
 #   'quantification_binned'  — per-element bin CE (upstream-style, 1000-way per element)
 #   'detection'              — multi-label element presence/absence (BCE), labels
 #                              derived from concentrations vs per-element LODs
+#   'cf_quantification'      — calibration-free quantification: concentrations come
+#                              from the parameter-free Saha–Boltzmann layer (cf/);
+#                              the encoder only feeds a per-line weight head and a
+#                              plasma-state init head, trained on synthetic data
+#                              (batches with has_plasma_labels == 1) only.
 #   'regression' / 'both'    — legacy aliases kept for backward compatibility:
 #                              'regression' == 'quantification' (sigmoid head),
 #                              'both' = classification + regression jointly.
@@ -37,9 +45,52 @@ TaskName = Literal[
     'quantification',
     'quantification_binned',
     'detection',
+    'cf_quantification',
     'regression',
     'both',
 ]
+
+# Elements whose per-element R² is averaged into `cf_r2_major` (those present
+# in element_names are used; the rest are ignored).
+CF_MAJOR_ELEMENTS = ('Fe', 'C', 'Mn', 'Si', 'Cr', 'Ni', 'Cu', 'Al')
+
+# Keys of `finetune.cf` forwarded verbatim to cf.layer.SahaBoltzmannLayer(cfg=…)
+# (only those present in the config; the layer rejects unknown keys).
+CF_LAYER_KEYS = ('n_iter', 'ridge', 'prior_T', 'prior_Ne', 'sa_correction',
+                 'gamma_nm', 'eps', 'min_area', 'sa_seed_init', 'use_isolation',
+                 'min_lines', 'reject_sigma', 'reject_floor')
+
+# Defaults for every `finetune.cf` key the task reads (config overrides win).
+CF_CFG_DEFAULTS: dict[str, Any] = {
+    # solver (see cf/layer.py)
+    'n_iter': 3,
+    'ridge': 1e-6,
+    'prior_T': 0.1,
+    'prior_Ne': 0.1,
+    'sa_correction': True,
+    'gamma_nm': 0.01,
+    'eps': 1e-7,
+    'min_area': 0.0,
+    'min_lines': 2,
+    'reject_sigma': 3.0,
+    'reject_floor': 0.15,
+    # loss weights (plan: L = L_conc + λ_T·… + λ_Ne·… + λ_Nl·… + λ_w·…)
+    'lambda_T': 0.1,
+    'lambda_Ne': 0.1,
+    'lambda_Nl': 0.1,
+    'lambda_w': 0.01,
+    # plumbing
+    'presence_gate': True,      # gate line weights by the seed detection head (≥ 0.5)
+    'pure_physics': False,      # classical weights + solver defaults, no learned heads
+    'c0_source': 'binned',      # binned | uniform | truth (truth = debug only)
+    'line_dict_path': None,     # line_dict_<h>.h5 with isolation_score / forced
+    'weight_hidden': 64,        # CFLineWeightHead hidden width
+    'classical': {},            # kwargs for cf.classical.classical_weights (pure_physics)
+    # solver defaults used when the init head is bypassed (pure_physics)
+    'T0_default': 10000.0,
+    'log10_Ne0_default': 17.0,
+    'log10_Nl0_default': 16.0,
+}
 
 
 class LIBSFinetuneModule(pl.LightningModule):
@@ -52,6 +103,10 @@ class LIBSFinetuneModule(pl.LightningModule):
         - classification:        batch['label']           (int64, [B])
         - quantification:        batch['concentrations']  (float32, [B, n_elements])
         - quantification_binned: batch['concentrations']  (float32, [B, n_elements])
+        - detection:             batch['concentrations'] (binarised against LOD)
+        - cf_quantification:     batch['concentrations'] + plasma aux targets
+                                 (Te, log10_Ne, log10_Nl, is_two_zone,
+                                 has_plasma_labels; each float32 [B])
         - both:                  batch['label'] + batch['concentrations']
 
     Args:
@@ -68,6 +123,13 @@ class LIBSFinetuneModule(pl.LightningModule):
         max_epochs: Maximum epochs
         class_weights: Optional class weights for imbalanced classification
         pool: Pooling strategy for the encoder representation
+        cf_tables: cf.tables.CFTables (cf_quantification only) — element order,
+                   ionisation energies, partition functions, LODs.
+        cf_cfg: `finetune.cf` config block (see CF_CFG_DEFAULTS).
+        seed_binned: frozen LIBSFinetuneModule(task='quantification_binned')
+                     providing the closure seed C0 (cf_quantification only).
+        seed_detection: frozen LIBSFinetuneModule(task='detection') providing
+                     the element-presence gate on line weights.
     """
 
     def __init__(
@@ -87,10 +149,15 @@ class LIBSFinetuneModule(pl.LightningModule):
         element_names: Optional[list[str]] = None,
         lod: Optional[torch.Tensor] = None,
         detection_pos_weight: Optional[torch.Tensor] = None,
+        cf_tables: Any = None,
+        cf_cfg: Optional[dict] = None,
+        seed_binned: Optional[nn.Module] = None,
+        seed_detection: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.save_hyperparameters(
-            ignore=['encoder', 'class_weights', 'lod', 'detection_pos_weight'])
+            ignore=['encoder', 'class_weights', 'lod', 'detection_pos_weight',
+                    'cf_tables', 'cf_cfg', 'seed_binned', 'seed_detection'])
 
         self.encoder = encoder
         self.task = task
@@ -117,6 +184,9 @@ class LIBSFinetuneModule(pl.LightningModule):
         self._test_det_probs: list[torch.Tensor] = []
         self._test_det_targets: list[torch.Tensor] = []
         self.test_detection_metrics: dict[str, Any] = {}
+        # Test-only buffers for CF plasma-state diagnostics (cf_quantification).
+        self._test_cf_buf: dict[str, list[torch.Tensor]] = {}
+        self.test_plasma_metrics: dict[str, float] = {}
 
         d_model = encoder.d_model
         head_in_dim = 2 * d_model if pool == 'cls_mean' else d_model
@@ -140,6 +210,17 @@ class LIBSFinetuneModule(pl.LightningModule):
                 d_model=head_in_dim,
                 n_elements=self.n_elements,
             )
+
+        # Calibration-free quantification: learned line weights + plasma init,
+        # frozen seed modules, and the parameter-free Saha–Boltzmann layer.
+        self.cf_cfg: Optional[dict] = None
+        self.cf_tables = None
+        self.seed_binned = seed_binned
+        self.seed_detection = seed_detection
+        self._classical_fn = None
+        self._warned: set[str] = set()
+        if task == 'cf_quantification':
+            lod = self._init_cf(cf_tables, cf_cfg, d_model, head_in_dim, lod)
 
         # Per-element limit-of-detection thresholds (mass fraction) used to turn
         # concentrations into presence/absence targets for the detection task.
@@ -172,7 +253,227 @@ class LIBSFinetuneModule(pl.LightningModule):
         """Unfreeze encoder weights."""
         for param in self.encoder.parameters():
             param.requires_grad = True
-    
+
+    # ── cf_quantification: construction ──────────────────────────────────
+    def _init_cf(
+        self,
+        cf_tables: Any,
+        cf_cfg: Optional[dict],
+        d_model: int,
+        head_in_dim: int,
+        lod: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Build the CF heads, the Saha–Boltzmann layer and the seed plumbing.
+
+        Returns the LOD vector to register as `detection_lod` (the CF tables'
+        LODs when none was passed explicitly).
+        """
+        if cf_tables is None:
+            raise ValueError("task='cf_quantification' requires cf_tables (cf.tables.CFTables)")
+        cfg = dict(CF_CFG_DEFAULTS)
+        cfg.update({k: v for k, v in (cf_cfg or {}).items()})
+        self.cf_cfg = cfg
+        self.cf_tables = cf_tables
+
+        table_names = list(getattr(cf_tables, 'element_names', []))
+        if table_names and table_names != self.element_names:
+            raise ValueError(
+                "cf_tables.element_names must match the module's element_names "
+                f"(got {table_names[:5]}… vs {self.element_names[:5]}…)"
+            )
+
+        self.cf_weight_head = CFLineWeightHead(d_model, hidden=int(cfg['weight_hidden']))
+        self.cf_plasma_head = CFPlasmaInitHead(
+            head_in_dim,
+            init=(float(cfg['T0_default']), float(cfg['log10_Ne0_default']),
+                  float(cfg['log10_Nl0_default'])),
+        )
+
+        from cf.layer import SahaBoltzmannLayer  # lazy: cf/ is optional for other tasks
+        layer_cfg = {k: cfg[k] for k in CF_LAYER_KEYS if k in cfg}
+        self.cf_layer = SahaBoltzmannLayer(
+            cf_tables, layer_cfg, line_dict_path=cfg.get('line_dict_path'),
+        )
+
+        # Atomic number → element column (−1 = not a target element).
+        z_to_elem = np.asarray(cf_tables.z_to_elem, dtype=np.int64)
+        self.register_buffer('cf_z_to_elem', torch.from_numpy(z_to_elem.copy()))
+
+        # LOD used for censoring in the loss: the layer's buffer if it has one.
+        layer_lod = getattr(self.cf_layer, 'lod', None)
+        lod_src = layer_lod if layer_lod is not None else cf_tables.lod
+        lod_t = torch.as_tensor(np.asarray(
+            lod_src.detach().cpu().numpy() if isinstance(lod_src, torch.Tensor) else lod_src,
+            dtype=np.float32,
+        ))
+        self.register_buffer('cf_lod', lod_t)
+
+        major_idx = [self.element_names.index(e) for e in CF_MAJOR_ELEMENTS
+                     if e in self.element_names]
+        self.register_buffer('cf_major_idx', torch.as_tensor(major_idx, dtype=torch.long))
+
+        # Seeds are frozen and always in eval mode (see train()).
+        for seed in (self.seed_binned, self.seed_detection):
+            if seed is not None:
+                for p in seed.parameters():
+                    p.requires_grad_(False)
+                seed.eval()
+
+        if cfg['c0_source'] == 'binned' and self.seed_binned is None:
+            self._warn_once(
+                "cf: c0_source='binned' but no seed_binned module was given — "
+                "the closure starts from a uniform C0 instead."
+            )
+        if cfg['c0_source'] == 'truth':
+            self._warn_once("cf: c0_source='truth' uses batch['concentrations'] as C0 (debug only).")
+        return lod if lod is not None else lod_t
+
+    def _warn_once(self, msg: str) -> None:
+        if msg not in self._warned:
+            self._warned.add(msg)
+            warnings.warn(msg, stacklevel=2)
+
+    def train(self, mode: bool = True):
+        """Standard train()/eval() switch, except the frozen seed modules stay
+        in eval mode (no dropout in the C0 / presence seeds while training)."""
+        super().train(mode)
+        for seed in (self.seed_binned, self.seed_detection):
+            if seed is not None:
+                seed.eval()
+        return self
+
+    # ── cf_quantification: forward helpers ───────────────────────────────
+    def _cf_line_gate(self, presence: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """Map per-element presence [B, E] onto the lines [B, L] via the atomic
+        number channel; lines of non-target elements get gate 0."""
+        from data.line_tokenization import F_Z
+        n_z = int(self.cf_z_to_elem.numel())
+        z = tokens[..., F_Z].round().long().clamp(0, n_z - 1)
+        elem = self.cf_z_to_elem[z]                             # [B, L], -1 if not target
+        is_target = (elem >= 0).to(presence.dtype)
+        gate = torch.gather(presence, 1, elem.clamp(min=0))
+        return gate * is_target
+
+    def _cf_classical_weights(self, tokens: torch.Tensor, fit_valid_f: torch.Tensor) -> torch.Tensor:
+        """Parameter-free {0, 1} line weights (pure_physics) from
+        cf.classical.classical_weights on the raw tokens; the line dictionary's
+        isolation_score / forced buffers of the layer are passed through when
+        the layer exposes them (cfg['classical'] keys override)."""
+        if self._classical_fn is None:
+            try:
+                from cf.classical import classical_weights
+                self._classical_fn = classical_weights
+            except ImportError:
+                self._warn_once(
+                    "cf.classical.classical_weights not importable — pure_physics "
+                    "falls back to weights = fit_valid."
+                )
+                self._classical_fn = False
+        if self._classical_fn is False:
+            return fit_valid_f
+        kwargs = dict(self.cf_cfg.get('classical') or {})
+        for key in ('isolation', 'forced'):
+            if key in kwargs:
+                continue
+            buf = getattr(self.cf_layer, 'isolation_score' if key == 'isolation' else key, None)
+            if isinstance(buf, torch.Tensor) and buf.numel() == tokens.shape[1]:
+                kwargs[key] = buf.detach().cpu().numpy()
+        tok_np = tokens.detach().float().cpu().numpy().astype(np.float64)
+        valid_np = fit_valid_f.detach().cpu().numpy()
+        w_np = np.asarray(self._classical_fn(tok_np, valid_np, **kwargs), dtype=np.float32)
+        w = torch.from_numpy(w_np.reshape(tokens.shape[0], tokens.shape[1])).to(tokens.device)
+        return w * fit_valid_f
+
+    def _cf_seed_c0(
+        self,
+        batch: Dict[str, torch.Tensor],
+        seed_inputs: Dict[str, torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Closure seed C0 [B, E] (mass fractions, rows sum to 1) or None (uniform)."""
+        src = self.cf_cfg['c0_source']
+        if src == 'truth':
+            c0 = batch.get('concentrations')
+            if c0 is None:
+                return None
+            c0 = c0.float().clamp(min=0.0)
+        elif src == 'binned' and self.seed_binned is not None:
+            with torch.no_grad():
+                c0 = self.seed_binned(seed_inputs)['concentrations_pred'].float().clamp(min=0.0)
+        else:
+            return None
+        s = c0.sum(dim=-1, keepdim=True)
+        uniform = torch.full_like(c0, 1.0 / c0.shape[-1])
+        return torch.where(s > 0, c0 / s.clamp(min=1e-12), uniform)
+
+    def _cf_forward(
+        self,
+        batch: Dict[str, torch.Tensor],
+        encoder_output: Dict[str, torch.Tensor],
+        representation: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """Line weights → plasma init → seeds → Saha–Boltzmann layer."""
+        cfg = self.cf_cfg
+        tokens = batch['tokens']
+        B, L = tokens.shape[0], tokens.shape[1]
+        fit_valid = batch.get('fit_valid')
+        if fit_valid is None:
+            fit_valid = torch.ones(B, L, dtype=torch.uint8, device=tokens.device)
+        fit_valid_f = (fit_valid > 0).to(torch.float32)
+        seed_inputs = {'tokens': tokens, 'fit_valid': fit_valid}
+
+        # 1. per-line weights in [0, 1]
+        if cfg['pure_physics']:
+            w_logits = None
+            w = self._cf_classical_weights(tokens, fit_valid_f)
+        else:
+            w_logits = self.cf_weight_head(encoder_output['sequence_embeddings']).float()
+            w = torch.sigmoid(w_logits) * fit_valid_f
+
+        # 2. presence gate from the frozen detection seed
+        presence = None
+        if self.seed_detection is not None and cfg['presence_gate']:
+            with torch.no_grad():
+                presence = (self.seed_detection(seed_inputs)['presence_prob'] >= 0.5).float()
+            w = w * self._cf_line_gate(presence, tokens)
+
+        # 3. plasma-state initial guess
+        if cfg['pure_physics']:
+            T0 = torch.full((B,), float(cfg['T0_default']), device=tokens.device)
+            log10_Ne0 = torch.full((B,), float(cfg['log10_Ne0_default']), device=tokens.device)
+            log10_Nl0 = torch.full((B,), float(cfg['log10_Nl0_default']), device=tokens.device)
+        else:
+            T0, log10_Ne0, log10_Nl0 = self.cf_plasma_head(representation.float())
+
+        # 4. closure seed
+        C0 = self._cf_seed_c0(batch, seed_inputs)
+
+        # 5. physics
+        cf_out = self.cf_layer(
+            tokens, fit_valid, w, C0=C0, T0=T0, log10_Ne0=log10_Ne0, log10_Nl0=log10_Nl0,
+        )
+        out: Dict[str, Any] = {
+            'concentrations_pred': cf_out['concentrations'],
+            'cf_number_fractions': cf_out['number_fractions'],
+            'cf_T': cf_out['T'],
+            'cf_log10_Ne': cf_out['log10_Ne'],
+            'cf_weights': w,
+            'cf_censored': cf_out['censored'],
+            'cf_intercepts': cf_out['intercepts'],
+            'cf_tau0': cf_out['tau0'],
+            'cf_n_lines_used': cf_out['n_lines_used'],
+            'cf_resid': cf_out.get('resid'),
+            'cf_used_mask': cf_out.get('used_mask'),
+            'cf_init': {'T0': T0, 'log10_Ne0': log10_Ne0, 'log10_Nl0': log10_Nl0},
+            'cf_fit_valid': fit_valid_f,
+        }
+        if w_logits is not None:
+            out['cf_weight_logits'] = w_logits
+        if presence is not None:
+            out['cf_presence'] = presence
+        if C0 is not None:
+            out['cf_C0'] = C0
+        return out
+
     def _pool(self, encoder_output: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Build the downstream representation from encoder outputs.
 
@@ -216,6 +517,13 @@ class LIBSFinetuneModule(pl.LightningModule):
               - quantification:        'concentrations'     [B, n_elements]
               - quantification_binned: 'bin_logits'         [B, n_elements, n_bins]
                                        'concentrations_pred' [B, n_elements] (argmax-decoded)
+              - detection:             'detection_logits', 'presence_prob', 'presence_pred'
+              - cf_quantification:     'concentrations_pred' [B, E] mass fractions from the
+                                       Saha–Boltzmann layer, plus 'cf_number_fractions',
+                                       'cf_T' [B], 'cf_log10_Ne' [B], 'cf_weights' [B, L],
+                                       'cf_censored' [B, E], 'cf_intercepts' [B, E],
+                                       'cf_tau0' [B, L], 'cf_n_lines_used' [B, E],
+                                       'cf_init' {T0, log10_Ne0, log10_Nl0} each [B]
               - both:                  'class_logits' + 'concentrations'
         """
         if isinstance(batch, dict):
@@ -244,6 +552,10 @@ class LIBSFinetuneModule(pl.LightningModule):
             result['detection_logits'] = det_logits
             result['presence_prob'] = torch.sigmoid(det_logits)
             result['presence_pred'] = (result['presence_prob'] >= 0.5).float()
+        if self.task == 'cf_quantification':
+            if not isinstance(batch, dict) or 'tokens' not in batch:
+                raise ValueError("cf_quantification requires line-token batches ('tokens', 'fit_valid')")
+            result.update(self._cf_forward(batch, encoder_output, representation))
         return result
     
     def compute_classification_loss(
@@ -397,6 +709,119 @@ class LIBSFinetuneModule(pl.LightningModule):
             'exact_match': exact,
         }
 
+    # ── cf_quantification: loss + metrics ────────────────────────────────
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Mean of `values` over entries where `mask` > 0 (0 if the mask is empty)."""
+        mask = mask.to(values.dtype)
+        return (values * mask).sum() / mask.sum().clamp(min=1.0)
+
+    def compute_cf_loss(
+        self,
+        outputs: Dict[str, Any],
+        batch: Dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, int]]:
+        """Synthetic-only CF training loss and batch metrics.
+
+        Loss (per plan), averaged over samples with has_plasma_labels == 1:
+            L = L_conc
+              + λ_T  · ((T − Te)/Te)²          [one-zone shots only]
+              + λ_Ne · (log10 Ne − log10 Ne_true)²   [one-zone shots only]
+              + λ_Nl · (log10 Nl0 − log10 Nl_true)²  [all synthetic shots]
+              + λ_w  · (mean_{fit_valid} w − 1)²
+            L_conc = mean_e[m_e (ln(C_e+ε) − ln(C_true,e+ε))²]
+                   + mean_e[(1−m_e) relu(ln(C_e+ε) − ln LOD_e)²],   m_e = 1[C_true,e ≥ LOD_e]
+
+        Metrics (over every sample with concentrations, measured included):
+            cf_log_rmse, cf_within2x (uncensored truth only), cf_r2_major,
+            te_mape, ne_log_mae (one-zone synthetic shots only).
+
+        Returns:
+            (loss, metrics, counts) — `counts` tells the caller which metrics
+            have support in this batch (0 → do not log).
+        """
+        cfg = self.cf_cfg
+        eps = float(cfg['eps'])
+        pred = outputs['concentrations_pred'].float()
+        B, E = pred.shape
+        device = pred.device
+        conc_true = batch.get('concentrations')
+        has = batch.get('has_plasma_labels')
+        h = has.float().reshape(B) if has is not None else torch.zeros(B, device=device)
+        is_two = batch.get('is_two_zone')
+        one_zone = h * (1.0 - (is_two.float().reshape(B) if is_two is not None else torch.zeros(B, device=device)))
+
+        # Leaf with grad so measured-only batches still return a backward-able 0.
+        loss = torch.zeros((), device=device, dtype=torch.float32, requires_grad=True)
+        metrics: Dict[str, torch.Tensor] = {}
+        counts = {'conc': 0, 'supervised': int(h.sum().item()), 'one_zone': int(one_zone.sum().item())}
+
+        lod = self.cf_lod.to(device=device, dtype=torch.float32)
+        log_lod = torch.log(lod)[None, :]
+        T = outputs['cf_T'].float().reshape(B)
+        log10_Ne = outputs['cf_log10_Ne'].float().reshape(B)
+        log10_Nl0 = outputs['cf_init']['log10_Nl0'].float().reshape(B)
+        w = outputs['cf_weights'].float()
+        fv = outputs['cf_fit_valid'].float()
+
+        if conc_true is not None:
+            conc_true = conc_true.float()
+            counts['conc'] = B
+            log_pred = torch.log(pred.clamp(min=0.0) + eps)
+            log_true = torch.log(conc_true.clamp(min=0.0) + eps)
+            m = (conc_true >= lod[None, :]).float()                   # uncensored truth
+            d = log_pred - log_true
+            term_unc = (m * d ** 2).mean(dim=1)
+            term_cen = ((1.0 - m) * torch.relu(log_pred - log_lod) ** 2).mean(dim=1)
+            l_conc = self._masked_mean(term_unc + term_cen, h)
+
+            # metrics
+            with torch.no_grad():
+                n_unc = m.sum()
+                if n_unc > 0:
+                    metrics['cf_log_rmse'] = torch.sqrt((m * d ** 2).sum() / n_unc)
+                    metrics['cf_within2x'] = (m * (d.abs() <= math.log(2.0)).float()).sum() / n_unc
+                else:
+                    metrics['cf_log_rmse'] = torch.zeros((), device=device)
+                    metrics['cf_within2x'] = torch.zeros((), device=device)
+                if self.cf_major_idx.numel() > 0 and B > 1:
+                    y = conc_true[:, self.cf_major_idx]
+                    p = pred[:, self.cf_major_idx]
+                    ss_res = ((y - p) ** 2).sum(dim=0)
+                    ss_tot = ((y - y.mean(dim=0)) ** 2).sum(dim=0)
+                    metrics['cf_r2_major'] = (1.0 - ss_res / (ss_tot + 1e-8)).mean()
+                metrics['cf_mean_weight'] = self._masked_mean(
+                    (w * fv).sum(dim=1) / fv.sum(dim=1).clamp(min=1.0), torch.ones(B, device=device))
+                metrics['cf_n_censored'] = outputs['cf_censored'].float().sum(dim=1).mean()
+
+            if counts['supervised'] > 0:
+                loss = loss + l_conc
+                metrics['cf_conc_loss'] = l_conc.detach()
+
+        if counts['supervised'] > 0:
+            Te = batch['Te'].float().reshape(B)
+            log10_Ne_true = batch['log10_Ne'].float().reshape(B)
+            log10_Nl_true = batch['log10_Nl'].float().reshape(B)
+            if counts['one_zone'] > 0:
+                rel_T = (T - Te) / Te.clamp(min=1.0)
+                l_T = self._masked_mean(rel_T ** 2, one_zone)
+                l_Ne = self._masked_mean((log10_Ne - log10_Ne_true) ** 2, one_zone)
+                loss = loss + float(cfg['lambda_T']) * l_T + float(cfg['lambda_Ne']) * l_Ne
+                with torch.no_grad():
+                    metrics['te_mape'] = self._masked_mean(rel_T.abs(), one_zone)
+                    metrics['ne_log_mae'] = self._masked_mean((log10_Ne - log10_Ne_true).abs(), one_zone)
+                    metrics['cf_T_loss'] = l_T.detach()
+                    metrics['cf_Ne_loss'] = l_Ne.detach()
+            l_Nl = self._masked_mean((log10_Nl0 - log10_Nl_true) ** 2, h)
+            mean_w = (w * fv).sum(dim=1) / fv.sum(dim=1).clamp(min=1.0)
+            l_w = self._masked_mean((mean_w - 1.0) ** 2, h)
+            loss = loss + float(cfg['lambda_Nl']) * l_Nl + float(cfg['lambda_w']) * l_w
+            with torch.no_grad():
+                metrics['cf_Nl_loss'] = l_Nl.detach()
+                metrics['cf_w_loss'] = l_w.detach()
+                metrics['nl_log_mae'] = self._masked_mean((log10_Nl0 - log10_Nl_true).abs(), h)
+        return loss, metrics, counts
+
     def _step(self, batch: Dict[str, torch.Tensor], stage: str) -> Dict[str, torch.Tensor]:
         """Shared train/val/test logic, dispatched by self.task.
 
@@ -459,6 +884,30 @@ class LIBSFinetuneModule(pl.LightningModule):
             results['presence_prob'] = outputs['presence_prob']
             results['presence_targets'] = det_targets
 
+        # ── Calibration-free quantification ──────────────────────────────
+        # Loss only from batches carrying plasma labels (synthetic); measured
+        # batches contribute metrics and a zero loss that still has a grad.
+        if self.task == 'cf_quantification':
+            cf_loss, m, counts = self.compute_cf_loss(outputs, batch)
+            total_loss = total_loss + cf_loss
+            self.log(f'{stage}/cf_loss', cf_loss, **log_kw)
+            if counts['conc'] > 0:
+                for key in ('cf_log_rmse', 'cf_within2x', 'cf_r2_major', 'cf_mean_weight',
+                            'cf_n_censored', 'cf_conc_loss'):
+                    if key in m:
+                        self.log(f'{stage}/{key}', m[key],
+                                 **{**log_kw, 'prog_bar': key == 'cf_log_rmse' and stage != 'train'})
+                results['conc_predictions'] = outputs['concentrations_pred']
+                results['conc_targets'] = batch['concentrations']
+            for key in ('te_mape', 'ne_log_mae', 'nl_log_mae', 'cf_T_loss', 'cf_Ne_loss',
+                        'cf_Nl_loss', 'cf_w_loss'):
+                if key in m:
+                    self.log(f'{stage}/{key}', m[key], **log_kw)
+            results['cf_T'] = outputs['cf_T']
+            results['cf_log10_Ne'] = outputs['cf_log10_Ne']
+            results['cf_censored'] = outputs['cf_censored']
+            results['cf_init'] = outputs['cf_init']
+
         self.log(f'{stage}/loss', total_loss, **{**log_kw, 'prog_bar': True})
         results['loss'] = total_loss
         return results
@@ -472,12 +921,29 @@ class LIBSFinetuneModule(pl.LightningModule):
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
         """Test step with dedicated `test/*` logging namespace."""
         out = self._step(batch, 'test')
-        if self.task == 'quantification_binned':
+        if self.task in ('quantification_binned', 'cf_quantification'):
             pred = out.get('conc_predictions')
             targ = out.get('conc_targets')
             if pred is not None and targ is not None:
                 self._test_conc_preds.append(pred.detach().float().cpu())
                 self._test_conc_targets.append(targ.detach().float().cpu())
+        if self.task == 'cf_quantification':
+            B = out['cf_T'].shape[0]
+            buf = self._test_cf_buf
+
+            def _push(key: str, value):
+                if value is None:
+                    value = torch.zeros(B)
+                buf.setdefault(key, []).append(value.detach().float().reshape(B, -1).cpu())
+
+            _push('cf_T', out['cf_T'])
+            _push('cf_log10_Ne', out['cf_log10_Ne'])
+            _push('T0', out['cf_init']['T0'])
+            _push('log10_Ne0', out['cf_init']['log10_Ne0'])
+            _push('log10_Nl0', out['cf_init']['log10_Nl0'])
+            _push('cf_censored', out['cf_censored'])
+            for key in ('Te', 'log10_Ne', 'log10_Nl', 'is_two_zone', 'has_plasma_labels'):
+                _push(key, batch.get(key))
         if self.task == 'detection':
             prob = out.get('presence_prob')
             targ = out.get('presence_targets')
@@ -493,6 +959,8 @@ class LIBSFinetuneModule(pl.LightningModule):
         self._test_det_probs = []
         self._test_det_targets = []
         self.test_detection_metrics = {}
+        self._test_cf_buf = {}
+        self.test_plasma_metrics = {}
 
     @staticmethod
     def _safe_pearson(x: np.ndarray, y: np.ndarray) -> float:
@@ -513,18 +981,56 @@ class LIBSFinetuneModule(pl.LightningModule):
             return 0.0
         return float(corr)
 
+    @staticmethod
+    def cf_element_metrics(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        lod: float,
+        censored: Optional[np.ndarray] = None,
+        eps: float = 1e-7,
+    ) -> dict[str, float]:
+        """CF per-element diagnostics shared by the test pass and scripts/evaluate_cf.py.
+
+        log_rmse / within_2x are computed over spectra whose true concentration
+        is at or above the LOD (uncensored truth); n_censored counts spectra
+        the solver flagged as censored (below LOD) when `censored` is given.
+        """
+        y_true = np.asarray(y_true, dtype=np.float64)
+        y_pred = np.asarray(y_pred, dtype=np.float64)
+        unc = y_true >= lod
+        out: dict[str, float] = {
+            "n_uncensored_truth": float(unc.sum()),
+            "lod": float(lod),
+        }
+        if unc.any():
+            d = np.log(np.clip(y_pred[unc], 0.0, None) + eps) - np.log(y_true[unc] + eps)
+            out["log_rmse"] = float(np.sqrt(np.mean(d ** 2)))
+            out["within_2x"] = float(np.mean(np.abs(d) <= np.log(2.0)))
+        else:
+            out["log_rmse"] = float("nan")
+            out["within_2x"] = float("nan")
+        out["n_censored"] = float(np.sum(censored)) if censored is not None else 0.0
+        return out
+
     def on_test_epoch_end(self) -> None:
         if self.task == 'detection':
             self._finalize_detection_test()
             return
-        if self.task != 'quantification_binned':
+        if self.task not in ('quantification_binned', 'cf_quantification'):
             return
+        if self.task == 'cf_quantification':
+            self._finalize_cf_plasma_test()
         if not self._test_conc_preds or not self._test_conc_targets:
             return
 
         preds = torch.cat(self._test_conc_preds, dim=0).numpy()
         targets = torch.cat(self._test_conc_targets, dim=0).numpy()
         n_samples = int(targets.shape[0])
+        censored_all = None
+        if self.task == 'cf_quantification' and self._test_cf_buf.get('cf_censored'):
+            censored_all = torch.cat(self._test_cf_buf['cf_censored'], dim=0).numpy()
+            if censored_all.shape[0] != n_samples:
+                censored_all = None
         per_elem: dict[str, dict[str, float]] = {}
         for i in range(self.n_elements):
             name = self.element_names[i] if i < len(self.element_names) else f"elem_{i}"
@@ -543,6 +1049,12 @@ class LIBSFinetuneModule(pl.LightningModule):
                 "spearman": spearman,
                 "n_samples": float(n_samples),
             }
+            if self.task == 'cf_quantification':
+                per_elem[name].update(self.cf_element_metrics(
+                    y_true, y_pred, float(self.cf_lod[i]),
+                    censored=None if censored_all is None else censored_all[:, i],
+                    eps=float(self.cf_cfg['eps']),
+                ))
 
         # Persist for final run summary / run_info.yaml serialization.
         self.test_per_element_metrics = per_elem
@@ -566,11 +1078,52 @@ class LIBSFinetuneModule(pl.LightningModule):
             add_scalar(f"{base}/r2", m["r2"], step)
             add_scalar(f"{base}/pearson", m["pearson"], step)
             add_scalar(f"{base}/spearman", m["spearman"], step)
+            for key in ("log_rmse", "within_2x", "n_censored"):
+                if key in m and np.isfinite(m[key]):
+                    add_scalar(f"{base}/{key}", m[key], step)
             add_hist(f"{base}/target_hist", y_true, step)
+        for key, value in self.test_plasma_metrics.items():
+            if isinstance(value, float) and np.isfinite(value):
+                add_scalar(f"test/plasma/{key}", value, step)
 
         # Keep memory bounded across epochs even if test is called repeatedly.
         self._test_conc_preds = []
         self._test_conc_targets = []
+        self._test_cf_buf = {}
+
+    def _finalize_cf_plasma_test(self) -> None:
+        """T / Ne recovery over one-zone test shots that carry plasma labels
+        (two-zone T is ill-defined; measured shots have no labels)."""
+        buf = self._test_cf_buf
+        if not buf.get('cf_T'):
+            self.test_plasma_metrics = {}
+            return
+        col = {k: torch.cat(v, dim=0).numpy() for k, v in buf.items() if k != 'cf_censored'}
+        has = col['has_plasma_labels'][:, 0] > 0.5
+        one_zone = has & (col['is_two_zone'][:, 0] < 0.5)
+        two_zone = has & ~one_zone
+        metrics: dict[str, float] = {
+            "n_test": float(has.shape[0]),
+            "n_labelled": float(has.sum()),
+            "n_one_zone": float(one_zone.sum()),
+            "n_two_zone": float(two_zone.sum()),
+        }
+        if one_zone.any():
+            T, Te = col['cf_T'][one_zone, 0], col['Te'][one_zone, 0]
+            lne, lne_t = col['cf_log10_Ne'][one_zone, 0], col['log10_Ne'][one_zone, 0]
+            metrics["te_mape"] = float(np.mean(np.abs(T - Te) / np.maximum(Te, 1.0)))
+            metrics["te_rmse"] = float(np.sqrt(np.mean((T - Te) ** 2)))
+            metrics["ne_log_mae"] = float(np.mean(np.abs(lne - lne_t)))
+            metrics["ne_log_rmse"] = float(np.sqrt(np.mean((lne - lne_t) ** 2)))
+            metrics["t0_mape"] = float(np.mean(np.abs(col['T0'][one_zone, 0] - Te) / np.maximum(Te, 1.0)))
+            metrics["ne0_log_mae"] = float(np.mean(np.abs(col['log10_Ne0'][one_zone, 0] - lne_t)))
+        if has.any():
+            metrics["nl_log_mae"] = float(np.mean(np.abs(
+                col['log10_Nl0'][has, 0] - col['log10_Nl'][has, 0])))
+        if two_zone.any():
+            T, Te = col['cf_T'][two_zone, 0], col['Te'][two_zone, 0]
+            metrics["te_mape_two_zone"] = float(np.mean(np.abs(T - Te) / np.maximum(Te, 1.0)))
+        self.test_plasma_metrics = metrics
     
     def _finalize_detection_test(self) -> None:
         """Aggregate per-element + overall presence metrics over the test set."""
@@ -654,7 +1207,12 @@ class LIBSFinetuneModule(pl.LightningModule):
             head_params.extend(self.binned_head.parameters())
         if self.task == 'detection':
             head_params.extend(self.detection_head.parameters())
-        
+        if self.task == 'cf_quantification':
+            # The Saha–Boltzmann layer has no parameters and the seeds are
+            # frozen; only the two CF heads (plus the encoder) train.
+            head_params.extend(self.cf_weight_head.parameters())
+            head_params.extend(self.cf_plasma_head.parameters())
+
         # Use lower learning rate for encoder
         param_groups = [
             {'params': encoder_params, 'lr': self.learning_rate * 0.1},
@@ -701,8 +1259,12 @@ class FinetuneDataModule(pl.LightningDataModule):
         val_concentrations: Optional validation concentrations
         batch_size: Batch size
         num_workers: Number of workers
+        train_aux / val_aux: Optional dict of per-spectrum float arrays
+            (already sliced to the split, e.g. the plasma-state targets from
+            data.libs_pipeline.extract_plasma_targets) forwarded to the
+            line-token datasets as `aux_targets`; ignored on the intensity path.
     """
-    
+
     def __init__(
         self,
         train_spectra=None,
@@ -717,6 +1279,8 @@ class FinetuneDataModule(pl.LightningDataModule):
         line_tokens_path: Optional[str] = None,
         train_indices: Optional[np.ndarray] = None,
         val_indices: Optional[np.ndarray] = None,
+        train_aux: Optional[Dict[str, np.ndarray]] = None,
+        val_aux: Optional[Dict[str, np.ndarray]] = None,
     ):
         super().__init__()
         self.train_spectra = train_spectra
@@ -731,7 +1295,9 @@ class FinetuneDataModule(pl.LightningDataModule):
         self.line_tokens_path = line_tokens_path
         self.train_indices = train_indices
         self.val_indices = val_indices
-    
+        self.train_aux = train_aux
+        self.val_aux = val_aux
+
     def setup(self, stage: Optional[str] = None):
         """Setup datasets."""
         from data.dataset import (
@@ -740,7 +1306,7 @@ class FinetuneDataModule(pl.LightningDataModule):
             LineTokensLabeledDataset,
         )
         import numpy as np
-        
+
         if stage == 'fit' or stage is None:
             if self.line_tokens_path:
                 self.train_dataset = LineTokensLabeledDataset(
@@ -748,12 +1314,14 @@ class FinetuneDataModule(pl.LightningDataModule):
                     self.train_labels,
                     concentrations=self.train_concentrations,
                     indices=self.train_indices,
+                    aux_targets=self.train_aux,
                 )
                 self.val_dataset = LineTokensLabeledDataset(
                     self.line_tokens_path,
                     self.val_labels,
                     concentrations=self.val_concentrations,
                     indices=self.val_indices,
+                    aux_targets=self.val_aux,
                 )
             elif self.line_features_path:
                 self.train_dataset = LineTokenLabeledDataset(
@@ -761,12 +1329,14 @@ class FinetuneDataModule(pl.LightningDataModule):
                     self.train_labels,
                     concentrations=self.train_concentrations,
                     indices=self.train_indices,
+                    aux_targets=self.train_aux,
                 )
                 self.val_dataset = LineTokenLabeledDataset(
                     self.line_features_path,
                     self.val_labels,
                     concentrations=self.val_concentrations,
                     indices=self.val_indices,
+                    aux_targets=self.val_aux,
                 )
             else:
                 self.train_dataset = LabeledLIBSDataset(

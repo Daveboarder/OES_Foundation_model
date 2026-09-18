@@ -33,9 +33,9 @@ def _collect_best_per_element(cfg: dict, project_root: Path) -> dict[str, list[f
     ld_cfg = dict(cfg["line_dictionary"])
     db_path = str((project_root / ld_cfg["db_path"]).resolve())
     te_grid, ne_grid = _te_ne_grid(ld_cfg)
-    n = float(ld_cfg["N"])
-    c = float(ld_cfg["C"])
-    l_path = float(ld_cfg["l"])
+    n = float(ld_cfg.get("N", 1.0))      # legacy scale keys; physics-v2 intensities are per unit x_e*N*l
+    c = float(ld_cfg.get("C", 1.0))
+    l_path = float(ld_cfg.get("l", 1.0))
     wmin, wmax = _wavelength_clip_bounds(ld_cfg, project_root)
     elements = _list_elements(db_path)
 

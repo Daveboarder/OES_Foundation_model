@@ -28,7 +28,12 @@ downstream:
   elements_to_predict: null
   n_clusters: 10
   n_concentration_bins: 1000
+  # strategy: random | group_sample | group_instrument. Grouped strategies keep
+  # every shot of a physical sample (or of an instrument) in one partition,
+  # so the measured test set never leaks a sample seen in training
+  # (file splits_<key>_<strategy>.json; `random` keeps splits_<key>.json).
   splits:
+    strategy: group_sample
     val_fraction: 0.15
     test_fraction: 0.15
     seed: 42

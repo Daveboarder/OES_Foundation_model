@@ -3,6 +3,13 @@
 # =============================================================================
 # Used by `data/libs_pipeline.build_dataset_from_config(cfg)`.
 # All paths are relative to the project root.
+#
+# physics_version 2 (generation.plasma_model != legacy): spectra come from
+# `data/two_zone_pipeline.py` — Kirchhoff-consistent LTE line physics with
+# physical optical depths (N from quasi-neutrality, path lengths in cm), one-
+# or two-zone radiative transfer, instrument convolution. The cache key of
+# `synthetic_cache_<key>.h5` covers every knob of the `generation:` block, so
+# changing any of them regenerates (~2 h at n_workers 60 for 2256 x 50 shots).
 # =============================================================================
 
 paths:
@@ -11,8 +18,8 @@ paths:
   wavelength_json:   "external_data/Data/VASKUT K8.json"
   cache_dir:         "external_data/cache"
 
-# Physical ranges sampled per simulated shot.
-# Te (plasma temperature) is uniform; Ne (electron density) is log-uniform.
+# Legacy (physics_version 1) ranges — only used when generation.plasma_model
+# is absent or `legacy`. The v2 generator draws from generation.zones instead.
 ranges:
   te: [6500.0, 11000.0]     # Kelvin
   ne: [1.0e+17, 5.0e+17]    # cm^-3
@@ -21,11 +28,35 @@ ranges:
 generation:
   n_samples_per_type: 50     # Shots per row of the Excel matrix (2256 rows → set ~5-20 for pretraining)
   max_sample_types: null    # Cap total types; null = use all (~2256). Set to small int for smoke tests.
-  number_density:    1.0e-4 # N (cm^-3); upstream default
-  optical_path:      1.4e-4 # l (cm);    upstream default
-  n_workers:         60      # >1 enables multiprocessing pool (Windows: spawn-safe but slower)
+  number_density:    auto   # v2: `auto` = quasi-neutrality N = Ne / sum_e x_e r_II,e per zone; or a float (cm^-3)
+  number_density_max: null  # v2: optional cap on N per zone (cm^-3); quasi-neutrality diverges for a very cold zone
+  optical_path:      1.4e-4 # legacy only (cm); v2 uses zones.l_inner_cm / l_outer_cm
+  n_workers:         22      # >1 enables multiprocessing pool (machine has 24 cores)
   seed:              42
   verbose:           true
+
+  # ---- physics_version 2 -------------------------------------------------
+  plasma_model: mixed            # legacy | one_zone | two_zone | mixed
+  two_zone_fraction: 0.7         # mixed: probability that a shot is two_zone
+  outer_density: isobaric        # isobaric: N2 = N1*Te1/Te2, Ne2 from Saha equilibrium (quasi_neutral = legacy rule)
+  zones:
+    te1: [8000, 20000]           # K, uniform (cap 20 kK: DB has no stage III)
+    ne1: [5.0e+16, 3.0e+18]      # cm^-3, log-uniform; covers the spark value 1.79e18
+    te2_ratio: [0.15, 0.6]       # Te2 = Te1 * U(te2_ratio)
+    ne2_log_ratio: [-3, -1]      # only used when outer_density: quasi_neutral
+    l_inner_cm: [0.003, 0.05]    # log-uniform; calibrated 2026-09-18 on PURE KFE (core N*l 5e15-3e16 cm^-2)
+    l_outer_cm: [2.0e-5, 2.0e-3]  # log-uniform, per outer segment; calibrated (shell N*l 1e14-3e14 cm^-2)
+    gamma_stark_nm: [0.003, 0.03]  # Lorentz HWHM per zone (Stark proxy), log-uniform
+  instrument:
+    profile: gaussian            # gaussian | voigt (+ lorentz_fwhm_nm)
+    fwhm_nm: 0.047               # calibrated: median of 15 isolated weak Fe lines in PURE KFE
+  fine_step_nm: 0.002            # internal grid for the radiative transfer
+  line_window_nm: 0.4            # half window per line on the fine grid
+  adaptive_window: true          # widen the window (<= 8x) for saturated lines
+  min_relative_intensity: 1.0e-7 # drop lines below this fraction of the strongest thin line
+  augment:
+    noise_sigma: 0.0             # Gaussian noise, fraction of the spectrum maximum (0 = off)
+    continuum: 0.0               # flat pedestal, fraction of the spectrum maximum (0 = off)
 
 # Downstream / fine-tune settings (only used by train_finetune.py).
 downstream:
@@ -44,7 +75,10 @@ downstream:
 
   # Train/val/test split is materialised once and cached alongside the
   # spectra HDF5 so pretrain and finetune share the same partition.
+  # strategy: random | group_sample | group_instrument (grouped = whole
+  # sample / instrument held out; file splits_<key>_<strategy>.json)
   splits:
+    strategy: random
     val_fraction: 0.15
     test_fraction: 0.15
     seed: 42

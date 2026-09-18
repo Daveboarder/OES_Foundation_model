@@ -1,4 +1,7 @@
-# Smoke-test data config: 3 sample types × 2 shots each.
+# Smoke-test data config: 3 sample types × 6 shots each.
+# NOTE: this file stays on the LEGACY generator (no generation.plasma_model)
+# so its cache key / synthetic_cache_<key>.h5 do not change. The physics_version-2
+# smoke variant is config/libs_data_cf_smoke.yaml.
 paths:
   db:                "external_data/Source/LIBS_data_vacuum.db"
   sample_matrix:     "external_data/Source/Samples_Fe_matrix.xlsx"

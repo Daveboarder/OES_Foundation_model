@@ -1,0 +1,74 @@
+# Smoke / dev config for the calibration-free task (task=cf_quantification):
+# config_libs_token_linear.yaml + `finetune.cf` block, 2 epochs, tiny model.
+# Usage (3 sample types × 6 shots; seeds first, then the CF task):
+#   uv run python train_finetune.py --config config/config_libs_cf_smoke.yaml \
+#     --libs_data_config config/libs_data_cf_smoke.yaml \
+#     --line_embedding_config config/line_embedding_cf_smoke.yaml \
+#     --task quantification_binned --experiment_name cf_smoke_seed_binned
+#   uv run python train_finetune.py ... --task detection --experiment_name cf_smoke_seed_detection
+#   uv run python train_finetune.py --config config/config_libs_cf_smoke.yaml \
+#     --libs_data_config config/libs_data_cf_smoke.yaml \
+#     --line_embedding_config config/line_embedding_cf_smoke.yaml \
+#     --task cf_quantification \
+#     --seed_binned_run_dir runs/finetune_<..>_cf_smoke_seed_binned \
+#     --seed_detection_run_dir runs/finetune_<..>_cf_smoke_seed_detection \
+#     --experiment_name cf_smoke
+
+data:
+  n_bins: 2048
+  n_classes: 3
+  n_elements: 60
+  n_concentration_bins: 50
+  synthetic:
+    val_fraction: 0.34
+
+model:
+  embedding_type: line_token_linear
+  d_model: 64
+  n_heads: 2
+  n_layers: 2
+  d_ff: 128
+  dropout: 0.0
+  max_seq_len: 4096
+  n_mip_target_channels: 2
+
+pretrain:
+  mask_ratio: 0.15
+  batch_size: 2
+  epochs: 2
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+
+finetune:
+  batch_size: 2
+  epochs: 2
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  freeze_encoder: false
+  cf:
+    n_iter: 3
+    ridge: 1.0e-6
+    prior_T: 0.1
+    prior_Ne: 0.1
+    sa_correction: true
+    gamma_nm: 0.01
+    lambda_T: 0.1
+    lambda_Ne: 0.1
+    lambda_Nl: 0.1
+    lambda_w: 0.01
+    presence_gate: true
+    eps: 1.0e-7
+    min_lines: 2         # elements with fewer weighted lines fall back to the seed
+    reject_sigma: 3.0    # robust residual rejection between solves (0 = off)
+    reject_floor: 0.15
+
+logging:
+  logger: tensorboard
+  log_every_n_steps: 1
+  val_check_interval: 1.0
+
+device:
+  accelerator: auto
+  precision: "32"

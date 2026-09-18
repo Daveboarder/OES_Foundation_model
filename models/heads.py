@@ -546,3 +546,111 @@ if __name__ == "__main__":
     multi_output = multi_head(cls_input)
     print(f"  Class logits shape: {multi_output['class_logits'].shape}")
     print(f"  Concentrations shape: {multi_output['concentrations'].shape}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Calibration-free (CF) quantification heads — see cf/ and the
+# `cf_quantification` task in training/finetune.py.  Both heads are trained
+# on synthetic data only; the concentrations themselves always come from the
+# parameter-free SahaBoltzmannLayer.
+# ─────────────────────────────────────────────────────────────────────────────
+class CFLineWeightHead(nn.Module):
+    """Per-line reliability logits for the CF Saha–Boltzmann solver.
+
+    Reads the encoder's per-token embeddings and scores every line; the
+    fine-tune module turns the logits into weights in (0, 1) with a sigmoid,
+    multiplies by ``fit_valid`` and the seed-detection presence gate, and
+    feeds them as least-squares weights to ``cf.layer.SahaBoltzmannLayer``.
+
+    Args:
+        d_model: encoder embedding width (input of the per-token MLP)
+        hidden: hidden width of the two-layer MLP
+        dropout: dropout after the hidden activation
+    """
+
+    def __init__(self, d_model: int, hidden: int = 64, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, sequence_embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            sequence_embeddings: [B, L, d_model] per-line encoder outputs
+        Returns:
+            Weight logits [B, L] (raw; apply sigmoid for weights in (0, 1)).
+        """
+        return self.net(sequence_embeddings).squeeze(-1)
+
+
+class CFPlasmaInitHead(nn.Module):
+    """Bounded initial plasma state for the CF solver: (T0, log10 Ne0, log10 N·l0).
+
+    Outputs are squashed into physically sensible ranges so a randomly
+    initialised head cannot push the solver's priors to absurd values:
+
+        T0         = t_min  + t_span  · sigmoid(z0)   (default 5000 … 25000 K)
+        log10_Ne0  = ne_min + ne_span · sigmoid(z1)   (default 15 … 19)
+        log10_Nl0  = nl_min + nl_span · sigmoid(z2)   (default 13 … 19)
+
+    The final layer starts with zero weights and biases chosen so that the
+    initial outputs equal the solver defaults (10000 K, 1e17 cm^-3,
+    1e16 cm^-2) for every input; gradients still flow to the weights.
+
+    Args:
+        head_in_dim: pooled representation width (d_model or 2·d_model)
+        hidden: hidden width of the MLP (defaults to head_in_dim)
+        dropout: dropout after the hidden activation
+        t_range: (min, max) of T0 in K
+        log10_ne_range: (min, max) of log10 Ne0 [cm^-3]
+        log10_nl_range: (min, max) of log10 (N·l)0 [cm^-2]
+        init: initial (T0, log10_Ne0, log10_Nl0) reproduced at zero input
+    """
+
+    def __init__(
+        self,
+        head_in_dim: int,
+        hidden: Optional[int] = None,
+        dropout: float = 0.1,
+        t_range: tuple[float, float] = (5000.0, 25000.0),
+        log10_ne_range: tuple[float, float] = (15.0, 19.0),
+        log10_nl_range: tuple[float, float] = (13.0, 19.0),
+        init: tuple[float, float, float] = (10000.0, 17.0, 16.0),
+    ):
+        super().__init__()
+        hidden = hidden or head_in_dim
+        self.t_min, self.t_span = float(t_range[0]), float(t_range[1] - t_range[0])
+        self.ne_min, self.ne_span = float(log10_ne_range[0]), float(log10_ne_range[1] - log10_ne_range[0])
+        self.nl_min, self.nl_span = float(log10_nl_range[0]), float(log10_nl_range[1] - log10_nl_range[0])
+        self.trunk = nn.Sequential(
+            nn.Linear(head_in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.out = nn.Linear(hidden, 3)
+        with torch.no_grad():
+            self.out.weight.zero_()
+            fracs = [
+                (init[0] - self.t_min) / self.t_span,
+                (init[1] - self.ne_min) / self.ne_span,
+                (init[2] - self.nl_min) / self.nl_span,
+            ]
+            bias = [float(np.log(f / (1.0 - f))) for f in np.clip(fracs, 1e-3, 1 - 1e-3)]
+            self.out.bias.copy_(torch.tensor(bias, dtype=self.out.bias.dtype))
+
+    def forward(self, representation: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            representation: [B, head_in_dim] pooled encoder output
+        Returns:
+            ``(T0 [B] in K, log10_Ne0 [B], log10_Nl0 [B])``
+        """
+        z = torch.sigmoid(self.out(self.trunk(representation)))
+        T0 = self.t_min + self.t_span * z[:, 0]
+        log10_Ne0 = self.ne_min + self.ne_span * z[:, 1]
+        log10_Nl0 = self.nl_min + self.nl_span * z[:, 2]
+        return T0, log10_Ne0, log10_Nl0

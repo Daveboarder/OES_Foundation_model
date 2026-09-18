@@ -1,9 +1,10 @@
 """
 Publication-quality figures for the LIBS foundation model.
 
-Reads the data caches + outputs of a fine-tuned `quantification_binned` run
-(line_token_linear embedding) and renders a PowerPoint-ready figure set:
-300 dpi PNG + editable-text SVG, white background, large fonts.
+Reads the data caches + outputs of a fine-tuned `quantification_binned`,
+`detection` or `cf_quantification` run (line_token_linear embedding) and
+renders a PowerPoint-ready figure set: 300 dpi PNG + editable-text SVG, white
+background, large fonts.
 
 Figures
     fig1_annotated_spectrum      representative spectrum, top attention lines labeled
@@ -15,6 +16,15 @@ Figures
     fig5_training_curves         pretrain + finetune curves from TensorBoard logs
     fig6_embedding_map           t-SNE of pooled embeddings colored by Fe content
     fig7_graphical_abstract      composite 16:9 panel (a-d)
+
+Task-specific variants of fig4 (detection: `fig4_presence_detection` +
+`fig4b_per_element_f1`; cf_quantification: `fig4_cf_pred_vs_true` (log-log,
+censored points marked) + `fig4b_cf_per_element_within2x`).
+
+Calibration-free (cf_quantification) extras
+    fig_cf_sb_plot               Saha-Boltzmann plots of 3 test spectra
+    fig_cf_plasma_recovery       T and log10 Ne predicted vs true (one-/two-zone)
+    fig_cf_comparison            CF-learned vs CF pure-physics vs binned seed bars
 
 Animations (GIF)
     anim_attention_layers.gif    CLS attention per transformer layer
@@ -29,12 +39,15 @@ Usage:
 
     # no checkpoint inference (skips fig4, fig6, gif_layers, abstract panels c/d)
     uv run python make_publication_figures.py --skip-inference
+
+    # CF run: add a pure-physics run to the comparison figure
+    uv run python make_publication_figures.py --run_dir runs/finetune_<cf> \
+        --compare_runs "CF (pure physics)=runs/finetune_<cf_pure>"
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -62,17 +75,32 @@ from analyze_attention_importance import (  # noqa: E402
 )
 from data.libs_pipeline import load_wavelength  # noqa: E402
 from data.line_features import fwhm_voigt, voigt  # noqa: E402
-from data.line_tokenization import FEATURE_NAMES  # noqa: E402
+from data.line_tokenization import (  # noqa: E402
+    F_EK, F_ION, F_LOG_AK, F_LOG_GK, F_MAX_I, F_WAVELENGTH, F_Z, FEATURE_NAMES,
+)
 from models.heads import bin_to_concentration, concentration_to_presence  # noqa: E402
+from publication.inference_runner import (  # noqa: E402
+    CF_TASK,
+    FinetuneInferenceRunner,
+    load_splits,
+    resolve_spectra_cache,
+)
 from training.finetune import LIBSFinetuneModule  # noqa: E402
 from utils.run_manager import RunManager  # noqa: E402
 
 DEFAULT_RUN = "runs/finetune_2026-06-04_21-03-15_libs_binned_ft"
 
+CF_TARGETS = ["fig_cf_sb_plot", "fig_cf_plasma_recovery", "fig_cf_comparison"]
 ALL_TARGETS = [
     "fig1", "fig2", "fig3", "fig4", "fig5", "fig6", "fig7", "fig8",
     "gif_layers", "gif_buildup",
-]
+] + CF_TARGETS
+# Targets that need checkpoint inference (dropped by --skip-inference).
+INFERENCE_TARGETS = ("fig4", "fig6", "gif_layers", "fig_cf_sb_plot",
+                     "fig_cf_plasma_recovery")
+
+# Major elements of the Fe-matrix sample set (order = panel/bar order).
+CF_MAJOR_ELEMENTS = ["Fe", "C", "Mn", "Si", "Cr", "Ni", "Cu", "Al"]
 
 # ────────────────────────────────────────────────────────────────────────────
 # Publication style
@@ -107,6 +135,34 @@ _BASE_COLORS = [
     "#56B4E9", "#F0E442", "#7f3c8d", "#11A579", "#E73F74",
     "#3969AC", "#80BA5A", "#E68310", "#008695", "#CF1C90",
 ]
+
+# Calibration-free figures follow the dataviz reference palette: categorical
+# slots are assigned in this FIXED order (never cycled past 8 — extra classes
+# fold into "other"), text/axes use ink tokens, never a series colour.
+CF_PALETTE = [
+    "#2a78d6",  # 1 blue
+    "#eb6834",  # 2 orange
+    "#1baf7a",  # 3 aqua
+    "#eda100",  # 4 yellow
+    "#e87ba4",  # 5 magenta
+    "#008300",  # 6 green
+    "#4a3aa7",  # 7 violet
+    "#e34948",  # 8 red
+]
+CF_INK = "#0b0b0b"
+CF_INK_SECONDARY = "#52514e"
+CF_MUTED = "#898781"       # axis labels, "other", censored markers
+CF_HAIRLINE = "#e1e0d9"    # gridlines
+CF_BASELINE = "#c3c2b7"    # identity / reference lines
+# Method colours for the comparison figure: colour follows the method, not
+# its position in the bar group, so every panel paints a method identically.
+CF_METHOD_SLOTS = {
+    "CF (learned)": CF_PALETTE[0],
+    "CF (pure physics)": CF_PALETTE[1],
+    "Binned seed": CF_PALETTE[2],
+    "Classical (54 lines)": CF_PALETTE[3],
+}
+CF_ZONE_COLORS = {"one-zone": CF_PALETTE[0], "two-zone": CF_PALETTE[1]}
 
 
 class FigureRegistry:
@@ -199,6 +255,7 @@ class Assets:
         self.run_info = yaml.safe_load(open(run_dir / "run_info.yaml"))
         self.element_names: list[str] = list(self.run_info["element_names"])
         self.task: str = str(self.run_info.get("task", "quantification_binned"))
+        self.cf_info: dict = dict(self.run_info.get("cf") or {})
         self.cache_dir = Path("external_data/cache")
         self._lod_vector: np.ndarray | None = None
 
@@ -211,6 +268,8 @@ class Assets:
         self._module = None
         self._inference = None
         self._spectrum_sample = None
+        self._cf_runner: FinetuneInferenceRunner | None = None
+        self._plasma_targets: dict[str, np.ndarray] | None = None
 
         # Newest attention-importance evaluation folder.
         att_dirs = sorted((run_dir / "evaluation").glob("attention_importance_*"))
@@ -265,15 +324,16 @@ class Assets:
         return self._wavelength
 
     @property
+    def is_cf(self) -> bool:
+        return self.task == CF_TASK
+
+    @property
     def spectra_h5(self) -> h5py.File:
+        """Spectra cache of the run: `synthetic_cache_*.h5` or
+        `measured_cache_*.h5`, preferring the path recorded in run_info."""
         if self._spectra_file is None:
-            path = _resolve_cache_path(None, self.cache_dir, "synthetic_cache_*.h5")
-            # Prefer the cache whose splits file matches the trained sample counts.
-            for cand in sorted(self.cache_dir.glob("synthetic_cache_*.h5")):
-                with h5py.File(cand, "r") as f:
-                    if f["spectra"].shape[0] == self.n_total_spectra:
-                        path = cand
-                        break
+            path = resolve_spectra_cache(self.cache_dir, self.n_total_spectra,
+                                         self.run_info)
             self._spectra_file = h5py.File(path, "r")
             print(f"Spectra cache: {path.name} {self._spectra_file['spectra'].shape}")
         return self._spectra_file
@@ -286,18 +346,31 @@ class Assets:
     @property
     def splits(self) -> dict[str, np.ndarray]:
         if self._splits is None:
-            cands = sorted(self.cache_dir.glob("splits_*.json"))
-            chosen = None
-            for cand in cands:
-                s = json.load(open(cand))
-                if (len(s.get("test", [])) == self.run_info["test_samples"]
-                        and sum(len(v) for v in s.values()) == self.n_total_spectra):
-                    chosen = s
-                    break
-            if chosen is None:
-                raise FileNotFoundError("no splits_*.json matching the run sample counts")
-            self._splits = {k: np.asarray(v, dtype=np.int64) for k, v in chosen.items()}
+            self._splits = load_splits(
+                self.cache_dir, self.n_total_spectra, self.run_info["test_samples"],
+                strategy=self.cf_info.get("split_strategy"),
+            )
         return self._splits
+
+    # ── calibration-free run helpers ──
+    @property
+    def cf_runner(self) -> FinetuneInferenceRunner:
+        """Checkpoint runner that knows how to rebuild a CF module
+        (tables, layer config and seeds from run_info['cf'])."""
+        if self._cf_runner is None:
+            self._cf_runner = FinetuneInferenceRunner(
+                self.run_dir, device=self.args.device,
+                batch_size=self.args.batch_size, label=self.run_dir.name,
+            )
+        return self._cf_runner
+
+    @property
+    def plasma_targets(self) -> dict[str, np.ndarray]:
+        """Contract C2 aux targets (Te, log10_Ne, log10_Nl, is_two_zone,
+        has_plasma_labels) for every spectrum of the cache."""
+        if self._plasma_targets is None:
+            self._plasma_targets = self.cf_runner.plasma_targets
+        return self._plasma_targets
 
     @property
     def concentrations(self) -> np.ndarray:
@@ -345,6 +418,9 @@ class Assets:
 
     @property
     def encoder(self):
+        if self._encoder is None and self.is_cf:
+            # The CF module owns the encoder (built with its tables/seeds).
+            self._encoder = self.cf_runner.module.encoder
         if self._encoder is None:
             cfg = self.config
             cfg["data"]["n_bins"] = self.token_meta["n_lines"]
@@ -362,7 +438,9 @@ class Assets:
 
     @property
     def module(self) -> LIBSFinetuneModule:
-        """Full finetune module (encoder + binned head) loaded from best.ckpt."""
+        """Full finetune module (encoder + task head) loaded from best.ckpt."""
+        if self._module is None and self.is_cf:
+            self._module = self.cf_runner.module
         if self._module is None:
             module = LIBSFinetuneModule(
                 encoder=self.encoder,
@@ -412,8 +490,16 @@ class Assets:
         test_idx = self.splits["test"]
         n_take = min(self.args.max_samples, len(test_idx))
         sub = np.sort(rng.choice(test_idx, size=n_take, replace=False))
-        targets_all = self.concentrations[sub]
 
+        if self.is_cf:
+            # Physics solver outputs (mass fractions, T, Ne, per-line weights…)
+            # come from the runner; keys follow run_cf_inference's contract.
+            print(f"Running CF inference on {n_take} test spectra "
+                  f"(batch_size={self.args.batch_size}, device={self.device})...")
+            self._inference = self.cf_runner.run_cf_inference(sub)
+            return self._inference
+
+        targets_all = self.concentrations[sub]
         module = self.module
         device = self.device
         n_bins = self.run_info["n_concentration_bins"]
@@ -957,6 +1043,9 @@ def make_fig4(assets: Assets, reg: FigureRegistry):
     if assets.task == "detection":
         make_fig4_detection(assets, reg)
         return
+    if assets.is_cf:
+        make_fig4_cf(assets, reg)
+        return
     inf = assets.inference()
     preds, targets = inf["preds"], inf["targets"]
     names = assets.element_names
@@ -1010,6 +1099,598 @@ def make_fig4(assets: Assets, reg: FigureRegistry):
              "split, from run_info.yaml); negative values clipped to 0.")
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Calibration-free (cf_quantification) figures
+# ────────────────────────────────────────────────────────────────────────────
+
+def _scatter_alpha(n: int) -> float:
+    """Point opacity that keeps sparse scatters readable and dense ones light."""
+    return 0.8 if n < 200 else (0.5 if n < 1000 else 0.35)
+
+
+def _cf_style_axes(ax):
+    """Recessive chrome for CF figures: hairline grid, muted axis ink."""
+    ax.grid(True, color=CF_HAIRLINE, lw=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_color(CF_BASELINE)
+    ax.tick_params(colors=CF_INK_SECONDARY)
+
+
+def _cf_log_metrics(y_true: np.ndarray, y_pred: np.ndarray, censored: np.ndarray,
+                    lod: float) -> tuple[float, float, int, int]:
+    """(log-RMSE, within-2x fraction, n scored, n censored) over uncensored
+    predictions of spectra whose true content is at/above the LOD."""
+    scored = (y_true >= lod) & ~censored & (y_pred > 0)
+    n_cens = int((censored & (y_true >= lod)).sum())
+    if scored.sum() == 0:
+        return float("nan"), float("nan"), 0, n_cens
+    d = np.log(y_pred[scored]) - np.log(y_true[scored])
+    return (float(np.sqrt(np.mean(d ** 2))), float(np.mean(np.abs(d) <= np.log(2.0))),
+            int(scored.sum()), n_cens)
+
+
+def draw_cf_scatter(ax, y_true: np.ndarray, y_pred: np.ndarray, elem: str,
+                    lod: float, censored: np.ndarray | None = None,
+                    color: str = CF_PALETTE[0], show_xlabel: bool = True,
+                    show_ylabel: bool = True):
+    """Log–log CF prediction vs truth for one element.
+
+    Filled dots = solver estimates; hollow triangles (muted) = predictions the
+    solver flagged as censored (below LOD or no usable line). True values of
+    zero cannot be drawn on a log axis and are dropped; predictions below
+    LOD/10 are clamped to that floor so censored points stay visible.
+    """
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    censored = (np.zeros_like(y_true, dtype=bool) if censored is None
+                else np.asarray(censored, dtype=bool))
+    keep = y_true > 0
+    t, p, c = y_true[keep], y_pred[keep], censored[keep]
+    floor = max(lod / 10.0, 1e-8)
+    p_draw = np.maximum(p, floor)
+    scale = 100.0  # wt.%
+    lo = min(t.min(), p_draw.min()) * scale * 0.6 if t.size else floor * scale
+    hi = max(t.max(), p_draw.max()) * scale * 1.6 if t.size else 1.0
+
+    line_x = np.array([lo, hi])
+    ax.plot(line_x, line_x, color=CF_BASELINE, lw=1.0, zorder=1)
+    ax.plot(line_x, 2.0 * line_x, color=CF_BASELINE, lw=0.8, ls="--", zorder=1)
+    ax.plot(line_x, 0.5 * line_x, color=CF_BASELINE, lw=0.8, ls="--", zorder=1)
+    ax.axvline(lod * scale, color=CF_MUTED, lw=0.8, ls=":", zorder=1)
+
+    ok = ~c
+    ax.scatter(t[ok] * scale, p_draw[ok] * scale, s=10, alpha=_scatter_alpha(int(ok.sum())),
+               color=color, edgecolors="none", zorder=3, rasterized=True)
+    if c.any():
+        ax.scatter(t[c] * scale, p_draw[c] * scale, s=16, marker="v",
+                   facecolors="none", edgecolors=CF_MUTED, linewidths=0.7,
+                   alpha=0.8, zorder=2, rasterized=True)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal", adjustable="box")
+    _cf_style_axes(ax)
+
+    log_rmse, within2x, n_scored, n_cens = _cf_log_metrics(t, p, c, lod)
+    ax.text(0.04, 0.96,
+            f"{elem}\nlog-RMSE = {log_rmse:.2f}\nwithin 2x = {within2x:.0%}\n"
+            f"n = {n_scored}" + (f", censored {n_cens}" if n_cens else ""),
+            transform=ax.transAxes, va="top", ha="left", fontsize=10,
+            color=CF_INK)
+    if show_xlabel:
+        ax.set_xlabel("True (wt.%)")
+    if show_ylabel:
+        ax.set_ylabel("CF predicted (wt.%)")
+    return log_rmse, within2x
+
+
+def _select_cf_panels(targets: np.ndarray, lod: np.ndarray, names: list[str],
+                      n: int = 9, min_support: int = 5) -> list[int]:
+    """Elements with the most test spectra above LOD; Fe (matrix) first."""
+    support = (targets >= lod[None, :]).sum(axis=0)
+    ranked = sorted(((int(support[i]), i) for i in range(len(names))
+                     if support[i] >= min_support), reverse=True)
+    chosen = [i for _, i in ranked[:n]]
+    fe = names.index("Fe") if "Fe" in names else None
+    if fe is not None and fe not in chosen and chosen:
+        chosen[-1] = fe
+    if fe in chosen:
+        chosen = [fe] + [i for i in chosen if i != fe]
+    return chosen
+
+
+def _per_element_metric_items(per_elem: dict, metric: str) -> list[tuple[str, float]]:
+    """(element, value) pairs for `metric`, tolerating one nested level
+    (e.g. per_element[el][sample_median][metric])."""
+    items: list[tuple[str, float]] = []
+    for name, m in (per_elem or {}).items():
+        if not isinstance(m, dict):
+            continue
+        val = m.get(metric)
+        if val is None:
+            for sub in m.values():
+                if isinstance(sub, dict) and sub.get(metric) is not None:
+                    val = sub[metric]
+                    break
+        if val is not None and np.isfinite(float(val)):
+            items.append((str(name), float(val)))
+    return items
+
+
+def make_fig4_cf(assets: Assets, reg: FigureRegistry):
+    inf = assets.inference()
+    preds, targets = inf["preds"], inf["targets"]
+    censored = inf.get("censored")
+    names = assets.element_names
+    lod = assets.lod_vector.numpy()
+    chosen = _select_cf_panels(targets, lod, names)
+    if not chosen:
+        print("fig4 (cf): no element with enough test support — skipped")
+        return
+
+    ncols = 3
+    nrows = int(np.ceil(len(chosen) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(11.5, 3.9 * nrows))
+    axes = np.atleast_2d(axes)
+    for k, ei in enumerate(chosen):
+        ax = axes[k // ncols][k % ncols]
+        draw_cf_scatter(ax, targets[:, ei], preds[:, ei], names[ei], float(lod[ei]),
+                        censored=None if censored is None else censored[:, ei],
+                        show_xlabel=(k // ncols == nrows - 1),
+                        show_ylabel=(k % ncols == 0))
+    for k in range(len(chosen), nrows * ncols):
+        axes[k // ncols][k % ncols].axis("off")
+    variant = "pure physics" if assets.cf_info.get("pure_physics") else "learned weights"
+    fig.suptitle(f"Calibration-free quantification vs. true composition "
+                 f"(test set, {variant})", fontsize=14, y=1.0)
+    fig.tight_layout()
+    n_cens_total = int(censored[:, chosen].sum()) if censored is not None else 0
+    reg.save(fig, "fig4_cf_pred_vs_true",
+             f"Calibration-free (Saha–Boltzmann + closure) mass fractions vs. "
+             f"ground truth on {preds.shape[0]} test spectra for the {len(chosen)} "
+             "elements with the largest test support, log–log axes. Solid line = "
+             "identity, dashed = factor-of-two band, dotted = LOD; hollow "
+             f"triangles = censored predictions ({n_cens_total} in these panels). "
+             "Annotated log-RMSE and within-2x fraction are computed on "
+             "uncensored spectra with true content at or above LOD.")
+
+    # 4b — per-element within-2x from the full-test-set metrics in run_info.
+    per_elem = (assets.run_info.get("test_results") or {}).get("per_element")
+    items = _per_element_metric_items(per_elem, "within_2x")
+    if not items:
+        print("run_info has no per_element within_2x metrics — skipping fig4b")
+        return
+    n_cens = dict(_per_element_metric_items(per_elem, "n_censored"))
+    items.sort(key=lambda kv: kv[1], reverse=True)
+    names_s = [k for k, _ in items]
+    vals = np.array([min(max(v, 0.0), 1.0) for _, v in items])
+    fig, ax = plt.subplots(figsize=(7.2, 9.5))
+    ax.barh(range(len(names_s)), vals, color=CF_PALETTE[0], edgecolor="none",
+            height=0.72, zorder=2)
+    ax.set_yticks(range(len(names_s)))
+    ax.set_yticklabels(names_s, fontsize=10)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1.02)
+    ax.set_xlabel("Test fraction within a factor of 2 (uncensored, above LOD)")
+    _cf_style_axes(ax)
+    ax.grid(False, axis="y")
+    for i, (name, v) in enumerate(zip(names_s, vals)):
+        label = f"{v:.2f}"
+        if name in n_cens and n_cens[name] > 0:
+            label += f"  ({int(n_cens[name])} censored)"
+        ax.text(min(v + 0.012, 1.0), i, label, va="center", fontsize=8.2,
+                color=CF_INK_SECONDARY)
+    ax.set_title(f"Calibration-free accuracy across all {len(names_s)} elements",
+                 fontsize=12.5)
+    fig.tight_layout()
+    reg.save(fig, "fig4b_cf_per_element_within2x",
+             "Per-element fraction of test spectra whose calibration-free "
+             "estimate lies within a factor of two of the truth (full test "
+             "split, from run_info.yaml); the number of censored predictions "
+             "(below LOD / no usable line) is given in brackets.")
+
+
+def _cf_sb_points(tokens: np.ndarray, valid: np.ndarray, weights: np.ndarray,
+                  T: float, log10_Ne: float, tables, tau0: np.ndarray | None,
+                  gamma_nm: float, used_mask: np.ndarray | None = None) -> dict:
+    """Saha–Boltzmann coordinates of every used line of one spectrum.
+
+    x = E_k + z·E_ion,   y = ln(area·λ / (g_k A_k)) − z·ln F(T) + z·ln N_e,
+    so that all lines of one element (both stages) lie on y = q_e − x / kT.
+    Areas are self-absorption corrected with the solver's curve-of-growth
+    factor when `tau0` is available (raw positions are kept in `y_raw`).
+    """
+    from data.plasma_physics import (
+        KB_EV, curve_of_growth_factor, doppler_sigma_nm, saha_thermal_factor,
+    )
+    wl = tokens[:, F_WAVELENGTH].astype(np.float64)
+    Ek = tokens[:, F_EK].astype(np.float64)
+    gk = 10.0 ** tokens[:, F_LOG_GK].astype(np.float64)
+    Ak = 10.0 ** tokens[:, F_LOG_AK].astype(np.float64)
+    Z = np.rint(tokens[:, F_Z]).astype(np.int64)
+    z = np.rint(tokens[:, F_ION]).astype(np.int64)
+    area = tokens[:, F_MAX_I].astype(np.float64)
+    elem_idx = np.full(Z.shape, -1, dtype=np.int64)
+    in_range = (Z >= 0) & (Z < len(tables.z_to_elem))
+    elem_idx[in_range] = np.asarray(tables.z_to_elem)[Z[in_range]]
+
+    used = (valid > 0) & (weights > 1e-3) & (area > 0) & (elem_idx >= 0)
+    if used_mask is not None:
+        used &= used_mask.astype(bool)
+    e = elem_idx[used]
+    x = Ek[used] + z[used] * np.asarray(tables.E_ion)[e]
+    lnF = float(np.log(saha_thermal_factor(T)))
+    eta = float(np.log(10.0) * log10_Ne)
+    y_raw = np.log(area[used] * wl[used] / (gk[used] * Ak[used])) - z[used] * lnF + z[used] * eta
+    y = y_raw.copy()
+    tau = None
+    if tau0 is not None:
+        tau = np.maximum(np.asarray(tau0, dtype=np.float64)[used], 0.0)
+        sigma = doppler_sigma_nm(wl[used], T, np.asarray(tables.mass_amu)[e])
+        f = curve_of_growth_factor(tau, sigma, gamma_nm)
+        y = y_raw - np.log(np.maximum(f, 1e-12))
+    return {"x": x, "y": y, "y_raw": y_raw, "elem": e, "w": weights[used],
+            "z": z[used], "tau0": tau, "beta": 1.0 / (KB_EV * T)}
+
+
+def make_fig_cf_sb_plot(assets: Assets, reg: FigureRegistry, n_spectra: int = 3):
+    """Saha–Boltzmann plots of three test spectra spanning the fitted T range."""
+    if not assets.is_cf:
+        print("fig_cf_sb_plot: not a cf_quantification run — skipped")
+        return
+    inf = assets.inference()
+    if inf.get("weights") is None or inf.get("T") is None:
+        print("fig_cf_sb_plot: module output lacks cf_weights/cf_T — skipped")
+        return
+    tables = assets.cf_runner.cf_tables
+    names = assets.element_names
+    weights, valid = inf["weights"], inf["fit_valid"]
+    used_all = inf.get("used_mask")
+    n_used = ((weights > 1e-3) & (valid > 0)).sum(axis=1)
+    if used_all is not None:
+        n_used = np.minimum(n_used, used_all.sum(axis=1))
+    # Candidates: the better-populated third of the spectra; pick min/median/max T.
+    order = np.argsort(-n_used)
+    pool = order[:max(n_spectra, len(order) // 3)]
+    pool = pool[np.argsort(inf["T"][pool])]
+    if len(pool) >= n_spectra:
+        picks = [int(pool[0]), int(pool[len(pool) // 2]), int(pool[-1])][:n_spectra]
+        picks = list(dict.fromkeys(picks))
+    else:
+        picks = [int(i) for i in pool]
+    if not picks:
+        print("fig_cf_sb_plot: no spectrum with used lines — skipped")
+        return
+
+    cf_cfg = dict(assets.cf_info.get("cf_cfg") or {})
+    gamma_nm = float(cf_cfg.get("gamma_nm", 0.01))
+    sa_on = bool(cf_cfg.get("sa_correction", True)) and inf.get("tau0") is not None
+    glob_idx = inf["indices"][picks]
+    with h5py.File(assets.tokens_path, "r") as f:
+        tokens = f["tokens"][np.sort(glob_idx)].astype(np.float32)
+    # h5py needs sorted indices; restore pick order.
+    tokens = tokens[np.argsort(np.argsort(glob_idx))]
+
+    panels = []
+    for k, row in enumerate(picks):
+        panels.append(_cf_sb_points(
+            tokens[k], valid[row], weights[row], float(inf["T"][row]),
+            float(inf["log10_Ne"][row]), tables,
+            inf["tau0"][row] if sa_on else None, gamma_nm,
+            used_mask=None if used_all is None else used_all[row],
+        ))
+
+    # Element colours: fixed slots by total weight over the shown spectra;
+    # everything past slot 7 folds into a muted "other".
+    tot_w = np.zeros(len(names))
+    for p in panels:
+        np.add.at(tot_w, p["elem"], p["w"])
+    ranked = [int(i) for i in np.argsort(-tot_w) if tot_w[i] > 0]
+    slots = {ei: CF_PALETTE[r] for r, ei in enumerate(ranked[:7])}
+    other_color = CF_MUTED
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.6 * len(panels) + 0.8, 4.9),
+                             sharey=False)
+    axes = np.atleast_1d(axes)
+    for ax, p, row in zip(axes, panels, picks):
+        T, logNe = float(inf["T"][row]), float(inf["log10_Ne"][row])
+        size = 6.0 + 54.0 * np.clip(p["w"], 0.0, 1.0)
+        for ei in np.unique(p["elem"]):
+            m = p["elem"] == ei
+            color = slots.get(int(ei), other_color)
+            ax.scatter(p["x"][m], p["y"][m], s=size[m], color=color, alpha=0.75,
+                       edgecolors="white", linewidths=0.5, zorder=3)
+            if sa_on and p["tau0"] is not None:
+                strong = m & (p["tau0"] > 0.5)
+                if strong.any():
+                    ax.scatter(p["x"][strong], p["y_raw"][strong], s=size[strong] * 0.6,
+                               facecolors="none", edgecolors=color, linewidths=0.6,
+                               alpha=0.6, zorder=2)
+                    ax.vlines(p["x"][strong], p["y_raw"][strong], p["y"][strong],
+                              color=color, lw=0.5, alpha=0.5, zorder=2)
+            # Common-slope line from the returned intercept q_e and T.
+            q = inf["intercepts"][row, int(ei)] if inf.get("intercepts") is not None else np.nan
+            if np.isfinite(q) and int(ei) in slots:
+                xs = np.array([p["x"][m].min() - 0.3, p["x"][m].max() + 0.3])
+                ax.plot(xs, q - p["beta"] * xs, color=color, lw=1.4, alpha=0.9, zorder=2)
+        _cf_style_axes(ax)
+        ax.set_xlabel("$E_k + z\\,E_{ion}$ (eV)")
+        ax.set_title(f"T = {T:.0f} K,  log$_{{10}}$ N$_e$ = {logNe:.2f}\n"
+                     f"{int(len(p['x']))} weighted lines", fontsize=11.5)
+    axes[0].set_ylabel("ln(A λ / g$_k$ A$_{ki}$) − z ln F(T) + z ln N$_e$")
+
+    handles = [plt.Line2D([], [], marker="o", ls="", color=slots[ei], ms=7,
+                          label=names[ei]) for ei in ranked[:7]]
+    if len(ranked) > 7:
+        handles.append(plt.Line2D([], [], marker="o", ls="", color=other_color, ms=7,
+                                  label="other"))
+    handles += [
+        plt.Line2D([], [], marker="o", ls="", color=CF_INK_SECONDARY, ms=3.5,
+                   label="w = 0.25"),
+        plt.Line2D([], [], marker="o", ls="", color=CF_INK_SECONDARY, ms=7.5,
+                   label="w = 1.0"),
+    ]
+    axes[-1].legend(handles=handles, loc="upper right", fontsize=9, ncol=1,
+                    handletextpad=0.4, borderaxespad=0.2)
+    fig.suptitle("Saha–Boltzmann plots of calibration-free test spectra "
+                 "(points sized by learned line weight)", fontsize=13.5, y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    reg.save(fig, "fig_cf_sb_plot",
+             f"Saha–Boltzmann plots for {len(panels)} test spectra spanning the "
+             "fitted temperature range. Each point is one weighted line "
+             "(x = upper-level energy plus z·E_ion, y = ln(area·λ/(g_k A_ki)) "
+             "minus the Saha thermal term plus z·ln N_e, so neutral and ionic "
+             "lines of one element share a line); point size encodes the "
+             "reliability weight, colour the element (top 7 by weight, rest "
+             "muted). Solid lines have the common slope −1/kT from the fitted "
+             "temperature and the per-element intercept q_e returned by the "
+             "solver" + (". Hollow markers show the uncorrected position of "
+                        "self-absorbed lines (τ0 > 0.5)." if sa_on else "."))
+
+
+def _draw_recovery_panel(ax, true_v, pred_v, two_zone, xlabel, ylabel,
+                         fmt_err, title):
+    """Predicted-vs-true scatter coloured one-/two-zone with per-group error."""
+    lo = float(min(true_v.min(), pred_v.min()))
+    hi = float(max(true_v.max(), pred_v.max()))
+    pad = 0.05 * (hi - lo + 1e-9)
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color=CF_BASELINE, lw=1.0,
+            zorder=1)
+    lines = []
+    for label, m in (("one-zone", ~two_zone), ("two-zone", two_zone)):
+        if not m.any():
+            continue
+        ax.scatter(true_v[m], pred_v[m], s=10, alpha=_scatter_alpha(int(two_zone.size)),
+                   color=CF_ZONE_COLORS[label], edgecolors="none", zorder=3,
+                   rasterized=True, label=label)
+        lines.append(f"{label}: {fmt_err(true_v[m], pred_v[m])} (n={int(m.sum())})")
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_aspect("equal", adjustable="box")
+    _cf_style_axes(ax)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=11.5)
+    ax.text(0.04, 0.96, "\n".join(lines), transform=ax.transAxes, va="top",
+            ha="left", fontsize=9.5, color=CF_INK)
+
+
+def make_fig_cf_plasma_recovery(assets: Assets, reg: FigureRegistry):
+    """T and log10 Ne recovered by the CF solver vs the generator's values."""
+    if not assets.is_cf:
+        print("fig_cf_plasma_recovery: not a cf_quantification run — skipped")
+        return
+    inf = assets.inference()
+    if inf.get("T") is None or inf.get("log10_Ne") is None:
+        print("fig_cf_plasma_recovery: module output lacks cf_T/cf_log10_Ne — skipped")
+        return
+    aux = assets.plasma_targets
+    idx = inf["indices"]
+    has = aux["has_plasma_labels"][idx] > 0
+    if not has.any():
+        print("fig_cf_plasma_recovery: spectra cache has no plasma labels "
+              "(measured data or legacy generator) — skipped")
+        return
+    two_zone = aux["is_two_zone"][idx][has] > 0
+    T_true, T_pred = aux["Te"][idx][has], inf["T"][has]
+    ne_true, ne_pred = aux["log10_Ne"][idx][has], inf["log10_Ne"][has]
+
+    def mape(t, p):
+        return f"MAPE {np.mean(np.abs(p - t) / np.maximum(t, 1.0)):.1%}"
+
+    def mae(t, p):
+        return f"MAE {np.mean(np.abs(p - t)):.2f} dex"
+
+    panels = [
+        (T_true / 1000.0, T_pred / 1000.0, "True T$_e$ (kK)", "CF T (kK)", mape,
+         "Temperature"),
+        (ne_true, ne_pred, "True log$_{10}$ N$_e$ (cm$^{-3}$)",
+         "CF log$_{10}$ N$_e$", mae, "Electron density"),
+    ]
+    nl_true = aux.get("log10_Nl")
+    nl_init = inf.get("init_log10_Nl0")
+    if nl_true is not None and nl_init is not None and np.any(nl_true[idx][has] != 0):
+        panels.append((nl_true[idx][has], nl_init[has],
+                       "True log$_{10}$ (N·l) (cm$^{-2}$)",
+                       "Initial-guess log$_{10}$ (N·l)", mae, "Column density (init head)"))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.7 * len(panels) + 0.4, 4.6))
+    axes = np.atleast_1d(axes)
+    for ax, (t, p, xl, yl, err, title) in zip(axes, panels):
+        _draw_recovery_panel(ax, np.asarray(t, dtype=np.float64),
+                             np.asarray(p, dtype=np.float64), two_zone, xl, yl, err, title)
+    axes[0].legend(loc="lower right", fontsize=9.5, markerscale=2.0)
+    fig.suptitle("Plasma-state recovery by the calibration-free solver (test set)",
+                 fontsize=13.5, y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    reg.save(fig, "fig_cf_plasma_recovery",
+             f"Plasma parameters recovered by the Saha–Boltzmann solver on "
+             f"{int(has.sum())} synthetic test spectra vs. the generator's values "
+             "(inner-zone T_e1 and N_e1 for two-zone shots): temperature, "
+             "electron density" + (", and the initial column-density guess of "
+                                   "the plasma-init head" if len(panels) == 3 else "")
+             + ". Colour marks one-zone vs. two-zone shots; a single-zone "
+             "solver applied to a two-zone plasma recovers an effective "
+             "temperature, hence the larger two-zone scatter.")
+
+
+def _find_per_element_blocks(d, path: tuple[str, ...] = (), depth: int = 0):
+    """Yield (path, per_element_dict) for every nested dict carrying a
+    `per_element` block (test_results and evaluate_cf.py layouts)."""
+    if not isinstance(d, dict) or depth > 4:
+        return
+    pe = d.get("per_element")
+    if isinstance(pe, dict) and pe and all(isinstance(v, dict) for v in pe.values()):
+        yield path, pe
+    for k, v in d.items():
+        if k != "per_element" and isinstance(v, dict):
+            yield from _find_per_element_blocks(v, path + (str(k),), depth + 1)
+
+
+def _cf_method_label(path: tuple[str, ...], default: str) -> str:
+    s = "/".join(path).lower()
+    if "pure" in s:
+        return "CF (pure physics)"
+    if "classical" in s:
+        return "Classical (54 lines)"
+    if "binned" in s or "seed" in s:
+        return "Binned seed"
+    return default
+
+
+def _cf_group_label(path: tuple[str, ...], default: str) -> str:
+    return "measured" if "measured" in "/".join(path).lower() else default
+
+
+def _cf_comparison_sources(assets: Assets) -> dict[tuple[str, str], dict]:
+    """{(group, method): per_element} from this run, its binned seed run and
+    any `--compare_runs label=run_dir` entries. Groups: 'synthetic test' and
+    'measured' (blocks under test_results_measured)."""
+    sources: dict[tuple[str, str], dict] = {}
+
+    def add_run(run_info: dict, default_label: str):
+        for top, group in (("test_results", "synthetic test"),
+                           ("test_results_measured", "measured")):
+            block = run_info.get(top)
+            if not isinstance(block, dict):
+                continue
+            for path, pe in _find_per_element_blocks(block, (top,)):
+                key = (_cf_group_label(path, group), _cf_method_label(path[1:], default_label))
+                sources.setdefault(key, pe)
+
+    own_label = ("CF (pure physics)" if assets.cf_info.get("pure_physics")
+                 else "CF (learned)")
+    add_run(assets.run_info, own_label)
+
+    seed_run = assets.cf_info.get("seed_binned_run")
+    if seed_run and Path(seed_run, "run_info.yaml").is_file():
+        add_run(yaml.safe_load(open(Path(seed_run, "run_info.yaml"))) or {}, "Binned seed")
+
+    for entry in (assets.args.compare_runs or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        label, _, run_dir = entry.partition("=")
+        if not run_dir:
+            label, run_dir = Path(entry).name, entry
+        info_path = Path(run_dir) / "run_info.yaml"
+        if not info_path.is_file():
+            print(f"--compare_runs: {run_dir} has no run_info.yaml — skipped")
+            continue
+        add_run(yaml.safe_load(open(info_path)) or {}, label.strip())
+    return sources
+
+
+def make_fig_cf_comparison(assets: Assets, reg: FigureRegistry):
+    """Grouped bars per major element: CF-learned vs CF pure-physics vs the
+    binned seed (and any extra runs), on the synthetic test split and, when
+    `test_results_measured` exists, on measured spectra."""
+    if not assets.is_cf:
+        print("fig_cf_comparison: not a cf_quantification run — skipped")
+        return
+    sources = _cf_comparison_sources(assets)
+    if not sources:
+        print("fig_cf_comparison: no per_element test metrics found — skipped")
+        return
+    names = assets.element_names
+    majors = [e for e in CF_MAJOR_ELEMENTS if e in names]
+
+    # Metric: the one available in the most sources (priority on ties).
+    candidates = [("within_2x", "Fraction within a factor of 2", False),
+                  ("r2", "Test $R^2$", False),
+                  ("log_rmse", "log-RMSE (lower is better)", True)]
+    best = None
+    for metric, label, lower_better in candidates:
+        n_have = sum(
+            1 for pe in sources.values()
+            if any(e in dict(_per_element_metric_items(pe, metric)) for e in majors)
+        )
+        if best is None or n_have > best[0]:
+            best = (n_have, metric, label, lower_better)
+    n_have, metric, metric_label, lower_better = best
+    if n_have == 0:
+        print("fig_cf_comparison: no comparable per-element metric — skipped")
+        return
+
+    groups = [g for g in ("synthetic test", "measured") if any(k[0] == g for k in sources)]
+    method_order = list(CF_METHOD_SLOTS) + sorted(
+        {k[1] for k in sources} - set(CF_METHOD_SLOTS))
+    methods = [m for m in method_order if any(k[1] == m for k in sources)]
+    colors = {m: CF_METHOD_SLOTS.get(m, CF_PALETTE[min(4 + i, 7)])
+              for i, m in enumerate(methods)}
+
+    panel_w = 0.8 * len(majors) + 1.8
+    fig, axes = plt.subplots(1, len(groups), figsize=(panel_w * len(groups), 4.8),
+                             sharey=True)
+    axes = np.atleast_1d(axes)
+    width = 0.8 / max(len(methods), 1)
+    x = np.arange(len(majors))
+    ymax = 0.0
+    for ax, group in zip(axes, groups):
+        present = [m for m in methods if (group, m) in sources]
+        for j, m in enumerate(present):
+            vals = dict(_per_element_metric_items(sources[(group, m)], metric))
+            y = np.array([vals.get(e, np.nan) for e in majors], dtype=np.float64)
+            if not lower_better:
+                y = np.clip(y, 0.0, None)
+            offset = (j - (len(present) - 1) / 2.0) * width
+            ax.bar(x + offset, np.nan_to_num(y), width * 0.92, color=colors[m],
+                   edgecolor="none", label=m, zorder=2)
+            for xi, yi in zip(x + offset, y):
+                if np.isnan(yi):
+                    ax.text(xi, 0.01, "n/a", rotation=90, ha="center", va="bottom",
+                            fontsize=7, color=CF_MUTED)
+            ymax = max(ymax, float(np.nanmax(y)) if np.isfinite(y).any() else 0.0)
+        ax.set_xticks(x)
+        ax.set_xticklabels(majors)
+        ax.set_title(group, fontsize=12)
+        _cf_style_axes(ax)
+        ax.grid(False, axis="x")
+    axes[0].set_ylabel(metric_label)
+    if not lower_better:
+        axes[0].set_ylim(0, 1.12)
+    else:
+        axes[0].set_ylim(0, ymax * 1.25 if ymax > 0 else 1.0)
+    # One legend for every method drawn anywhere (colour follows the method).
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=colors[m], edgecolor="none", label=m) for m in methods]
+    fig.legend(handles=handles, loc="upper center", ncol=len(methods), fontsize=10,
+               bbox_to_anchor=(0.5, 0.96), frameon=False)
+    fig.suptitle("Calibration-free vs. learned quantification per major element",
+                 fontsize=13.5, y=1.04)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    reg.save(fig, "fig_cf_comparison",
+             f"Per-element {metric_label.replace('$', '')} for the major elements "
+             f"({', '.join(majors)}) of the methods available in run_info.yaml "
+             f"({', '.join(methods)}) on the synthetic test split"
+             + (" and on measured spectra (test_results_measured)"
+                if "measured" in groups else "")
+             + ". Missing bars (n/a) mean the metric was not reported for that "
+             "method/element.")
+
+
 def _scalars(log_dir: str, tag: str):
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     ea = EventAccumulator(log_dir, size_guidance={"scalars": 0})
@@ -1045,6 +1726,7 @@ def make_fig5(assets: Assets, reg: FigureRegistry):
                  transform=ax1.transAxes)
         ax1.axis("off")
 
+    legend_loc = "lower right"
     if assets.task == "detection":
         tr = _scalars(ft_logs, "train/det_f1_epoch")
         if tr is None:
@@ -1055,6 +1737,17 @@ def make_fig5(assets: Assets, reg: FigureRegistry):
         test_key = "test/det_f1"
         test_scale = 1.0
         test_fmt = "{:.3f}"
+    elif assets.is_cf:
+        tr = _scalars(ft_logs, "train/cf_log_rmse_epoch")
+        if tr is None:
+            tr = _scalars(ft_logs, "train/cf_log_rmse")
+        va = _scalars(ft_logs, "val/cf_log_rmse")
+        ylab = "CF log-RMSE (ln units, lower is better)"
+        title = "Fine-tuning\n(calibration-free quantification: line weights + plasma init)"
+        test_key = "test/cf_log_rmse"
+        test_scale = 1.0
+        test_fmt = "{:.3f}"
+        legend_loc = "upper right"
     else:
         tr = _scalars(ft_logs, "train/bin_accuracy_epoch")
         va = _scalars(ft_logs, "val/bin_accuracy")
@@ -1077,31 +1770,47 @@ def make_fig5(assets: Assets, reg: FigureRegistry):
                  f"test {test_fmt.format(test_acc if test_scale == 1.0 else test_acc * 100)}",
                  transform=ax2.get_yaxis_transform(), ha="right", va="top",
                  fontsize=10, color="0.3")
+    if tr is None and va is None:
+        ax2.text(0.5, 0.5, "fine-tune curves not found", ha="center", va="center",
+                 transform=ax2.transAxes)
     ax2.set_title(title)
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel(ylab)
-    ax2.legend(loc="lower right")
+    if tr is not None or va is not None:
+        ax2.legend(loc=legend_loc)
     fig.tight_layout()
-    caption = (
-        "Training curves parsed from TensorBoard logs: pre-training loss "
-        "(left) and fine-tuning detection F1 (right), with the final test "
-        "F1 marked."
-        if assets.task == "detection" else
-        "Training curves parsed from TensorBoard logs: pre-training loss "
-        "(left) and fine-tuning concentration-bin accuracy (right), with "
-        "the final test accuracy marked."
-    )
+    if assets.task == "detection":
+        caption = (
+            "Training curves parsed from TensorBoard logs: pre-training loss "
+            "(left) and fine-tuning detection F1 (right), with the final test "
+            "F1 marked."
+        )
+    elif assets.is_cf:
+        caption = (
+            "Training curves parsed from TensorBoard logs: pre-training loss "
+            "(left) and the calibration-free log-RMSE of the solver output "
+            "while the line-weight and plasma-init heads are trained on "
+            "synthetic data (right), with the final test log-RMSE marked."
+        )
+    else:
+        caption = (
+            "Training curves parsed from TensorBoard logs: pre-training loss "
+            "(left) and fine-tuning concentration-bin accuracy (right), with "
+            "the final test accuracy marked."
+        )
     reg.save(fig, "fig5_training_curves", caption)
 
 
 def make_fig6(assets: Assets, reg: FigureRegistry):
     inf = assets.inference()
     c_idx = assets.element_names.index("C")
-    color_values = (
-        inf["concentrations"][:, c_idx]
-        if assets.task == "detection"
-        else inf["targets"][:, c_idx]
-    )
+    if assets.task == "detection":
+        color_values = inf["concentrations"][:, c_idx]
+    elif assets.is_cf:
+        # CF targets are the true mass fractions of the spectra cache.
+        color_values = inf["targets"][:, c_idx]
+    else:
+        color_values = inf["targets"][:, c_idx]
     fig, ax = plt.subplots(figsize=(7.6, 6.2))
     print("Computing t-SNE embedding map...")
     draw_embedding_map(ax, fig, inf["representations"], color_values,
@@ -1151,6 +1860,13 @@ def make_fig7(assets: Assets, reg: FigureRegistry, top_n: int,
             )
             ax_c.set_title("Presence detection (test set)", fontsize=11.5)
             color_values = inf["concentrations"][:, c_idx]
+        elif assets.is_cf:
+            cens = inf.get("censored")
+            draw_cf_scatter(ax_c, inf["targets"][:, fe_idx], inf["preds"][:, fe_idx],
+                            "Fe", float(assets.lod_vector[fe_idx]),
+                            censored=None if cens is None else cens[:, fe_idx])
+            ax_c.set_title("Calibration-free quantification (test set)", fontsize=11.5)
+            color_values = inf["targets"][:, c_idx]
         else:
             draw_pred_scatter(ax_c, inf["targets"][:, fe_idx], inf["preds"][:, fe_idx],
                               "Fe", color="#0072B2")
@@ -1163,15 +1879,20 @@ def make_fig7(assets: Assets, reg: FigureRegistry, top_n: int,
         ax_d.set_title("Learned embeddings", fontsize=11.5)
     else:
         per_elem = (assets.run_info.get("test_results") or {}).get("per_element", {})
-        items = sorted(((n, m["r2"]) for n, m in per_elem.items()),
+        metric, xlabel = "r2", "Test $R^2$"
+        if assets.is_cf and _per_element_metric_items(per_elem, "within_2x"):
+            metric, xlabel = "within_2x", "Test fraction within 2x"
+        items = sorted(_per_element_metric_items(per_elem, metric),
                        key=lambda kv: kv[1], reverse=True)[:12]
         ax_c.barh(range(len(items)), [max(v, 0) for _, v in items],
-                  color="#0072B2")
+                  color=CF_PALETTE[0] if assets.is_cf else "#0072B2")
         ax_c.set_yticks(range(len(items)))
         ax_c.set_yticklabels([n for n, _ in items], fontsize=9)
         ax_c.invert_yaxis()
-        ax_c.set_xlabel("Test $R^2$")
-        ax_c.set_title("Quantification (test set)", fontsize=11.5)
+        ax_c.set_xlabel(xlabel)
+        ax_c.set_title("Calibration-free quantification (test set)"
+                       if assets.is_cf else "Quantification (test set)",
+                       fontsize=11.5)
         wl_lines = assets.per_line.sort_values("line_index")
         ax_d.vlines(wl_lines["central_wavelength_nm"], 0,
                     wl_lines["importance_layer_mean"], color="0.6", lw=0.7)
@@ -1429,8 +2150,8 @@ def main(args):
     if unknown:
         raise ValueError(f"unknown --only targets {unknown}; pick from {ALL_TARGETS}")
     if args.skip_inference:
-        skipped = [t for t in targets if t in ("fig4", "fig6", "gif_layers")]
-        targets = [t for t in targets if t not in ("fig4", "fig6", "gif_layers")]
+        skipped = [t for t in targets if t in INFERENCE_TARGETS]
+        targets = [t for t in targets if t not in INFERENCE_TARGETS]
         if skipped:
             print(f"--skip-inference: skipping {skipped} "
                   "(fig4b is also skipped; it is bundled with fig4)")
@@ -1446,6 +2167,11 @@ def main(args):
     plt.rcParams.update(PUB_RC)
     assets = Assets(run_dir, args)
     reg = FigureRegistry(output_dir)
+    if not assets.is_cf:
+        # CF-only figures are silently dropped for detection / binned runs
+        # unless they were requested explicitly.
+        implicit_cf = [t for t in targets if t in CF_TARGETS] if not args.only else []
+        targets = [t for t in targets if t not in implicit_cf]
 
     try:
         if "fig1" in targets:
@@ -1469,18 +2195,34 @@ def main(args):
             make_gif_buildup(assets, reg)
         if "gif_layers" in targets:
             make_gif_layers(assets, reg)
+        if "fig_cf_sb_plot" in targets:
+            make_fig_cf_sb_plot(assets, reg)
+        if "fig_cf_plasma_recovery" in targets:
+            make_fig_cf_plasma_recovery(assets, reg)
+        if "fig_cf_comparison" in targets:
+            make_fig_cf_comparison(assets, reg)
     finally:
         assets.close()
 
-    reg.write_readme([
+    header = [
         f"Run: {assets.run_info.get('run_name', run_dir.name)}",
         f"Task: {assets.run_info.get('task')}  "
         f"Embedding: {assets.run_info.get('embedding_type')}",
         f"Attention source: {assets.attention_dir.name}",
+    ]
+    if assets.is_cf:
+        header.append(
+            f"CF: pure_physics={assets.cf_info.get('pure_physics', False)}  "
+            f"c0_source={assets.cf_info.get('c0_source')}  "
+            f"seed_binned_run={assets.cf_info.get('seed_binned_run')}  "
+            f"seed_detection_run={assets.cf_info.get('seed_detection_run')}",
+        )
+    header += [
         f"Generated: {datetime.now().isoformat(timespec='seconds')}",
         "All static figures: 300 dpi PNG + SVG with editable text "
         "(white background, PowerPoint-ready).",
-    ])
+    ]
+    reg.write_readme(header)
 
     print("\n" + "=" * 60)
     print(f"Publication figures complete: {output_dir}")
@@ -1493,8 +2235,14 @@ if __name__ == "__main__":
                     "fine-tuned LIBS foundation-model run",
     )
     parser.add_argument("--run_dir", type=str, default=DEFAULT_RUN,
-                        help="Fine-tuned run directory (binned quantification, "
-                             "line_token_linear embedding)")
+                        help="Fine-tuned run directory (quantification_binned, "
+                             "detection or cf_quantification; line_token_linear "
+                             "embedding)")
+    parser.add_argument("--compare_runs", type=str, default=None,
+                        help="cf_quantification only: comma list of "
+                             "'label=run_dir' entries whose run_info test metrics "
+                             "are added to fig_cf_comparison (e.g. a "
+                             "--cf_pure_physics run or the binned seed run)")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Where to write figures (default: "
                              "<run_dir>/evaluation/publication_<timestamp>)")
@@ -1514,7 +2262,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip-inference", dest="skip_inference",
                         action="store_true",
                         help="Skip checkpoint inference (drops fig4, fig6, "
-                             "gif_layers; abstract uses CSV-only panels)")
+                             "gif_layers, fig_cf_sb_plot, fig_cf_plasma_recovery; "
+                             "abstract uses CSV-only panels)")
     parser.add_argument("--only", type=str, default=None,
                         help="Comma list of targets to render: "
                              + ",".join(ALL_TARGETS))
