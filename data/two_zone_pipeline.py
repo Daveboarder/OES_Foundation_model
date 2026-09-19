@@ -644,7 +644,9 @@ def generate_zone_spectra(
 ) -> np.ndarray:
     """Synthesise every row of ``sample_table`` (contract-C1 columns)."""
     n_samples = len(sample_table)
-    spectra = np.zeros((n_samples, len(wavelength)))
+    # float32: the spectra are unit-normalised and end up in a float32 tensor,
+    # and float64 doubles both the 8 GB working set and the HDF5 cache.
+    spectra = np.zeros((n_samples, len(wavelength)), dtype=np.float32)
     elements = [c for c in sample_table.columns if c not in _SKIP_COLS]
     conc_mat = sample_table[elements].to_numpy(dtype=np.float64)
     zone_rows = sample_table[list(ZONE_COLUMNS)].to_dict("records")

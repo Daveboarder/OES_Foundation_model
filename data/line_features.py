@@ -327,7 +327,14 @@ def build_line_features_cache(
     features = np.zeros((n_spec, n_lines, N_FEATURES), dtype=np.float32)
 
     if workers > 1:
-        ctx = mp.get_context("spawn")
+        # `spectra` is the whole dataset (8 GB at full size): with "spawn" every
+        # worker gets its own pickled copy through initargs and the box is OOM
+        # killed at 22 workers. "fork" shares it copy-on-write instead.
+        try:
+            ctx = mp.get_context("fork")
+        except ValueError:                                   # non-POSIX
+            ctx = mp.get_context("spawn")
+        spectra = np.ascontiguousarray(spectra, dtype=np.float32)
         with ctx.Pool(
             processes=workers,
             initializer=_init_fit_worker,

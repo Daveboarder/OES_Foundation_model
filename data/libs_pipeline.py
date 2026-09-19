@@ -503,7 +503,11 @@ def save_spectra_cache(table: pd.DataFrame, spectra: np.ndarray, path: str) -> N
 
 def load_spectra_cache(path: str) -> tuple[pd.DataFrame, np.ndarray]:
     with h5py.File(path, "r") as f:
-        spectra = f["spectra"][:]
+        # read_direct converts chunk by chunk, so a float64 cache (written
+        # before the generator switched to float32) never costs 2x the RAM.
+        ds = f["spectra"]
+        spectra = np.empty(ds.shape, dtype=np.float32)
+        ds.read_direct(spectra)
         grp = f["sample_table"]
         cols = json.loads(grp.attrs["columns"])
         data = {}

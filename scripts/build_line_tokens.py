@@ -53,7 +53,7 @@ def main() -> None:
         raise SystemExit("LIBS pipeline produced no spectra — check configs.")
 
     meta = prepare_line_tokens_assets(
-        ds.spectra.astype(np.float32),
+        ds.spectra.astype(np.float32, copy=False),   # already float32 from the cache
         ds.wavelength,
         args.line_embedding_config,
         spectra_cache_key=ds.cache_key,
