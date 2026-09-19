@@ -46,6 +46,23 @@ _SQRT2 = math.sqrt(2.0)
 _SQRT2PI = math.sqrt(2.0 * math.pi)
 
 
+def _nanmedian_lower(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    """Lower median along ``dim``, ignoring NaNs.
+
+    Same value as ``torch.nanmedian(x, dim).values`` (and the numpy solver's
+    ``_lower_median``), but built from a stable ``sort``: the CUDA median
+    kernel has no deterministic implementation, and both trainers run the
+    Lightning Trainer with ``deterministic=True``.
+    """
+    nan = torch.isnan(x)
+    n = (~nan).sum(dim=dim, keepdim=True)
+    filled = torch.where(nan, torch.full_like(x, torch.finfo(x.dtype).max), x)
+    xs, _ = torch.sort(filled, dim=dim, stable=True)
+    out = xs.gather(dim, torch.clamp(n - 1, min=0) // 2)
+    out = torch.where(n > 0, out, torch.full_like(out, float("nan")))
+    return out.squeeze(dim)
+
+
 class SahaBoltzmannLayer(nn.Module):
     """Calibration-free Saha–Boltzmann solver as a parameter-free module.
 
@@ -335,8 +352,8 @@ class SahaBoltzmannLayer(nn.Module):
                 with torch.no_grad():
                     r = torch.where(used, resid, torch.full_like(resid, float("nan")))
                     n_used = used.sum(dim=1)
-                    med = torch.nanmedian(r, dim=1).values                          # [B]
-                    mad = torch.nanmedian((r - med[:, None]).abs(), dim=1).values
+                    med = _nanmedian_lower(r, dim=1)                                # [B]
+                    mad = _nanmedian_lower((r - med[:, None]).abs(), dim=1)
                     sig = torch.clamp(1.4826 * mad, min=self.reject_floor)
                     sig = torch.where(torch.isfinite(sig), sig, torch.full_like(sig, self.reject_floor))
                     bad = used & ((resid - med[:, None]).abs() > self.reject_sigma * sig[:, None])
