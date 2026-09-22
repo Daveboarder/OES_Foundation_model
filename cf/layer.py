@@ -33,7 +33,7 @@ from data.atomic_data import AMU_G
 from data.libs_pipeline import _EV_TO_ERG, _H, _KB, _ME
 from data.plasma_physics import C_CGS, KB_EV, NM_TO_CM
 from cf.solver_np import (
-    CH_AREA, CH_EI, CH_EK, CH_ION, CH_LOG_AK, CH_LOG_GK, CH_WL, CH_Z,
+    CH_AREA, CH_EI, CH_EK, CH_ION, CH_LOG_AK, CH_LOG_GK, CH_R2, CH_WL, CH_Z,
     DEFAULT_CFG, LN10, LOG10_NE_MAX, LOG10_NE_MIN, TAU_FLOOR,
 )
 from cf.tables import CFTables
@@ -95,6 +95,10 @@ class SahaBoltzmannLayer(nn.Module):
         self.min_area = float(cfg["min_area"])
         self.use_isolation = bool(cfg["use_isolation"])
         self.min_lines = max(int(cfg["min_lines"]), 1)
+        self.seed_in_closure = bool(cfg.get("seed_in_closure", False))
+        self.single_line_min_isolation = float(cfg.get("single_line_min_isolation", 0.0))
+        self.single_line_r2_min = float(cfg.get("single_line_r2_min", 0.0))
+        self.single_line_prior = float(cfg.get("single_line_prior", 0.0))
         self.reject_sigma = float(cfg["reject_sigma"])
         self.reject_floor = float(cfg["reject_floor"])
         self.element_names = list(tables.element_names)
@@ -233,11 +237,27 @@ class SahaBoltzmannLayer(nn.Module):
         w = torch.where(torch.isfinite(w), w.clamp(min=0.0), torch.zeros_like(w))
         onehot = F.one_hot(e_safe, E).to(f64) * is_target[..., None].to(f64)  # [B, L, E]
 
+        iso_line = (self.isolation_score[None, :].expand(B, L)
+                    if getattr(self, "isolation_score", None) is not None
+                    else torch.ones(B, L, dtype=f64, device=dev))
+        r2_line = (tokens[:, :, CH_R2].to(f64) if tokens.shape[2] > CH_R2
+                   else torch.ones(B, L, dtype=f64, device=dev))
+        clean_single = ((iso_line >= self.single_line_min_isolation)
+                        & (r2_line >= self.single_line_r2_min))
+
         def gate(w):
             """Zero the lines of elements with fewer than ``min_lines`` weighted lines
-            (masks are detached; gradients flow through the surviving weights)."""
+            (masks are detached; gradients flow through the surviving weights).
+
+            An element left with a single line must also carry a clean one
+            (rule A), otherwise a blend lets it claim matrix mass."""
             used = w > 0.0
             n = (onehot * used[..., None].to(f64)).sum(dim=1)                 # [B, E]
+            if self.single_line_min_isolation > 0.0 or self.single_line_r2_min > 0.0:
+                lone = torch.gather((n == 1).to(f64), 1, e_safe) > 0.5
+                w = torch.where(lone & used & ~clean_single, torch.zeros_like(w), w)
+                used = w > 0.0
+                n = (onehot * used[..., None].to(f64)).sum(dim=1)
             ok = (n >= self.min_lines).to(f64)
             w = w * torch.gather(ok, 1, e_safe)
             used = w > 0.0
@@ -287,10 +307,14 @@ class SahaBoltzmannLayer(nn.Module):
             S10 = self._saha_ratio(T, lnNe, U_T)                             # [B, E]
             x_tilde = torch.where(has_lines, U_T[:, :, 0] * torch.exp(q) * (1.0 + S10),
                                   torch.zeros_like(q))
-            if c0_given:
+            if c0_given and self.seed_in_closure:
                 scale = ((x0 * has_lines_f).sum(dim=1).clamp(min=eps)
                          / x_tilde.sum(dim=1).clamp(min=eps))[:, None]
                 x = torch.where(has_lines, x_tilde * scale, x0)
+            elif c0_given:
+                # only identified elements are summed; a row with nothing
+                # identified at all keeps the seed so the output stays finite
+                x = torch.where(has_lines.any(dim=1, keepdim=True), x_tilde, x0)
             else:
                 x = x_tilde
             return x / x.sum(dim=1, keepdim=True).clamp(min=eps), S10, U_T
@@ -335,7 +359,25 @@ class SahaBoltzmannLayer(nn.Module):
             Aw = A * w[..., None]
             M = torch.einsum("bli,blj->bij", Aw, A) + reg
             b = torch.einsum("bli,bl->bi", Aw, y)
-            b = b + torch.cat([torch.zeros(B, E, dtype=f64, device=dev),
+            q_bias = torch.zeros(B, E, dtype=f64, device=dev)
+            if self.single_line_prior > 0.0 and c0_given:
+                # rule B: a single-line element's intercept is pulled toward the
+                # seed, anchored on the elements several lines already determine
+                lone = (n_lines_used == 1)
+                if bool(lone.any()):
+                    U_T = self._partition_functions(T)
+                    S10 = self._saha_ratio(T, lnNe, U_T)
+                    q_seed = (torch.log(x0.clamp(min=eps))
+                              - torch.log((U_T[:, :, 0] * (1.0 + S10)).clamp(min=eps)))
+                    anchor = (n_lines_used >= 2)
+                    gap = torch.where(anchor, q - q_seed, torch.full_like(q, float("nan")))
+                    c = _nanmedian_lower(gap, dim=1)[:, None]
+                    c = torch.where(torch.isfinite(c), c, torch.zeros_like(c))
+                    pw = torch.where(lone, self.single_line_prior, 0.0)
+                    M = M + torch.diag_embed(torch.cat(
+                        [pw, torch.zeros(B, 2, dtype=f64, device=dev)], dim=1))
+                    q_bias = pw * (q_seed + c)
+            b = b + torch.cat([q_bias,
                                (self.prior_T * beta0)[:, None], (self.prior_Ne * eta0)[:, None]], dim=1)
             theta = torch.linalg.solve(M, b[..., None])[..., 0]              # [B, E+2]
             q = theta[:, :E]

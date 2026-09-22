@@ -61,6 +61,7 @@ from cf.tables import CFTables
 
 # Token channels
 CH_WL, CH_EI, CH_EK, CH_LOG_GI, CH_LOG_GK, CH_LOG_AK, CH_LOG_ITH, CH_Z, CH_ION, CH_AREA = range(10)
+CH_FWHM, CH_R2, CH_DLAM, CH_RMSE = range(10, 14)   # Voigt-fit quality channels
 
 LN10 = float(np.log(10.0))
 LOG10_NE_MIN = 10.0     # clamp for eta = ln N_e inside the loop
@@ -78,7 +79,11 @@ DEFAULT_CFG: dict = {
     "min_area": 0.0,
     "sa_seed_init": True,
     # robustness guards (a spectroscopist's rules, no learned parameters)
-    "min_lines": 2,          # elements with fewer weighted lines are not solved by CF (seed / none)
+    "min_lines": 1,          # one identified line is enough: the slope comes from the common (Fe) fit
+    "seed_in_closure": False,  # only elements with an identified line enter the closure sum
+    "single_line_min_isolation": 0.0,  # rule A: a lone line must be this isolated to count
+    "single_line_r2_min": 0.0,         # rule A: ... and fit this well
+    "single_line_prior": 0.0,          # rule B: pull a lone element's intercept toward the seed
     "reject_sigma": 3.0,     # drop lines whose residual exceeds k * robust sigma (0 = off)
     "reject_floor": 0.15,    # floor of the robust sigma [ln units]
 }
@@ -134,17 +139,23 @@ def _lower_median(v: np.ndarray) -> float:
 
 def _solve_weighted_ls(A: np.ndarray, w: np.ndarray, y: np.ndarray, E: int,
                        beta0: float, eta0: float, prior_T: float, prior_Ne: float,
-                       ridge: float) -> np.ndarray:
+                       ridge: float, q_prior_w: np.ndarray | None = None,
+                       q_prior: np.ndarray | None = None) -> np.ndarray:
     """theta = argmin sum_i w_i (y_i - A_i theta)^2 + prior_T (beta - beta0)^2
-    + prior_Ne (eta - eta0)^2 + ridge |theta|^2."""
+    + prior_Ne (eta - eta0)^2 + sum_e q_prior_w_e (q_e - q_prior_e)^2
+    + ridge |theta|^2."""
     M = (A * w[:, None]).T @ A
     b = A.T @ (w * y)
     diag = np.full(E + 2, ridge, dtype=np.float64)
     diag[E] += prior_T
     diag[E + 1] += prior_Ne
+    if q_prior_w is not None:
+        diag[:E] += q_prior_w
     M[np.diag_indices_from(M)] += diag
     b[E] += prior_T * beta0
     b[E + 1] += prior_Ne * eta0
+    if q_prior_w is not None and q_prior is not None:
+        b[:E] += q_prior_w * q_prior
     return np.linalg.solve(M, b)
 
 
@@ -167,7 +178,11 @@ def saha_boltzmann_solve_np(
     isolation: np.ndarray | None = None,
     min_area: float = 0.0,
     sa_seed_init: bool = True,
-    min_lines: int = 2,
+    min_lines: int = 1,
+    seed_in_closure: bool = False,
+    single_line_min_isolation: float = 0.0,
+    single_line_r2_min: float = 0.0,
+    single_line_prior: float = 0.0,
     reject_sigma: float = 3.0,
     reject_floor: float = 0.15,
 ) -> CFResult:
@@ -194,6 +209,10 @@ def saha_boltzmann_solve_np(
         min_area: lines with area ≤ ``min_area`` are never used
         sa_seed_init: evaluate the optical depths of the first solve at
             (T0, Ne0, x from ``C0``) when ``C0`` is given (see module doc)
+        seed_in_closure: when True an element without any identified line keeps
+            its seed number fraction and takes mass in the closure (legacy);
+            when False (default) only elements with at least one identified
+            line are summed, and the rest are reported as not determined.
         min_lines: elements with fewer than ``min_lines`` weighted lines are
             not solved by CF (their lines are dropped; value from the seed)
         reject_sigma: after every solve but the last, lines whose residual
@@ -230,11 +249,26 @@ def saha_boltzmann_solve_np(
         w = w * np.asarray(isolation, dtype=np.float64)
     w = np.where(np.isfinite(w), np.maximum(w, 0.0), 0.0)
 
+    iso_line = (np.asarray(isolation, dtype=np.float64) if isolation is not None
+                else np.ones(L, dtype=np.float64))
+    r2_line = tokens[:, CH_R2] if tokens.shape[1] > CH_R2 else np.ones(L, dtype=np.float64)
+    clean_single = (iso_line >= float(single_line_min_isolation)) & (r2_line >= float(single_line_r2_min))
+
     def _gate(w: np.ndarray):
-        """Zero the lines of elements with fewer than ``min_lines`` weighted lines."""
+        """Zero the lines of elements with fewer than ``min_lines`` weighted lines.
+
+        An element left with exactly one line is additionally required to have
+        a clean line (rule A): a blended line is the usual reason a trace
+        element claims matrix mass through the closure."""
         used = w > 0.0
         n = np.bincount(e_safe[used], minlength=E)
         ok = n >= max(int(min_lines), 1)
+        if single_line_min_isolation > 0.0 or single_line_r2_min > 0.0:
+            lone = (n == 1)[e_safe] & used
+            w = np.where(lone & ~clean_single, 0.0, w)
+            used = w > 0.0
+            n = np.bincount(e_safe[used], minlength=E)
+            ok = n >= max(int(min_lines), 1)
         w = w * ok[e_safe]
         used = w > 0.0
         n = np.bincount(e_safe[used], minlength=E).astype(np.int64)
@@ -286,9 +320,11 @@ def saha_boltzmann_solve_np(
         U_T = tables.partition_functions(T)                               # [E, 2]
         S10 = saha_ratio(T, np.exp(lnNe), U_T[:, 0], U_T[:, 1], tables.E_ion)
         x_tilde = np.where(has_lines, U_T[:, 0] * np.exp(q) * (1.0 + S10), 0.0)
-        if C0 is not None:
+        if seed_in_closure and C0 is not None:
             scale = max(float((x0 * has_lines).sum()), eps) / max(float(x_tilde.sum()), eps)
             x = np.where(has_lines, x_tilde * scale, x0)
+        elif C0 is not None and not np.any(has_lines):
+            x = x0                      # nothing identified at all: keep the seed
         else:
             x = x_tilde
         return x / max(float(x.sum()), eps), S10
@@ -315,11 +351,31 @@ def saha_boltzmann_solve_np(
         tau0, a = optical_depth(T, x0, S10)
         ln_f = sa_log_factor(tau0, a)
 
+    def _q_prior(T: float, lnNe: float, q_now: np.ndarray, n_used: np.ndarray):
+        """Rule B: intercept prior for elements carried by a single line.
+
+        The seed fixes composition only up to the overall scale that N*l and the
+        line strengths set, so the prior target is anchored on the elements that
+        several lines already determine: the offset ``c`` is the median gap
+        between their solved intercepts and their seed-implied ones."""
+        if single_line_prior <= 0.0 or C0 is None:
+            return None, None
+        lone = (n_used == 1)
+        if not np.any(lone):
+            return None, None
+        U_T = tables.partition_functions(T)
+        S10 = saha_ratio(T, np.exp(lnNe), U_T[:, 0], U_T[:, 1], tables.E_ion)
+        q_seed = np.log(np.maximum(x0, eps)) - np.log(np.maximum(U_T[:, 0] * (1.0 + S10), eps))
+        anchor = n_used >= 2
+        c = float(np.median((q_now - q_seed)[anchor])) if np.any(anchor) else 0.0
+        return np.where(lone, float(single_line_prior), 0.0), q_seed + c
+
     n_iter = int(n_iter)
     for it in range(n_iter):
         # ── weighted least squares ──────────────────────────────────────
         y = y_base - ln_f - z * np.log(saha_thermal_factor(T))
-        theta = _solve_weighted_ls(A, w, y, E, beta0, eta0, prior_T, prior_Ne, ridge)
+        qw, qp = _q_prior(T, lnNe, q, n_lines_used)
+        theta = _solve_weighted_ls(A, w, y, E, beta0, eta0, prior_T, prior_Ne, ridge, qw, qp)
         q = theta[:E]
         beta = theta[E]
         eta = theta[E + 1]
@@ -350,7 +406,8 @@ def saha_boltzmann_solve_np(
     mass = mass / max(float(mass.sum()), eps)
     intercepts = np.where(has_lines, q, np.nan)
     censored = (mass < tables.lod) | (~has_lines & (C0_mass < tables.lod))
-    source = np.where(has_lines, "cf", "seed" if C0 is not None else "none").astype("<U4")
+    _fallback = "seed" if (C0 is not None and (seed_in_closure or not np.any(has_lines))) else "none"
+    source = np.where(has_lines, "cf", _fallback).astype("<U4")
 
     return CFResult(
         mass_fractions=mass,

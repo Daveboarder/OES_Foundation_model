@@ -58,7 +58,9 @@ CF_MAJOR_ELEMENTS = ('Fe', 'C', 'Mn', 'Si', 'Cr', 'Ni', 'Cu', 'Al')
 # (only those present in the config; the layer rejects unknown keys).
 CF_LAYER_KEYS = ('n_iter', 'ridge', 'prior_T', 'prior_Ne', 'sa_correction',
                  'gamma_nm', 'eps', 'min_area', 'sa_seed_init', 'use_isolation',
-                 'min_lines', 'reject_sigma', 'reject_floor')
+                 'min_lines', 'reject_sigma', 'reject_floor',
+                 'seed_in_closure', 'single_line_min_isolation',
+                 'single_line_r2_min', 'single_line_prior')
 
 # Defaults for every `finetune.cf` key the task reads (config overrides win).
 CF_CFG_DEFAULTS: dict[str, Any] = {
@@ -71,7 +73,11 @@ CF_CFG_DEFAULTS: dict[str, Any] = {
     'gamma_nm': 0.01,
     'eps': 1e-7,
     'min_area': 0.0,
-    'min_lines': 2,
+    'min_lines': 1,
+    'seed_in_closure': False,
+    'single_line_min_isolation': 0.0,
+    'single_line_r2_min': 0.0,
+    'single_line_prior': 0.0,
     'reject_sigma': 3.0,
     'reject_floor': 0.15,
     # loss weights (plan: L = L_conc + λ_T·… + λ_Ne·… + λ_Nl·… + λ_w·…)

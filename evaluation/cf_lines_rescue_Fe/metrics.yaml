@@ -1,0 +1,56 @@
+runs:
+- majors_mean_r2: -1.0563950296156295
+  majors_median_r2: 0.5716666018065213
+  majors_within_2x: 0.3377399750460488
+  all_within_2x: 0.15738828410873443
+  all_log_rmse: 6.7445183612838395
+  Fe_pred_pct: 64.48982766163462
+  Fe_r2: -0.6388341266231954
+  tag: 'baseline: direct lines only'
+  T_median: 12325.389106365123
+  lines_median: 23.0
+- majors_mean_r2: 0.3900450748834741
+  majors_median_r2: 0.7283899702625359
+  majors_within_2x: 0.42979879525925974
+  all_within_2x: 0.20063111817395698
+  all_log_rmse: 6.638172165582817
+  Fe_pred_pct: 81.76834856792654
+  Fe_r2: 0.7206679261836146
+  tag: trained 'all' out-of-fold
+- majors_mean_r2: 0.4069992157852614
+  majors_median_r2: 0.7497547289439317
+  majors_within_2x: 0.4323825562097255
+  all_within_2x: 0.2018236232280181
+  all_log_rmse: 6.634057093020802
+  Fe_pred_pct: 81.76901701285216
+  Fe_r2: 0.7202271973683108
+  tag: trained 'all' fold-mean weights (in-sample)
+  T_median: 11807.805873725756
+  lines_median: 40.0
+args:
+  tokens: external_data/cache/line_tokens_3f255c706d25.h5
+  spectra_cache: external_data/cache/measured_cache_942cec6d2499.h5
+  line_dict: external_data/cache/line_dict_63607b6d2891.h5
+  deconv: external_data/cache/deconv_0d18698fba59.h5
+  rescue: Fe
+  db: external_data/Source/LIBS_data_vacuum.db
+  element_lod_config: config/element_lod.yaml
+  iso_min: 0.3
+  r2_min: 0.9
+  max_blend: 0.8
+  seed_c0: none
+  T0: 11000.0
+  log10_Ne0: 17.5
+  log10_Nl0: 16.0
+  cf_set: []
+  rules: false
+  train: true
+  variant: all
+  folds: 5
+  steps: 150
+  lr: 0.1
+  l1: 0.0
+  seed: 0
+  device: auto
+  chunk: 1024
+  out: /tmp/claude-10001113/-mnt-data-projects-Running-projects-26-0153-Foundation-model-Methods-LIBS-foundation/87f8b361-c57a-4d3d-bcc0-3d8f8a24534d/scratchpad/line_select/pe_Fe_none

@@ -163,6 +163,58 @@ uv run python scripts/evaluate_cf.py --run_dir runs/finetune_<cf> \
 uv run python scripts/run_cf_classical.py --line_list cf_oes54 --sample "PURE KFE"
 ```
 
+#### Rescuing blended lines and selecting the lines that count
+
+On the measured Fe-matrix spectra the isolation filter leaves most elements with one or two
+usable lines. Two tools recover more and decide which ones to trust:
+
+```bash
+# a. Deconvolve the blended lines of the measured cache at the plasma state of a CF run.
+#    --axis_from_tokens is essential: every measurement session has its own wavelength
+#    calibration (0.02-0.09 nm, ~1-2 line widths, smooth per spectrometer channel), which
+#    cf/axis.py fits from the Voigt-fit centre offsets; without it the deconvolved areas are
+#    ~3x too small.  --mode hybrid gives the target line its own scale so that its Boltzmann
+#    point is not an echo of the assumed T (per_element ties it to the theory ratio).
+uv run python scripts/deconvolve_lines.py \
+  --spectra_cache external_data/cache/measured_cache_<h>.h5 \
+  --line_dict external_data/cache/line_dict_<h>.h5 \
+  --plasma_csv runs/finetune_<cf>/evaluation/cf_measured_<ts>/per_spectrum.csv \
+  --axis_from_tokens external_data/cache/line_tokens_<h>.h5 --mode hybrid --workers 22
+#    (set OMP_NUM_THREADS=1: 22 workers x a BLAS thread pool each oversubscribes the box)
+
+# b. Line quality + selection.  Always writes the per-line Boltzmann self-consistency table
+#    and the deconvolved-vs-Voigt agreement (no reference values needed); --rules scores
+#    blend / bias / scatter / inverse-variance / IRLS rules against the certified values;
+#    --train fits one weight per dictionary line through the solver, 5-fold CV grouped by
+#    sample, and writes line_weights.h5 (out-of-fold metrics are the honest ones).
+uv run python scripts/select_cf_lines.py \
+  --tokens external_data/cache/line_tokens_<h>.h5 \
+  --spectra_cache external_data/cache/measured_cache_<h>.h5 \
+  --line_dict external_data/cache/line_dict_<h>.h5 \
+  --deconv external_data/cache/deconv_<h>.h5 --rescue Fe --rules --train --out evaluation/cf_lines
+
+# c. Use the selection in the classical solver
+uv run python scripts/run_cf_classical.py --tokens ... --spectra_cache ... --line_dict ... \
+  --deconv external_data/cache/deconv_<h>.h5 --line_weights evaluation/cf_lines/line_weights.h5
+```
+
+Measured so far (121 certified samples, per-sample medians, out of fold; `evaluation/cf_lines_rescue_*`):
+
+| lines | majors median R² | majors mean R² | majors within 2× | all within 2× | Fe (true 90.5 %) |
+|---|---|---|---|---|---|
+| direct only (baseline) | 0.57 | −1.06 | 0.34 | 0.16 | 64.5 % |
+| every rule on rescued Fe lines | ≤ 0.57 | ≤ −0.85 | ≤ 0.34 | | ≤ 67 % |
+| trained selection, `--rescue Fe` | **0.73** | 0.39 | 0.43 | 0.20 | 81.8 % |
+| trained selection, `--rescue Fe,Cr,Ni,Mn,Si` | 0.57 | **0.44** | **0.48** | **0.23** | **87.9 %** |
+| trained selection, `--rescue all` | 0.16 | −1.05 | 0.25 | 0.26 | 23 % |
+
+The rules cannot beat the baseline because their reference, the fit through the direct lines,
+itself contains self-absorbed lines. The trained selection is essentially binary: with
+`--rescue Fe` it keeps seven Fe lines spanning 4–9 eV (four of them rescued) and drops the
+strong resonance lines; with the majors rescued Cr, Ni, Mn and Si each get a real multi-line
+Boltzmann fit (Mn R² −0.24 → 0.87) at the price of Cr/Ni linearity on the high-alloy samples.
+Rescuing every element lets the trace elements take the closure and collapses Fe.
+
 Monitored metric: `val/cf_log_rmse` (min). `run_info.yaml` gains `test_results.per_element.<El>.{log_rmse, within_2x, n_censored}`, plasma metrics (`te_mape`, `ne_log_mae`) and a `cf:` block (`seed_binned_run`, `seed_detection_run`, `pure_physics`, `cf_cfg`, `line_dict_path`, `spectra_cache_path`, `split_strategy`, `c0_source`) that `make_publication_figures.py` uses to rebuild the solver. Smoke variants: `config/libs_data_cf_smoke.yaml`, `config/line_embedding_cf_smoke.yaml`, `config/config_libs_cf_smoke.yaml`.
 
 ```bash
@@ -329,6 +381,10 @@ LIBS_foundation/
 │   ├── line_embedding_pipeline.py
 │   └── dataset.py
 ├── scripts/build_line_tokens.py                # offline tokenization CLI
+├── cf/                                         # calibration-free solver (solver_np, layer, tables,
+│   ├── classical.py, deconv.py, axis.py        #   classical weights, window deconvolution,
+│   └── line_quality.py                         #   per-session axis fix, line quality / rules)
+├── scripts/deconvolve_lines.py, select_cf_lines.py, run_cf_classical.py, evaluate_cf.py
 ├── models/
 │   ├── libs_transformer.py, line_token_embedding.py, heads.py
 ├── training/pretrain.py, training/finetune.py

@@ -90,7 +90,8 @@ finetune:
     lambda_w: 0.01
     presence_gate: true  # gate line weights by the seed detection head (>= 0.5)
     eps: 1.0e-7          # ln(C + eps) floor in the loss / solver
-    min_lines: 2         # elements with fewer weighted lines fall back to the seed
+    min_lines: 1         # one identified line suffices; its slope comes from the common (Fe) fit
+    seed_in_closure: false   # only identified elements are summed in the closure
     reject_sigma: 3.0    # robust residual rejection between solves (0 = off)
     reject_floor: 0.15
 

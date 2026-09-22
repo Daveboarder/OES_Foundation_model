@@ -101,6 +101,17 @@ def main() -> None:
     ap.add_argument("--element_lod_config", default="config/element_lod.yaml")
     ap.add_argument("--indices", default="all", help="all | test | <n first matching>")
     ap.add_argument("--line_list", choices=("all", "cf_oes54"), default="all")
+    ap.add_argument("--deconv", default=None,
+                    help="deconv_*.h5 from scripts/deconvolve_lines.py: use the deconvolved "
+                         "areas of blended lines instead of their single-Voigt fit")
+    ap.add_argument("--deconv_max_blend", type=float, default=0.8,
+                    help="only take a deconvolved area when the line owns more than "
+                         "1 - this fraction of its own peak")
+    ap.add_argument("--deconv_only_invalid", action="store_true",
+                    help="keep every good Voigt fit and fill in only the rejected lines")
+    ap.add_argument("--line_weights", default=None,
+                    help="line_weights.h5 from scripts/select_cf_lines.py: per-line weights "
+                         "multiplied into the classical weights (same dictionary required)")
     ap.add_argument("--sample", default=None, help="substring of the sample name/id")
     ap.add_argument("--r2_min", type=float, default=0.9)
     ap.add_argument("--isolation_min", type=float, default=None,
@@ -133,6 +144,37 @@ def main() -> None:
         tokens = np.stack([tok_ds[int(i)] for i in idx]).astype(np.float64)
         fit_valid = np.stack([valid_ds[int(i)] for i in idx]).astype(np.float64)
 
+    rescue_elems = None                      # which elements' blended lines may be rescued
+    if args.line_weights:
+        with h5py.File(args.line_weights, "r") as f:
+            r = str(f.attrs.get("rescue", "all"))
+            if r != "all":
+                rescue_elems = np.isin(np.array([e.decode() for e in f["element"][:]]), r.split(","))
+                print(f"line weights: rescuing blended lines of {r} only")
+    if args.deconv:
+        with h5py.File(args.deconv, "r") as f:
+            d_area = f["area"][:].astype(np.float64)
+            d_blend = f["blend_fraction"][:].astype(np.float64)
+            d_rows = f["rows"][:].astype(np.int64)
+        pos = {int(r): k for k, r in enumerate(d_rows)}
+        missing = [int(i) for i in idx if int(i) not in pos]
+        if missing:
+            raise SystemExit(f"{args.deconv} has no rows for {len(missing)} requested spectra")
+        take = np.stack([pos[int(i)] for i in idx])
+        d_area, d_blend = d_area[take], d_blend[take]
+        ok = (d_area > 0) & (np.nan_to_num(d_blend, nan=1.0) <= args.deconv_max_blend)
+        if args.deconv_only_invalid or args.line_weights:      # never overwrite a good direct fit
+            ok &= ~((fit_valid > 0.5) & (tokens[:, :, 11] >= args.r2_min))
+        if rescue_elems is not None:
+            ok &= rescue_elems[None, :]
+        n_before = int((fit_valid > 0.5).sum())
+        tokens[:, :, 9] = np.where(ok, d_area, tokens[:, :, 9])
+        fit_valid = np.where(ok, 1.0, fit_valid)
+        rescued_w = np.where(ok, 1.0 - np.nan_to_num(d_blend, nan=1.0), 0.0)   # weight of a rescued slot
+        print(f"deconvolution: {int(ok.sum())} line-slots replaced "
+              f"({ok.sum() / ok.size:.1%} of all); usable lines per spectrum "
+              f"{n_before / len(idx):.0f} -> {(fit_valid > 0.5).sum() / len(idx):.0f}")
+
     isolation = forced = None
     if args.line_dict:
         with h5py.File(args.line_dict, "r") as f:
@@ -140,6 +182,15 @@ def main() -> None:
                 isolation = f["isolation_score"][:].astype(np.float64)
             if "forced" in f:
                 forced = f["forced"][:].astype(np.float64)
+
+    line_w = np.ones(wl.shape[0], dtype=np.float64)
+    if args.line_weights:
+        with h5py.File(args.line_weights, "r") as f:
+            line_w = f["weight"][:].astype(np.float64)
+            lw_wl = f["central_wavelength"][:]
+        if line_w.shape[0] != wl.shape[0] or not np.allclose(lw_wl, wl, atol=1e-3):
+            raise SystemExit(f"{args.line_weights} was made for a different line dictionary")
+        print(f"line weights: {int((line_w > 0.5).sum())}/{line_w.size} lines above 0.5")
 
     line_mask = np.ones(wl.shape[0], dtype=bool)
     if args.line_list == "cf_oes54":
@@ -156,7 +207,9 @@ def main() -> None:
         w = classical_weights(tokens[k], fit_valid[k], r2_min=args.r2_min,
                               isolation=isolation if args.isolation_min is not None else None,
                               forced=forced, isolation_min=args.isolation_min or 0.0)
-        w = w * line_mask
+        if args.deconv:                      # a rescued slot has no Voigt r²: weight it by its own share
+            w = np.where(rescued_w[k] > 0, np.maximum(w, rescued_w[k]), w)
+        w = w * line_mask * line_w
         res = saha_boltzmann_solve_np(
             tokens[k], fit_valid[k], w, tables, C0=None,
             T0=args.T0, log10_Ne0=args.log10_Ne0, log10_Nl0=args.log10_Nl0,

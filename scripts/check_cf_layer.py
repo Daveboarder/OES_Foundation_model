@@ -365,14 +365,21 @@ def check_degenerate(names, tab, tok_syn, device):
     w[np.flatnonzero(Z == 24)[0]] = 1.0
     w[(Z == 28) & (z == 0)] = 0.0
     w[Z == 6] = 0.0
-    # min_lines=1: this case deliberately tests a single-line element; the
-    # production default (2) would hand Cr to the seed instead.
-    r = saha_boltzmann_solve_np(tok_syn, fv, w, tab, C0=C0, T0=10000.0, log10_Ne0=17.0, log10_Nl0=16.4, min_lines=1)
+    # One identified line is enough (production default): the element takes the
+    # common Fe-dominated slope and joins the closure sum.
+    r = saha_boltzmann_solve_np(tok_syn, fv, w, tab, C0=C0, T0=10000.0, log10_Ne0=17.0, log10_Nl0=16.4)
     finite = np.isfinite(r.mass_fractions).all() and np.isfinite(r.T) and np.isfinite(r.log10_Ne) and np.isfinite(r.tau0).all()
     check(finite, "single-line Cr / ion-only Ni / seeded C: all outputs finite")
     check(r.n_lines_used[iCr] == 1 and r.source[iCr] == "cf", f"single-line element solved (Cr = {r.mass_fractions[iCr]:.4f}, true 0.18)")
     check(r.n_lines_used[iNi] > 0 and np.all(z[(Z == 28) & r.used_mask] == 1), f"stage-II-only element solved (Ni = {r.mass_fractions[iNi]:.4f}, true 0.09)")
-    check(r.n_lines_used[iC] == 0 and r.source[iC] == "seed" and np.isnan(r.intercepts[iC]), f"element without lines: source 'seed', intercept nan (C = {r.mass_fractions[iC]:.4f} from C0 0.03)")
+    check(r.n_lines_used[iC] == 0 and r.source[iC] == "none" and np.isnan(r.intercepts[iC])
+          and r.mass_fractions[iC] == 0.0,
+          f"element without any line: not summed, source 'none' (C = {r.mass_fractions[iC]:.4f})")
+    # legacy rule, still reachable: the seed keeps its mass in the closure
+    r_seed = saha_boltzmann_solve_np(tok_syn, fv, w, tab, C0=C0, T0=10000.0, log10_Ne0=17.0,
+                                     log10_Nl0=16.4, seed_in_closure=True)
+    check(r_seed.source[iC] == "seed" and r_seed.mass_fractions[iC] > 0.0,
+          f"seed_in_closure=True: element without lines keeps C0 (C = {r_seed.mass_fractions[iC]:.4f} from C0 0.03)")
     check(abs(r.mass_fractions[iFe] / 0.7 - 1) < 0.1, f"Fe still within 10 % ({r.mass_fractions[iFe]:.4f})")
     check(abs(r.mass_fractions.sum() - 1) < 1e-9, "mass fractions sum to 1")
 

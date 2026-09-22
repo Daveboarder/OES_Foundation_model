@@ -212,6 +212,7 @@ def load_cf_module(
     pure_physics: bool,
     spectra_cache_path: str | None,
     split_strategy: str | None,
+    cf_overrides: dict | None = None,
 ) -> tuple[LIBSFinetuneModule, dict]:
     """The CF module exactly as train_finetune's test pass builds it, on the
     current token cache (seeds checked by line-dictionary hash, not by cache
@@ -223,7 +224,13 @@ def load_cf_module(
     config["data"]["n_bins"] = n_lines
     config["model"]["max_seq_len"] = n_lines + 1
     config["model"]["embedding_type"] = run_info.get("embedding_type", "line_token_linear")
-    config.setdefault("finetune", {})["cf"] = dict(cf_info.get("cf_cfg") or {})
+    cf_cfg = dict(cf_info.get("cf_cfg") or {})
+    if cf_overrides:
+        # the run stored the solver settings it trained with; --cf_set re-solves
+        # the same checkpoint under different ones (e.g. the closure rule)
+        cf_cfg.update(cf_overrides)
+        print(f"CF config overrides: {cf_overrides}")
+    config.setdefault("finetune", {})["cf"] = cf_cfg
 
     encoder = build_encoder(config, run_info, token_meta)
     ckpt = finetune_checkpoint_path(run_dir)
@@ -333,6 +340,28 @@ def run_inference(
 # ─────────────────────────────────────────────────────────────────────────────
 # main
 # ─────────────────────────────────────────────────────────────────────────────
+def _parse_cf_set(items: list[str] | None) -> dict:
+    """--cf_set key=value pairs into a typed dict (bool / int / float / str)."""
+    out: dict = {}
+    for item in items or []:
+        if "=" not in item:
+            raise SystemExit(f"--cf_set expects KEY=VALUE, got {item!r}")
+        key, _, raw = item.partition("=")
+        low = raw.strip().lower()
+        if low in ("true", "false"):
+            val: object = low == "true"
+        else:
+            try:
+                val = int(raw)
+            except ValueError:
+                try:
+                    val = float(raw)
+                except ValueError:
+                    val = raw
+        out[key.strip()] = val
+    return out
+
+
 def main(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir)
     run_info = yaml.safe_load(open(run_dir / "run_info.yaml"))
@@ -392,7 +421,7 @@ def main(args: argparse.Namespace) -> None:
     module, assets = load_cf_module(
         run_dir, run_info, config, element_names, args.libs_data_config, token_meta,
         pure_physics=args.pure_physics, spectra_cache_path=spectra_cache_path,
-        split_strategy=strategy,
+        split_strategy=strategy, cf_overrides=_parse_cf_set(args.cf_set),
     )
     lod = np.asarray(assets["cf_tables"].lod, dtype=np.float64)
     eps = float(assets["cf_cfg"].get("eps", 1e-7))
@@ -435,6 +464,7 @@ def main(args: argparse.Namespace) -> None:
         rows[f"censored_{e}"] = res["censored"][:, i].astype(int)
         rows[f"binned_{e}"] = res["binned_pred"][:, i]
         rows[f"c0_{e}"] = res["c0"][:, i]
+        rows[f"nlines_{e}"] = res["n_lines_used"][:, i]   # 0 = not identified, 1 = single-line
     pd.DataFrame(rows).to_csv(out_dir / "per_spectrum.csv", index=False)
 
     cf_table = per_element_table(element_names, y_true, res["pred"], lod, res["censored"],
@@ -573,6 +603,9 @@ if __name__ == "__main__":
                         help="all spectra of the config, or its held-out test split")
     parser.add_argument("--split_strategy", type=str, choices=list(SPLIT_STRATEGIES), default=None,
                         help="split strategy for --indices test (default: config downstream.splits.strategy)")
+    parser.add_argument("--cf_set", action="append", default=None, metavar="KEY=VALUE",
+                        help="override a solver setting stored in run_info (repeatable), "
+                             "e.g. --cf_set min_lines=1 --cf_set seed_in_closure=false")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--device", type=str, default="auto", help="auto | cuda | cpu")
     parser.add_argument("--num_workers", type=int, default=0)
